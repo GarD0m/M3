@@ -264,47 +264,52 @@ def apply_mla(
     bsz, seq_len, _ = x.shape
     h = cfg.n_heads
 
-    c_q = rms_norm(x @ params["w_dq"], params["q_norm_w"], eps=cfg.rms_norm_eps)
-    q_all = (c_q @ params["w_uq"]).reshape(bsz, seq_len, h, cfg.d_qk_head)
-    q_nope, q_rope = jnp.split(q_all, [cfg.d_qk_nope], axis=-1)
+    with jax.named_scope("mla_qkv_proj"):
+        c_q = rms_norm(x @ params["w_dq"], params["q_norm_w"], eps=cfg.rms_norm_eps)
+        q_all = (c_q @ params["w_uq"]).reshape(bsz, seq_len, h, cfg.d_qk_head)
+        q_nope, q_rope = jnp.split(q_all, [cfg.d_qk_nope], axis=-1)
 
-    kv_raw = x @ params["w_dkv"]
-    c_kv_raw, k_rope_shared = jnp.split(kv_raw, [cfg.d_kv_lora], axis=-1)
-    c_kv = rms_norm(c_kv_raw, params["kv_norm_w"], eps=cfg.rms_norm_eps)
+        kv_raw = x @ params["w_dkv"]
+        c_kv_raw, k_rope_shared = jnp.split(kv_raw, [cfg.d_kv_lora], axis=-1)
+        c_kv = rms_norm(c_kv_raw, params["kv_norm_w"], eps=cfg.rms_norm_eps)
 
-    kv_all = (c_kv @ params["w_ukv"]).reshape(bsz, seq_len, h, cfg.d_qk_nope + cfg.d_v)
-    k_nope, v = jnp.split(kv_all, [cfg.d_qk_nope], axis=-1)
+        kv_all = (c_kv @ params["w_ukv"]).reshape(bsz, seq_len, h, cfg.d_qk_nope + cfg.d_v)
+        k_nope, v = jnp.split(kv_all, [cfg.d_qk_nope], axis=-1)
 
-    inv_freq, mscale = compute_yarn_freqs(
-        d_rope=cfg.d_qk_rope,
-        theta=cfg.rope_theta,
-        base_seq_len=cfg.base_seq_len,
-        scale=cfg.yarn_scale,
-        beta_fast=cfg.yarn_beta_fast,
-        beta_slow=cfg.yarn_beta_slow,
-    )
-    q_rope = apply_rope(q_rope, inv_freq)
-    k_rope = apply_rope(k_rope_shared[:, :, None, :], inv_freq)
-    k_rope = jnp.broadcast_to(k_rope, (bsz, seq_len, h, cfg.d_qk_rope))
+    with jax.named_scope("mla_rope"):
+        inv_freq, mscale = compute_yarn_freqs(
+            d_rope=cfg.d_qk_rope,
+            theta=cfg.rope_theta,
+            base_seq_len=cfg.base_seq_len,
+            scale=cfg.yarn_scale,
+            beta_fast=cfg.yarn_beta_fast,
+            beta_slow=cfg.yarn_beta_slow,
+        )
+        q_rope = apply_rope(q_rope, inv_freq)
+        k_rope = apply_rope(k_rope_shared[:, :, None, :], inv_freq)
+        k_rope = jnp.broadcast_to(k_rope, (bsz, seq_len, h, cfg.d_qk_rope))
 
-    q = jnp.concatenate([q_nope, q_rope], axis=-1)
-    k = jnp.concatenate([k_nope, k_rope], axis=-1)
+        q = jnp.concatenate([q_nope, q_rope], axis=-1)
+        k = jnp.concatenate([k_nope, k_rope], axis=-1)
 
     softmax_scale = (mscale * mscale) / math.sqrt(float(cfg.d_qk_head))
 
     aux_info: dict[str, jax.Array] = {}
     sparse_mask = None
     if cfg.use_csa2_indexer and seq_len > cfg.csa2_topk:
-        sparse_mask, idx_scores = compute_csa2_lightning_mask(params, x, c_q, cfg)
-        aux_info["csa2_score_mean"] = jnp.mean(idx_scores)
+        with jax.named_scope("mla_csa2_indexer"):
+            sparse_mask, idx_scores = compute_csa2_lightning_mask(params, x, c_q, cfg)
+            aux_info["csa2_score_mean"] = jnp.mean(idx_scores)
 
-    attn_out = _run_causal_attention(
-        q,
-        k,
-        v,
-        softmax_scale=softmax_scale,
-        use_tokamax=cfg.attn_use_tokamax,
-        sparse_mask=sparse_mask,
-    )
-    out = attn_out.reshape(bsz, seq_len, h * cfg.d_v) @ params["w_o"]
+    with jax.named_scope("mla_attention"):
+        attn_out = _run_causal_attention(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            use_tokamax=cfg.attn_use_tokamax,
+            sparse_mask=sparse_mask,
+        )
+    with jax.named_scope("mla_out_proj"):
+        out = attn_out.reshape(bsz, seq_len, h * cfg.d_v) @ params["w_o"]
     return out, aux_info

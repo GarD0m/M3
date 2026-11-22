@@ -67,65 +67,82 @@ def _single_loop_step(
     cfg: LoopMoEConfig,
 ) -> tuple[jax.Array, tuple[jax.Array, jax.Array, jax.Array]]:
     """Execute one recurrent iteration of Engram + IterAdaLN + Single-Pass mHC(MLA) + Single-Pass mHC(MoE)."""
-    alphas = params["iter_adaln"]["loop_alpha"][loop_idx]  # [3]
-    dt = x_streams.dtype
-    alpha_engram = alphas[0].astype(dt)
-    alpha_attn = alphas[1].astype(dt)
-    alpha_moe = alphas[2].astype(dt)
+    with jax.named_scope("loop_step"):
+        alphas = params["iter_adaln"]["loop_alpha"][loop_idx]  # [3]
+        dt = x_streams.dtype
+        alpha_engram = alphas[0].astype(dt)
+        alpha_attn = alphas[1].astype(dt)
+        alpha_moe = alphas[2].astype(dt)
 
-    # 1. Context-aware Engram conditional memory refinement
-    if cfg.use_engram:
-        h_summary = collapse_streams(x_streams)
-        engram_delta, engram_gate_mean = apply_engram_step(params["engram"], h_summary, engram_e, cfg)
-        x_streams = x_streams + alpha_engram * engram_delta[:, :, None, :]
-    else:
-        engram_gate_mean = jnp.asarray(0.0, dtype=jnp.float32)
+        # 1. Context-aware Engram conditional memory refinement
+        if cfg.use_engram:
+            with jax.named_scope("engram_step"):
+                h_summary = collapse_streams(x_streams)
+                engram_delta, engram_gate_mean = apply_engram_step(
+                    params["engram"], h_summary, engram_e, cfg
+                )
+                x_streams = x_streams + alpha_engram * engram_delta[:, :, None, :]
+        else:
+            engram_gate_mean = jnp.asarray(0.0, dtype=jnp.float32)
 
-    # 2. LoopMoE IterAdaLN modulation jointly conditioned on h_t and loop_idx
-    h_mod = collapse_streams(x_streams)
-    shift_a, scale_a, gate_a, shift_m, scale_m, gate_m = compute_iter_adaln_modulations(
-        params["iter_adaln"], h_mod, loop_idx
-    )
+        # 2. LoopMoE IterAdaLN modulation jointly conditioned on h_t and loop_idx
+        with jax.named_scope("iter_adaln"):
+            h_mod = collapse_streams(x_streams)
+            shift_a, scale_a, gate_a, shift_m, scale_m, gate_m = compute_iter_adaln_modulations(
+                params["iter_adaln"], h_mod, loop_idx
+            )
 
-    # 3. MLA sublayer inside Single-Pass mHC
-    if cfg.use_mhc:
-        h_in_a, _, h_post_a, h_res_a = mhc_compute_gates(
-            params["mhc"]["attn"], x_streams, cfg.mhc_sinkhorn_iters, cfg.rms_norm_eps
+        # 3. MLA sublayer inside Single-Pass mHC
+        def _attn_sublayer(p, xs, sa, sca, ga, aa):
+            with jax.named_scope("mhc_attn_sublayer"):
+                if cfg.use_mhc:
+                    h_in_a, _, h_post_a, h_res_a = mhc_compute_gates(
+                        p["mhc"]["attn"], xs, cfg.mhc_sinkhorn_iters, cfg.rms_norm_eps
+                    )
+                else:
+                    h_in_a = xs[:, :, 0, :]
+
+                h_in_a_norm = apply_adaln(
+                    h_in_a, p["iter_adaln"]["norm_attn_w"], sca, sa, cfg.rms_norm_eps
+                )
+                attn_out, _ = apply_mla(p["mla"], h_in_a_norm, cfg)
+                attn_out = attn_out * ga.astype(dt)
+
+                if cfg.use_mhc:
+                    return mhc_post_merge(xs, attn_out, h_post_a, h_res_a, loop_gate=aa)
+                return xs + aa * attn_out[:, :, None, :]
+
+        attn_fn = jax.checkpoint(_attn_sublayer) if cfg.remat_sublayers else _attn_sublayer
+        x_streams = attn_fn(params, x_streams, shift_a, scale_a, gate_a, alpha_attn)
+
+        # 4. DeepSeek MoE sublayer inside Single-Pass mHC
+        def _moe_sublayer(p, xs, sm, scm, gm, am, lidx):
+            with jax.named_scope("mhc_moe_sublayer"):
+                if cfg.use_mhc:
+                    h_in_m, _, h_post_m, h_res_m = mhc_compute_gates(
+                        p["mhc"]["moe"], xs, cfg.mhc_sinkhorn_iters, cfg.rms_norm_eps
+                    )
+                else:
+                    h_in_m = xs[:, :, 0, :]
+
+                h_in_m_norm = apply_adaln(
+                    h_in_m, p["iter_adaln"]["norm_moe_w"], scm, sm, cfg.rms_norm_eps
+                )
+                moe_out, ec, aux_l = apply_moe(p["moe"], h_in_m_norm, lidx, cfg)
+                moe_out = moe_out * gm.astype(dt)
+
+                if cfg.use_mhc:
+                    next_xs = mhc_post_merge(xs, moe_out, h_post_m, h_res_m, loop_gate=am)
+                else:
+                    next_xs = xs + am * moe_out[:, :, None, :]
+                return next_xs, ec, aux_l
+
+        moe_fn = jax.checkpoint(_moe_sublayer) if cfg.remat_sublayers else _moe_sublayer
+        x_streams, expert_counts, seq_aux_loss = moe_fn(
+            params, x_streams, shift_m, scale_m, gate_m, alpha_moe, loop_idx
         )
-    else:
-        h_in_a = x_streams[:, :, 0, :]
 
-    h_in_a_norm = apply_adaln(
-        h_in_a, params["iter_adaln"]["norm_attn_w"], scale_a, shift_a, cfg.rms_norm_eps
-    )
-    attn_out, _ = apply_mla(params["mla"], h_in_a_norm, cfg)
-    attn_out = attn_out * gate_a.astype(dt)
-
-    if cfg.use_mhc:
-        x_streams = mhc_post_merge(x_streams, attn_out, h_post_a, h_res_a, loop_gate=alpha_attn)
-    else:
-        x_streams = x_streams + alpha_attn * attn_out[:, :, None, :]
-
-    # 4. DeepSeek MoE sublayer inside Single-Pass mHC
-    if cfg.use_mhc:
-        h_in_m, _, h_post_m, h_res_m = mhc_compute_gates(
-            params["mhc"]["moe"], x_streams, cfg.mhc_sinkhorn_iters, cfg.rms_norm_eps
-        )
-    else:
-        h_in_m = x_streams[:, :, 0, :]
-
-    h_in_m_norm = apply_adaln(
-        h_in_m, params["iter_adaln"]["norm_moe_w"], scale_m, shift_m, cfg.rms_norm_eps
-    )
-    moe_out, expert_counts, seq_aux_loss = apply_moe(params["moe"], h_in_m_norm, loop_idx, cfg)
-    moe_out = moe_out * gate_m.astype(dt)
-
-    if cfg.use_mhc:
-        x_streams = mhc_post_merge(x_streams, moe_out, h_post_m, h_res_m, loop_gate=alpha_moe)
-    else:
-        x_streams = x_streams + alpha_moe * moe_out[:, :, None, :]
-
-    return x_streams, (expert_counts, seq_aux_loss, engram_gate_mean)
+        return x_streams, (expert_counts, seq_aux_loss, engram_gate_mean)
 
 
 def forward_hidden(
@@ -135,9 +152,10 @@ def forward_hidden(
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     """Run embedding + single pre-loop Engram gather + R-loop LoopMoE block + final RMSNorm."""
     x = params["embed_tokens"][input_ids]  # [B, S, D]
-    engram_e = (
-        prefetch_engram_embeddings(params["engram"], input_ids, cfg) if cfg.use_engram else None
-    )
+    with jax.named_scope("engram_prefetch"):
+        engram_e = (
+            prefetch_engram_embeddings(params["engram"], input_ids, cfg) if cfg.use_engram else None
+        )
 
     stream_init = params["mhc"]["stream_init"] if cfg.use_mhc else None
     x_streams = expand_streams(x, stream_init)
@@ -145,7 +163,8 @@ def forward_hidden(
     def scan_body(carry: jax.Array, loop_idx: jax.Array):
         return _single_loop_step(params, carry, engram_e, loop_idx, cfg)
 
-    step_fn = jax.checkpoint(scan_body) if (cfg.remat_per_loop and cfg.num_loops > 1) else scan_body
+    use_loop_remat = cfg.remat_per_loop and (cfg.num_loops > 1 or cfg.remat_sublayers)
+    step_fn = jax.checkpoint(scan_body) if use_loop_remat else scan_body
     loop_indices = jnp.arange(cfg.num_loops, dtype=jnp.int32)
     x_streams, (expert_counts, seq_aux_losses, gate_means) = jax.lax.scan(
         step_fn, x_streams, loop_indices
@@ -235,13 +254,14 @@ def forward_model(
     """Forward pass returning total loss (CE + tiny seq aux) and auxiliary telemetry."""
     hidden, aux = forward_hidden(params, input_ids, cfg)
     lm_w = get_lm_head_weight(params, cfg)
-    ce_loss = chunked_cross_entropy_loss(
-        hidden,
-        lm_w,
-        targets,
-        chunk_size=cfg.chunk_ce_size,
-        loss_mask=loss_mask,
-    )
+    with jax.named_scope("chunked_ce_loss"):
+        ce_loss = chunked_cross_entropy_loss(
+            hidden,
+            lm_w,
+            targets,
+            chunk_size=cfg.chunk_ce_size,
+            loss_mask=loss_mask,
+        )
     total_loss = ce_loss + aux["seq_aux_loss"]
     aux["ce_loss"] = ce_loss
     return total_loss, aux

@@ -93,61 +93,70 @@ def apply_moe(
     x_flat = x.reshape(num_tokens, d_model)
 
     # 1. Sigmoid routing + Aux-Loss-Free bias (bias excluded from gradient flow)
-    router_logits = (x_flat @ params["router_w"]).astype(jnp.float32)
-    scores = jax.nn.sigmoid(router_logits)
-    bias_t = jax.lax.stop_gradient(params["router_bias"][loop_idx])
-    biased_scores = scores + bias_t[None, :]
+    with jax.named_scope("moe_router"):
+        router_logits = (x_flat @ params["router_w"]).astype(jnp.float32)
+        scores = jax.nn.sigmoid(router_logits)
+        bias_t = jax.lax.stop_gradient(params["router_bias"][loop_idx])
+        biased_scores = scores + bias_t[None, :]
 
-    _, topk_idx = jax.lax.top_k(biased_scores, cfg.top_k)  # [N, K]
-    topk_scores = jnp.take_along_axis(scores, topk_idx, axis=-1)
-    topk_weights = topk_scores / (jnp.sum(topk_scores, axis=-1, keepdims=True) + 1e-20)
+        _, topk_idx = jax.lax.top_k(biased_scores, cfg.top_k)  # [N, K]
+        topk_scores = jnp.take_along_axis(scores, topk_idx, axis=-1)
+        topk_weights = topk_scores / (jnp.sum(topk_scores, axis=-1, keepdims=True) + 1e-20)
 
-    # 2. Sequence-wise balance loss (optional tiny regularizer) & token load counts
-    expert_counts = jnp.bincount(topk_idx.reshape(-1), length=cfg.n_routed_experts).astype(jnp.float32)
+        # 2. Sequence-wise balance loss (optional tiny regularizer) & token load counts
+        expert_counts = jnp.bincount(topk_idx.reshape(-1), length=cfg.n_routed_experts).astype(
+            jnp.float32
+        )
 
-    if cfg.seq_aux_loss_weight > 0.0:
-        scores_norm = scores / (jnp.sum(scores, axis=-1, keepdims=True) + 1e-20)
-        scores_seq = scores_norm.reshape(bsz, seq_len, cfg.n_routed_experts)
-        idx_seq = topk_idx.reshape(bsz, seq_len, cfg.top_k)
-        one_hot = jax.nn.one_hot(idx_seq, cfg.n_routed_experts, dtype=jnp.float32)
-        ce = jnp.mean(jnp.sum(one_hot, axis=2), axis=1) * (
-            float(cfg.n_routed_experts) / float(cfg.top_k)
-        )  # [B, E]
-        pi = jnp.mean(scores_seq, axis=1)  # [B, E]
-        seq_aux_loss = cfg.seq_aux_loss_weight * jnp.mean(jnp.sum(ce * pi, axis=-1))
-    else:
-        seq_aux_loss = jnp.asarray(0.0, dtype=jnp.float32)
+        if cfg.seq_aux_loss_weight > 0.0:
+            scores_norm = scores / (jnp.sum(scores, axis=-1, keepdims=True) + 1e-20)
+            scores_seq = scores_norm.reshape(bsz, seq_len, cfg.n_routed_experts)
+            idx_seq = topk_idx.reshape(bsz, seq_len, cfg.top_k)
+            one_hot = jax.nn.one_hot(idx_seq, cfg.n_routed_experts, dtype=jnp.float32)
+            ce = jnp.mean(jnp.sum(one_hot, axis=2), axis=1) * (
+                float(cfg.n_routed_experts) / float(cfg.top_k)
+            )  # [B, E]
+            pi = jnp.mean(scores_seq, axis=1)  # [B, E]
+            seq_aux_loss = cfg.seq_aux_loss_weight * jnp.mean(jnp.sum(ce * pi, axis=-1))
+        else:
+            seq_aux_loss = jnp.asarray(0.0, dtype=jnp.float32)
 
     # 3. Sort token-expert pairs by expert index for dropless ragged_dot
-    flat_experts = topk_idx.reshape(-1)
-    sort_order = jnp.argsort(flat_experts)
-    sorted_experts = flat_experts[sort_order]
-    token_indices = sort_order // cfg.top_k
-    sorted_weights = topk_weights.reshape(-1)[sort_order]
+    with jax.named_scope("moe_sort_dispatch"):
+        flat_experts = topk_idx.reshape(-1)
+        sort_order = jnp.argsort(flat_experts)
+        sorted_experts = flat_experts[sort_order]
+        token_indices = sort_order // cfg.top_k
+        sorted_weights = topk_weights.reshape(-1)[sort_order]
 
-    sorted_x = x_flat[token_indices]  # [N*K, D]
-    group_sizes = expert_counts.astype(jnp.int32)
+        sorted_x = x_flat[token_indices]  # [N*K, D]
+        group_sizes = expert_counts.astype(jnp.int32)
 
-    gate_act = _grouped_matmul(
-        sorted_x, params["w_gate"], group_sizes, sorted_experts, use_tokamax=cfg.moe_use_tokamax
-    )
-    up_act = _grouped_matmul(
-        sorted_x, params["w_up"], group_sizes, sorted_experts, use_tokamax=cfg.moe_use_tokamax
-    )
+    with jax.named_scope("moe_gmm_gate"):
+        gate_act = _grouped_matmul(
+            sorted_x, params["w_gate"], group_sizes, sorted_experts, use_tokamax=cfg.moe_use_tokamax
+        )
+    with jax.named_scope("moe_gmm_up"):
+        up_act = _grouped_matmul(
+            sorted_x, params["w_up"], group_sizes, sorted_experts, use_tokamax=cfg.moe_use_tokamax
+        )
     hidden = jax.nn.silu(gate_act) * up_act
-    down_out = _grouped_matmul(
-        hidden, params["w_down"], group_sizes, sorted_experts, use_tokamax=cfg.moe_use_tokamax
-    )
+    with jax.named_scope("moe_gmm_down"):
+        down_out = _grouped_matmul(
+            hidden, params["w_down"], group_sizes, sorted_experts, use_tokamax=cfg.moe_use_tokamax
+        )
 
-    dt = x_flat.dtype
-    scale_w = (sorted_weights[:, None] * float(cfg.routed_scaling_factor)).astype(dt)
-    scaled = down_out * scale_w
-    routed_out = jnp.zeros((num_tokens, d_model), dtype=dt).at[token_indices].add(scaled)
+    with jax.named_scope("moe_scatter_combine"):
+        dt = x_flat.dtype
+        scale_w = (sorted_weights[:, None] * float(cfg.routed_scaling_factor)).astype(dt)
+        scaled = down_out * scale_w
+        routed_out = jnp.zeros((num_tokens, d_model), dtype=dt).at[token_indices].add(scaled)
 
     # 4. Shared expert path (native BF16)
-    shared_gate = jax.nn.silu(x_flat @ params["shared_w_gate"])
-    shared_up = x_flat @ params["shared_w_up"]
-    shared_out = (shared_gate * shared_up) @ params["shared_w_down"]
+    with jax.named_scope("moe_shared_expert"):
+        shared_gate = jax.nn.silu(x_flat @ params["shared_w_gate"])
+        shared_up = x_flat @ params["shared_w_up"]
+        shared_out = (shared_gate * shared_up) @ params["shared_w_down"]
 
     total_out = (routed_out + shared_out).reshape(bsz, seq_len, d_model)
     return total_out, expert_counts, seq_aux_loss

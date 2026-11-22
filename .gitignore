@@ -9,6 +9,9 @@ dist/
 venv/
 checkpoints/
 _smoke_ckpt/
+_tmp_prof/
+tpu_profiles/
+bench_*.json
 artifacts/shards/
 *.bin
 *.msgpack

@@ -70,9 +70,15 @@ def test_forward_and_backward_r1_r8_and_csa2() -> None:
     x = jax.random.randint(key, (2, 32), 0, 512, dtype=jnp.int32)
     y = jax.random.randint(jax.random.PRNGKey(43), (2, 32), 0, 512, dtype=jnp.int32)
 
-    for num_loops, use_csa2, remat in [(1, False, False), (8, False, True), (2, True, False)]:
+    for num_loops, use_csa2, remat, remat_sub in [
+        (1, False, False, False),
+        (8, False, True, True),
+        (2, True, False, True),
+    ]:
         cfg = LoopMoEConfig.tiny(num_loops=num_loops, use_csa2_indexer=use_csa2)
-        cfg = LoopMoEConfig(**{**cfg.to_dict(), "remat_per_loop": remat})
+        cfg = LoopMoEConfig(
+            **{**cfg.to_dict(), "remat_per_loop": remat, "remat_sublayers": remat_sub}
+        )
         params = init_model_params(jax.random.PRNGKey(7), cfg)
         if num_loops > 1:
             params = expand_checkpoint_1_to_8_loops(params, jax.random.PRNGKey(8))

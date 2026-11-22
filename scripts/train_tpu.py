@@ -23,6 +23,7 @@ from tokenizers import Tokenizer
 from loopmoe.checkpoint import load_latest_checkpoint, save_checkpoint
 from loopmoe.config import (
     DEFAULT_CURRICULUM,
+    TPU_SPECS,
     LoopMoEConfig,
     StageConfig,
     estimate_step_flops,
@@ -91,7 +92,8 @@ def make_train_step(
         def accum_body(carry, microbatch):
             g_acc, loss_acc, ce_acc, gate_acc, cnt_acc = carry
             x_mb, y_mb = microbatch
-            (loss, aux), grads = grad_fn(params, x_mb, y_mb)
+            with jax.named_scope("fwd_bwd_microbatch"):
+                (loss, aux), grads = grad_fn(params, x_mb, y_mb)
             g_acc = jax.tree_util.tree_map(
                 lambda a, g: a + g * jnp.asarray(inv_g, dtype=g.dtype), g_acc, grads
             )
@@ -103,22 +105,25 @@ def make_train_step(
                 cnt_acc + aux["expert_counts"] * inv_g,
             ), None
 
-        (grads_mean, loss_mean, ce_mean, gate_mean, counts_mean), _ = jax.lax.scan(
-            accum_body, init_carry, (batch_xs, batch_ys)
-        )
+        with jax.named_scope("grad_accum_scan"):
+            (grads_mean, loss_mean, ce_mean, gate_mean, counts_mean), _ = jax.lax.scan(
+                accum_body, init_carry, (batch_xs, batch_ys)
+            )
 
-        updates, new_opt_state = optimizer.update(grads_mean, opt_state, params)
-        new_params = optax.apply_updates(params, updates)
+        with jax.named_scope("optimizer_muon_adamw"):
+            updates, new_opt_state = optimizer.update(grads_mean, opt_state, params)
+            new_params = optax.apply_updates(params, updates)
 
         # Auxiliary-Loss-Free dynamic bias adjustment outside gradient flow
-        moe_dict = dict(new_params["moe"])
-        moe_dict["router_bias"] = update_router_biases(
-            moe_dict["router_bias"],
-            counts_mean,
-            num_loops=model_cfg.num_loops,
-            update_rate=model_cfg.router_bias_update_rate,
-        )
-        new_params = {**new_params, "moe": moe_dict}
+        with jax.named_scope("router_bias_update"):
+            moe_dict = dict(new_params["moe"])
+            moe_dict["router_bias"] = update_router_biases(
+                moe_dict["router_bias"],
+                counts_mean,
+                num_loops=model_cfg.num_loops,
+                update_rate=model_cfg.router_bias_update_rate,
+            )
+            new_params = {**new_params, "moe": moe_dict}
 
         expert_mean = jnp.mean(counts_mean)
         expert_cv = jnp.std(counts_mean) / jnp.maximum(expert_mean, 1e-6)
@@ -211,7 +216,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seq-len-override", type=int, default=None, help="Optional seq_len override for debugging.")
     parser.add_argument("--muon-lr", type=float, default=0.015)
     parser.add_argument("--adam-lr", type=float, default=1.5e-3)
-    parser.add_argument("--peak-tflops", type=float, default=918.0, help="TPU v6e-1 BF16 peak TFLOPS.")
+    parser.add_argument(
+        "--tpu-preset",
+        choices=["v5e-1", "v6e-1"],
+        default="v6e-1",
+        help="Hardware preset adjusting peak TFLOPS, chunk CE size, sublayer remat, and default microbatch.",
+    )
+    parser.add_argument("--remat-sublayers", action="store_true", help="Enable sublayer remat inside loop.")
+    parser.add_argument("--chunk-ce-size", type=int, default=None, help="Chunk size for chunked cross-entropy.")
+    parser.add_argument("--profile-dir", type=str, default=None, help="Optional JAX profiler trace output directory.")
+    parser.add_argument("--profile-start-step", type=int, default=2, help="Step index to start profiling trace.")
+    parser.add_argument("--profile-steps", type=int, default=3, help="Number of steps to trace in profiler.")
+    parser.add_argument("--peak-tflops", type=float, default=None, help="Override TPU BF16 peak TFLOPS.")
     parser.add_argument("--use-csa2-long", action="store_true", help="Enable CSA2 indexer on >=16K stages.")
     parser.add_argument("--tiny", action="store_true", help="Use tiny model config for local debugging.")
     parser.add_argument("--seed", type=int, default=42)
@@ -221,11 +237,23 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    print(f"JAX backend: {jax.default_backend()} | devices: {jax.devices()}")
+    spec = TPU_SPECS[args.tpu_preset]
+    peak_tflops = args.peak_tflops or spec["peak_tflops_bf16"]
+    print(f"JAX backend: {jax.default_backend()} | devices: {jax.devices()} | preset: {args.tpu_preset}")
 
     base_cfg = LoopMoEConfig.tiny() if args.tiny else LoopMoEConfig()
+    cfg_overrides: dict[str, Any] = {}
     if args.use_csa2_long:
-        base_cfg = LoopMoEConfig(**{**base_cfg.to_dict(), "use_csa2_indexer": True})
+        cfg_overrides["use_csa2_indexer"] = True
+    if args.tpu_preset == "v5e-1" and not args.tiny:
+        cfg_overrides["remat_sublayers"] = True
+        cfg_overrides["chunk_ce_size"] = int(spec["default_chunk_ce_size"])
+    if args.remat_sublayers:
+        cfg_overrides["remat_sublayers"] = True
+    if args.chunk_ce_size is not None:
+        cfg_overrides["chunk_ce_size"] = args.chunk_ce_size
+    if cfg_overrides:
+        base_cfg = LoopMoEConfig(**{**base_cfg.to_dict(), **cfg_overrides})
     print(summarize_model(base_cfg))
 
     tokenizer = _load_tokenizer(args)
@@ -287,7 +315,8 @@ def main() -> None:
             continue
 
         global_tok = args.global_batch_tokens or stage.global_batch_tokens
-        micro_tok = args.microbatch_tokens or stage.microbatch_tokens
+        default_micro = int(spec["default_microbatch_tokens"]) if (args.tpu_preset == "v5e-1" and not args.tiny) else stage.microbatch_tokens
+        micro_tok = args.microbatch_tokens or default_micro
         if micro_tok % stage.seq_len != 0:
             micro_tok = stage.seq_len
         grad_accum = max(1, global_tok // micro_tok)
@@ -331,7 +360,14 @@ def main() -> None:
 
         try:
             t_log = time.perf_counter()
+            profiling_active = False
+            prof_end_step = args.profile_start_step + args.profile_steps
             for step in range(start_step, total_steps):
+                if args.profile_dir and not profiling_active and step == args.profile_start_step:
+                    Path(args.profile_dir).mkdir(parents=True, exist_ok=True)
+                    jax.profiler.start_trace(args.profile_dir)
+                    profiling_active = True
+
                 xs_list = []
                 ys_list = []
                 for _ in range(grad_accum):
@@ -342,7 +378,16 @@ def main() -> None:
                 batch_xs = jnp.asarray(np.stack(xs_list, axis=0))
                 batch_ys = jnp.asarray(np.stack(ys_list, axis=0))
 
-                params, opt_state, metrics = train_step(params, opt_state, batch_xs, batch_ys)
+                with jax.profiler.StepTraceAnnotation("train_step", step_num=step):
+                    params, opt_state, metrics = train_step(params, opt_state, batch_xs, batch_ys)
+                    if profiling_active:
+                        jax.block_until_ready(metrics["loss"])
+
+                if profiling_active and (step + 1) >= prof_end_step:
+                    jax.profiler.stop_trace()
+                    profiling_active = False
+                    print(f"[Profiler] Saved trace to {args.profile_dir}")
+
                 # Synchronize on log/ckpt boundaries for accurate MFU timing
                 tokens_seen += grad_accum * micro_tok
 
@@ -352,7 +397,7 @@ def main() -> None:
                     steps_elapsed = 1 if step == start_step else args.log_every
                     sec_per_step = dt / steps_elapsed
                     tok_per_sec = (grad_accum * micro_tok) / sec_per_step
-                    mfu = 100.0 * (step_flops / sec_per_step) / (args.peak_tflops * 1e12)
+                    mfu = 100.0 * (step_flops / sec_per_step) / (peak_tflops * 1e12)
                     tag = " (compile)" if step == start_step else ""
                     print(
                         f"[S{stage.stage_id} step {step + 1}/{total_steps}]{tag} "
@@ -381,6 +426,9 @@ def main() -> None:
                     )
                     print(f"[Checkpoint] Saved {ckpt_dir}")
         finally:
+            if profiling_active:
+                jax.profiler.stop_trace()
+                print(f"[Profiler] Saved trace to {args.profile_dir}")
             loader.close()
 
         prev_num_loops = stage.num_loops

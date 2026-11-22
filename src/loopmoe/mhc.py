@@ -24,17 +24,18 @@ def rms_norm(
 
 def sinkhorn_knopp(logits: jax.Array, num_iters: int = 20, eps: float = 1e-6) -> jax.Array:
     """Project log-space square matrices (..., N, N) onto the Birkhoff polytope."""
-    x = jnp.clip(logits.astype(jnp.float32), -20.0, 20.0)
-    # Subtract max per row before exp to prevent overflow while preserving Sinkhorn fixed point
-    x = x - jnp.max(x, axis=-1, keepdims=True)
-    m = jnp.exp(x)
+    with jax.named_scope("mhc_sinkhorn"):
+        x = jnp.clip(logits.astype(jnp.float32), -20.0, 20.0)
+        # Subtract max per row before exp to prevent overflow while preserving Sinkhorn fixed point
+        x = x - jnp.max(x, axis=-1, keepdims=True)
+        m = jnp.exp(x)
 
-    def body_fn(_: int, mat: jax.Array) -> jax.Array:
-        mat = mat / (jnp.sum(mat, axis=-1, keepdims=True) + eps)
-        mat = mat / (jnp.sum(mat, axis=-2, keepdims=True) + eps)
-        return mat
+        def body_fn(_: int, mat: jax.Array) -> jax.Array:
+            mat = mat / (jnp.sum(mat, axis=-1, keepdims=True) + eps)
+            mat = mat / (jnp.sum(mat, axis=-2, keepdims=True) + eps)
+            return mat
 
-    return jax.lax.fori_loop(0, num_iters, body_fn, m)
+        return jax.lax.fori_loop(0, num_iters, body_fn, m)
 
 
 def init_mhc_sublayer_params(
@@ -104,27 +105,28 @@ def mhc_compute_gates(
     eps: float = 1e-6,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Compute pre-aggregated input and mHC mixing matrices (H_pre, H_post, H_res)."""
-    bsz, seq_len, n_streams, d_model = x_streams.shape
-    dt = x_streams.dtype
-    x_flat = x_streams.reshape(bsz, seq_len, n_streams * d_model)
-    x_norm = rms_norm(x_flat, params["norm_w"], eps=eps)
+    with jax.named_scope("mhc_compute_gates"):
+        bsz, seq_len, n_streams, d_model = x_streams.shape
+        dt = x_streams.dtype
+        x_flat = x_streams.reshape(bsz, seq_len, n_streams * d_model)
+        x_norm = rms_norm(x_flat, params["norm_w"], eps=eps)
 
-    # Fused linear projections in input dtype, Sinkhorn manifold projection in float32
-    pre_dyn = (x_norm @ params["phi_pre"]).astype(jnp.float32)
-    post_dyn = (x_norm @ params["phi_post"]).astype(jnp.float32)
-    res_dyn = (x_norm @ params["phi_res"]).astype(jnp.float32).reshape(
-        bsz, seq_len, n_streams, n_streams
-    )
+        # Fused linear projections in input dtype, Sinkhorn manifold projection in float32
+        pre_dyn = (x_norm @ params["phi_pre"]).astype(jnp.float32)
+        post_dyn = (x_norm @ params["phi_post"]).astype(jnp.float32)
+        res_dyn = (x_norm @ params["phi_res"]).astype(jnp.float32).reshape(
+            bsz, seq_len, n_streams, n_streams
+        )
 
-    h_pre = jax.nn.sigmoid(params["alpha_pre"] * pre_dyn + params["b_pre"])
-    h_pre = (h_pre / (jnp.sum(h_pre, axis=-1, keepdims=True) + eps)).astype(dt)
+        h_pre = jax.nn.sigmoid(params["alpha_pre"] * pre_dyn + params["b_pre"])
+        h_pre = (h_pre / (jnp.sum(h_pre, axis=-1, keepdims=True) + eps)).astype(dt)
 
-    h_post = (2.0 * jax.nn.sigmoid(params["alpha_post"] * post_dyn + params["b_post"])).astype(dt)
-    h_res_logits = params["alpha_res"] * res_dyn + params["b_res"]
-    h_res = sinkhorn_knopp(h_res_logits, num_iters=sinkhorn_iters, eps=eps).astype(dt)
+        h_post = (2.0 * jax.nn.sigmoid(params["alpha_post"] * post_dyn + params["b_post"])).astype(dt)
+        h_res_logits = params["alpha_res"] * res_dyn + params["b_res"]
+        h_res = sinkhorn_knopp(h_res_logits, num_iters=sinkhorn_iters, eps=eps).astype(dt)
 
-    h_in = jnp.einsum("bsn,bsnd->bsd", h_pre, x_streams)
-    return h_in, h_pre, h_post, h_res
+        h_in = jnp.einsum("bsn,bsnd->bsd", h_pre, x_streams)
+        return h_in, h_pre, h_post, h_res
 
 
 def mhc_post_merge(
@@ -135,10 +137,11 @@ def mhc_post_merge(
     loop_gate: jax.Array | float = 1.0,
 ) -> jax.Array:
     """Single-Pass mHC post-residual update with smooth identity gating for loop expansion."""
-    dt = x_streams.dtype
-    mixed = jnp.einsum("bsij,bsjd->bsid", h_res.astype(dt), x_streams) + (
-        h_post[:, :, :, None].astype(dt) * sublayer_out[:, :, None, :].astype(dt)
-    )
-    gate = jnp.asarray(loop_gate, dtype=dt)
-    one = jnp.asarray(1.0, dtype=dt)
-    return (one - gate) * x_streams + gate * mixed
+    with jax.named_scope("mhc_post_merge"):
+        dt = x_streams.dtype
+        mixed = jnp.einsum("bsij,bsjd->bsid", h_res.astype(dt), x_streams) + (
+            h_post[:, :, :, None].astype(dt) * sublayer_out[:, :, None, :].astype(dt)
+        )
+        gate = jnp.asarray(loop_gate, dtype=dt)
+        one = jnp.asarray(1.0, dtype=dt)
+        return (one - gate) * x_streams + gate * mixed
