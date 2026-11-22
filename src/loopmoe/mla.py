@@ -1,0 +1,310 @@
+"""DeepSeek-V4.1-Flash Multi-head Latent Attention (MLA), YaRN RoPE, Splash Attention, and optional CSA2 Indexer."""
+
+from __future__ import annotations
+
+import inspect
+import math
+
+import jax
+import jax.numpy as jnp
+
+from .config import LoopMoEConfig
+from .mhc import rms_norm
+
+
+def compute_yarn_freqs(
+    d_rope: int,
+    theta: float = 10_000.0,
+    base_seq_len: int = 4096,
+    scale: float = 1.0,
+    beta_fast: float = 32.0,
+    beta_slow: float = 1.0,
+) -> tuple[jax.Array, float]:
+    """Compute YaRN inverse frequencies and attention mscale factor."""
+    dim_idx = jnp.arange(0, d_rope, 2, dtype=jnp.float32)
+    freq_extra = 1.0 / (theta ** (dim_idx / float(d_rope)))
+
+    if scale <= 1.0:
+        return freq_extra, 1.0
+
+    freq_inter = 1.0 / (scale * (theta ** (dim_idx / float(d_rope))))
+
+    def _find_correction_dim(num_rotations: float) -> float:
+        return (d_rope * math.log(base_seq_len / (num_rotations * 2.0 * math.pi))) / (
+            2.0 * math.log(theta)
+        )
+
+    low = max(math.floor(_find_correction_dim(beta_fast)), 0)
+    high = min(math.ceil(_find_correction_dim(beta_slow)), d_rope - 1)
+    if low == high:
+        high += 0.001
+
+    half_idx = jnp.arange(d_rope // 2, dtype=jnp.float32)
+    linear_func = (half_idx - float(low)) / float(high - low)
+    ramp = jnp.clip(linear_func, 0.0, 1.0)
+    # smooth == 1 keeps high frequency (extrapolation), 0 uses interpolated frequency
+    inv_freq_mask = 1.0 - ramp
+    inv_freq = freq_inter * (1.0 - inv_freq_mask) + freq_extra * inv_freq_mask
+    mscale = 0.1 * math.log(scale) + 1.0
+    return inv_freq, mscale
+
+
+def apply_rope(x: jax.Array, inv_freq: jax.Array) -> jax.Array:
+    """Apply rotary position embeddings to [B, S, H, D_rope] in native dtype."""
+    seq_len = x.shape[1]
+    positions = jnp.arange(seq_len, dtype=jnp.float32)[:, None]
+    angles = positions * inv_freq[None, :]  # [S, D_rope // 2]
+    cos = jnp.cos(angles)[None, :, None, :].astype(x.dtype)
+    sin = jnp.sin(angles)[None, :, None, :].astype(x.dtype)
+
+    x1 = x[..., 0::2]
+    x2 = x[..., 1::2]
+    out1 = x1 * cos - x2 * sin
+    out2 = x1 * sin + x2 * cos
+    return jnp.stack([out1, out2], axis=-1).reshape(x.shape)
+
+
+def init_mla_params(
+    key: jax.Array,
+    cfg: LoopMoEConfig,
+    dtype: jnp.dtype = jnp.bfloat16,
+) -> dict[str, jax.Array]:
+    """Initialize MLA projection matrices and optional CSA2 Lightning Indexer."""
+    keys = jax.random.split(key, 9)
+    d = cfg.d_model
+    h = cfg.n_heads
+
+    params: dict[str, jax.Array] = {
+        "w_dq": jax.random.normal(keys[0], (d, cfg.d_q_lora), dtype=dtype)
+        * (1.0 / jnp.sqrt(float(d))),
+        "q_norm_w": jnp.ones((cfg.d_q_lora,), dtype=dtype),
+        "w_uq": jax.random.normal(keys[1], (cfg.d_q_lora, h * cfg.d_qk_head), dtype=dtype)
+        * (1.0 / jnp.sqrt(float(cfg.d_q_lora))),
+        "w_dkv": jax.random.normal(keys[2], (d, cfg.d_kv_lora + cfg.d_qk_rope), dtype=dtype)
+        * (1.0 / jnp.sqrt(float(d))),
+        "kv_norm_w": jnp.ones((cfg.d_kv_lora,), dtype=dtype),
+        "w_ukv": jax.random.normal(keys[3], (cfg.d_kv_lora, h * (cfg.d_qk_nope + cfg.d_v)), dtype=dtype)
+        * (1.0 / jnp.sqrt(float(cfg.d_kv_lora))),
+        "w_o": jax.random.normal(keys[4], (h * cfg.d_v, d), dtype=dtype)
+        * (1.0 / jnp.sqrt(float(h * cfg.d_v))),
+    }
+
+    if cfg.use_csa2_indexer:
+        params.update(
+            {
+                "idx_w_q": jax.random.normal(
+                    keys[5], (cfg.d_q_lora, cfg.csa2_num_heads * cfg.csa2_head_dim), dtype=dtype
+                )
+                * (1.0 / jnp.sqrt(float(cfg.d_q_lora))),
+                "idx_w_k": jax.random.normal(keys[6], (d, cfg.csa2_head_dim), dtype=dtype)
+                * (1.0 / jnp.sqrt(float(d))),
+                "idx_k_norm_w": jnp.ones((cfg.csa2_head_dim,), dtype=dtype),
+                "idx_w_score": jax.random.normal(keys[7], (d, cfg.csa2_num_heads), dtype=dtype)
+                * (1.0 / jnp.sqrt(float(d))),
+            }
+        )
+    return params
+
+
+def quantize_kv_fp4_e2m1(kv: jax.Array, group_size: int = 16) -> tuple[jax.Array, jax.Array]:
+    """DeepSeek-V4.1-Flash simulated FP4 (E2M1) per-16-channel KV quantization for eval/serving."""
+    orig_shape = kv.shape
+    last_dim = orig_shape[-1]
+    pad = (group_size - (last_dim % group_size)) % group_size
+    kv_f32 = kv.astype(jnp.float32)
+    if pad:
+        kv_f32 = jnp.pad(kv_f32, [(0, 0)] * (kv_f32.ndim - 1) + [(0, pad)])
+    grouped = kv_f32.reshape(*orig_shape[:-1], -1, group_size)
+    max_abs = jnp.maximum(jnp.max(jnp.abs(grouped), axis=-1, keepdims=True), 1e-8)
+    scale = max_abs / 6.0  # E2M1 max magnitude = 6.0
+    normed = grouped / scale
+
+    # Nearest E2M1 grid values: {0, 0.5, 1, 1.5, 2, 3, 4, 6}
+    e2m1_pos = jnp.asarray([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=jnp.float32)
+    signs = jnp.sign(normed)
+    abs_val = jnp.abs(normed)[..., None]
+    nearest_idx = jnp.argmin(jnp.abs(abs_val - e2m1_pos), axis=-1)
+    q_val = signs * e2m1_pos[nearest_idx]
+    dequant = (q_val * scale).reshape(*orig_shape[:-1], last_dim + pad)[..., :last_dim]
+    return dequant.astype(kv.dtype), scale.squeeze(-1).astype(jnp.bfloat16)
+
+
+def compute_csa2_lightning_mask(
+    params: dict[str, jax.Array],
+    x: jax.Array,
+    c_q: jax.Array,
+    cfg: LoopMoEConfig,
+) -> tuple[jax.Array, jax.Array]:
+    """Compute CSA2 Lightning Indexer causal Top-K mask and raw index scores."""
+    bsz, seq_len, _ = x.shape
+    q_idx = (c_q @ params["idx_w_q"]).reshape(bsz, seq_len, cfg.csa2_num_heads, cfg.csa2_head_dim)
+    k_idx = rms_norm(x @ params["idx_w_k"], params["idx_k_norm_w"], eps=cfg.rms_norm_eps)
+    weights = jax.nn.relu(x @ params["idx_w_score"])  # [B, S, H_idx] in native BF16
+
+    # Score_{i, j} = sum_h w_{i, h} * ReLU(q_{i, h} . k_j)
+    raw = jnp.einsum("bshd,btd->bsht", q_idx, k_idx)
+    raw = jax.nn.relu(raw)
+    scores = jnp.sum(weights[:, :, :, None] * raw, axis=2).astype(jnp.float32)  # [B, S, S]
+
+    causal = jnp.tril(jnp.ones((seq_len, seq_len), dtype=bool))[None, :, :]
+    scores = jnp.where(causal, scores, -1e9)
+
+    k_select = min(cfg.csa2_topk, seq_len)
+    _, topk_idx = jax.lax.top_k(scores, k_select)
+    mask = jnp.zeros((bsz, seq_len, seq_len), dtype=bool)
+    b_idx = jnp.arange(bsz)[:, None, None]
+    q_pos = jnp.arange(seq_len)[None, :, None]
+    mask = mask.at[b_idx, q_pos, topk_idx].set(True) & causal
+    return mask, scores
+
+
+def _pad_last_dim_to_multiple(x: jax.Array, multiple: int) -> jax.Array:
+    dim = x.shape[-1]
+    rem = dim % multiple
+    if rem == 0:
+        return x
+    return jnp.pad(x, [(0, 0)] * (x.ndim - 1) + [(0, multiple - rem)])
+
+
+def _run_causal_attention(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    softmax_scale: float,
+    use_tokamax: bool,
+    sparse_mask: jax.Array | None = None,
+) -> jax.Array:
+    """Execute high-MFU TPU Splash/Tokamax attention with safe fallback on CPU/GPU."""
+    d_qk = q.shape[-1]
+    d_v = v.shape[-1]
+    seq_len = q.shape[1]
+    on_tpu = jax.default_backend() == "tpu"
+
+    def _sdpa_matched(q_in: jax.Array, k_in: jax.Array, v_in: jax.Array, mask_in=None) -> jax.Array:
+        max_d = max(d_qk, d_v)
+        q_m = _pad_last_dim_to_multiple(q_in, max_d) if d_qk < max_d else q_in
+        k_m = _pad_last_dim_to_multiple(k_in, max_d) if d_qk < max_d else k_in
+        v_m = _pad_last_dim_to_multiple(v_in, max_d) if d_v < max_d else v_in
+        if mask_in is not None:
+            out_m = jax.nn.dot_product_attention(
+                q_m,
+                k_m,
+                v_m,
+                mask=mask_in[:, None, :, :],
+                scale=softmax_scale,
+                is_causal=False,
+            )
+        else:
+            out_m = jax.nn.dot_product_attention(
+                q_m,
+                k_m,
+                v_m,
+                is_causal=True,
+                scale=softmax_scale,
+            )
+        return out_m[..., :d_v]
+
+    # Sparse mask path (CSA2 Top-K) uses masked SDPA directly
+    if sparse_mask is not None:
+        return _sdpa_matched(q, k, v, mask_in=sparse_mask)
+
+    if use_tokamax and on_tpu:
+        target_dim = max(((max(d_qk, d_v) + 127) // 128) * 128, 128)
+        q_pad = _pad_last_dim_to_multiple(q, target_dim) if d_qk != target_dim else q
+        k_pad = _pad_last_dim_to_multiple(k, target_dim) if d_qk != target_dim else k
+        v_pad = _pad_last_dim_to_multiple(v, target_dim) if d_v != target_dim else v
+
+        try:
+            import tokamax  # type: ignore
+
+            fn = getattr(tokamax, "dot_product_attention", None)
+            if fn is not None:
+                sig = inspect.signature(fn)
+                kwargs: dict[str, object] = {"is_causal": True}
+                if "logits_scale" in sig.parameters:
+                    kwargs["logits_scale"] = softmax_scale
+                elif "scale" in sig.parameters:
+                    kwargs["scale"] = softmax_scale
+                if "implementation" in sig.parameters:
+                    kwargs["implementation"] = "mosaic"
+                out = fn(q_pad, k_pad, v_pad, **kwargs)
+                return out[..., :d_v]
+        except Exception:
+            pass
+
+        if seq_len >= 128 and seq_len % 128 == 0:
+            try:
+                from jax.experimental.pallas.ops.tpu.splash_attention import (
+                    CausalMask,
+                    MultiHeadMask,
+                    make_splash_mha,
+                )
+
+                num_heads = q_pad.shape[2]
+                mask = MultiHeadMask([CausalMask(shape=(seq_len, seq_len)) for _ in range(num_heads)])
+                splash_fn = make_splash_mha(mask=mask, head_shards=1, q_seq_shards=1)
+                # Splash attention takes [H, S, D] per batch item and does not scale Q internally
+                q_hsd = jnp.swapaxes(q_pad * jnp.asarray(softmax_scale, dtype=q_pad.dtype), 1, 2)
+                k_hsd = jnp.swapaxes(k_pad, 1, 2)
+                v_hsd = jnp.swapaxes(v_pad, 1, 2)
+                out_hsd = jax.vmap(splash_fn)(q_hsd, k_hsd, v_hsd)
+                return jnp.swapaxes(out_hsd, 1, 2)[..., :d_v]
+            except Exception:
+                pass
+
+    return _sdpa_matched(q, k, v)
+
+
+def apply_mla(
+    params: dict[str, jax.Array],
+    x: jax.Array,
+    cfg: LoopMoEConfig,
+) -> tuple[jax.Array, dict[str, jax.Array]]:
+    """Run Multi-head Latent Attention (+ optional CSA2 Lightning Indexer)."""
+    bsz, seq_len, _ = x.shape
+    h = cfg.n_heads
+
+    c_q = rms_norm(x @ params["w_dq"], params["q_norm_w"], eps=cfg.rms_norm_eps)
+    q_all = (c_q @ params["w_uq"]).reshape(bsz, seq_len, h, cfg.d_qk_head)
+    q_nope, q_rope = jnp.split(q_all, [cfg.d_qk_nope], axis=-1)
+
+    kv_raw = x @ params["w_dkv"]
+    c_kv_raw, k_rope_shared = jnp.split(kv_raw, [cfg.d_kv_lora], axis=-1)
+    c_kv = rms_norm(c_kv_raw, params["kv_norm_w"], eps=cfg.rms_norm_eps)
+
+    kv_all = (c_kv @ params["w_ukv"]).reshape(bsz, seq_len, h, cfg.d_qk_nope + cfg.d_v)
+    k_nope, v = jnp.split(kv_all, [cfg.d_qk_nope], axis=-1)
+
+    inv_freq, mscale = compute_yarn_freqs(
+        d_rope=cfg.d_qk_rope,
+        theta=cfg.rope_theta,
+        base_seq_len=cfg.base_seq_len,
+        scale=cfg.yarn_scale,
+        beta_fast=cfg.yarn_beta_fast,
+        beta_slow=cfg.yarn_beta_slow,
+    )
+    q_rope = apply_rope(q_rope, inv_freq)
+    k_rope = apply_rope(k_rope_shared[:, :, None, :], inv_freq)
+    k_rope = jnp.broadcast_to(k_rope, (bsz, seq_len, h, cfg.d_qk_rope))
+
+    q = jnp.concatenate([q_nope, q_rope], axis=-1)
+    k = jnp.concatenate([k_nope, k_rope], axis=-1)
+
+    softmax_scale = (mscale * mscale) / math.sqrt(float(cfg.d_qk_head))
+
+    aux_info: dict[str, jax.Array] = {}
+    sparse_mask = None
+    if cfg.use_csa2_indexer and seq_len > cfg.csa2_topk:
+        sparse_mask, idx_scores = compute_csa2_lightning_mask(params, x, c_q, cfg)
+        aux_info["csa2_score_mean"] = jnp.mean(idx_scores)
+
+    attn_out = _run_causal_attention(
+        q,
+        k,
+        v,
+        softmax_scale=softmax_scale,
+        use_tokamax=cfg.attn_use_tokamax,
+        sparse_mask=sparse_mask,
+    )
+    out = attn_out.reshape(bsz, seq_len, h * cfg.d_v) @ params["w_o"]
+    return out, aux_info

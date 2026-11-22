@@ -1,0 +1,10 @@
+# Google Colab TPU v6e-1 runtime dependencies
+# Install JAX TPU first:
+#   pip install -U "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+flax>=0.10.0
+optax>=0.2.5
+tokamax
+tokenizers>=0.20.0
+datasets>=3.0.0
+huggingface_hub>=0.26.0
+tqdm>=4.66.0

@@ -1,0 +1,31 @@
+"""1B 1-Layer DeepSeek-V4.1-Flash LoopMoE package."""
+
+from .config import (
+    DEFAULT_CURRICULUM,
+    SPECIAL_TOKENS,
+    LoopMoEConfig,
+    StageConfig,
+    count_analytic_params,
+    estimate_step_flops,
+)
+from .model import (
+    chunked_cross_entropy_loss,
+    count_tree_params,
+    expand_checkpoint_1_to_8_loops,
+    forward_model,
+    init_model_params,
+)
+
+__all__ = [
+    "DEFAULT_CURRICULUM",
+    "SPECIAL_TOKENS",
+    "LoopMoEConfig",
+    "StageConfig",
+    "chunked_cross_entropy_loss",
+    "count_analytic_params",
+    "count_tree_params",
+    "estimate_step_flops",
+    "expand_checkpoint_1_to_8_loops",
+    "forward_model",
+    "init_model_params",
+]
