@@ -47,7 +47,7 @@ def test_full_1b_analytic_params_and_tiny_exact_match() -> None:
     cfg = LoopMoEConfig()
     stats = count_analytic_params(cfg)
     assert 1.10e9 <= stats["total"] <= 1.20e9, f"Expected ~1.15B params, got {stats['total']}"
-    assert 0.18 <= stats["engram_sparse_ratio"] <= 0.25, stats["engram_sparse_ratio"]
+    assert 0.20 <= stats["engram_sparse_ratio"] <= 0.25, stats["engram_sparse_ratio"]
     assert all(is_prime(p) for p in cfg.engram_table_sizes)
     assert len(set(cfg.engram_table_sizes)) == len(cfg.engram_table_sizes)
 

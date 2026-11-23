@@ -100,7 +100,7 @@ class LoopMoEConfig:
     engram_orders: tuple[int, ...] = (2, 3)
     engram_hash_heads: int = 4
     engram_head_dim: int = 128
-    engram_total_slots: int = 1_460_000
+    engram_total_slots: int = 1_600_000
     engram_conv_kernel: int = 4
     engram_conv_dilation: int = 3
     engram_seed: int = 20260112
