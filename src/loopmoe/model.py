@@ -77,12 +77,18 @@ def _single_loop_step(
 
         # 1. Context-aware Engram conditional memory refinement
         if cfg.use_engram:
-            with jax.named_scope("engram_step"):
-                h_summary = collapse_streams(x_streams)
-                engram_delta, engram_gate_mean = apply_engram_step(
-                    params["engram"], h_summary, engram_e, cfg
-                )
-                x_streams = x_streams + alpha_engram * engram_delta[:, :, None, :]
+            def _engram_sublayer(p, xs, ee, ae):
+                with jax.named_scope("engram_step"):
+                    h_summary = collapse_streams(xs)
+                    engram_delta, gate_mean = apply_engram_step(p["engram"], h_summary, ee, cfg)
+                    return xs + ae * engram_delta[:, :, None, :], gate_mean
+
+            engram_fn = (
+                jax.checkpoint(_engram_sublayer)
+                if (cfg.remat_sublayers or cfg.remat_moe)
+                else _engram_sublayer
+            )
+            x_streams, engram_gate_mean = engram_fn(params, x_streams, engram_e, alpha_engram)
         else:
             engram_gate_mean = jnp.asarray(0.0, dtype=jnp.float32)
 
@@ -168,7 +174,7 @@ def forward_hidden(
     def scan_body(carry: jax.Array, loop_idx: jax.Array):
         return _single_loop_step(params, carry, engram_e, loop_idx, cfg)
 
-    use_loop_remat = cfg.remat_per_loop and (cfg.num_loops > 1 or cfg.remat_sublayers)
+    use_loop_remat = cfg.remat_per_loop and (cfg.num_loops > 1)
     step_fn = jax.checkpoint(scan_body) if use_loop_remat else scan_body
     loop_indices = jnp.arange(cfg.num_loops, dtype=jnp.int32)
     x_streams, (expert_counts, seq_aux_losses, gate_means) = jax.lax.scan(

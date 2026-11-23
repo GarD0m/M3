@@ -158,17 +158,16 @@ def apply_moe(
             sorted_x, params["w_gate_up"], group_sizes, sorted_experts, use_tokamax=cfg.moe_use_tokamax
         )
         gate_act, up_act = jnp.split(gate_up, 2, axis=-1)
-    hidden = jax.nn.silu(gate_act) * up_act
+    dt = x_flat.dtype
+    scale_w = (sorted_weights[:, None] * float(cfg.routed_scaling_factor)).astype(dt)
+    hidden = (jax.nn.silu(gate_act) * up_act) * scale_w
     with jax.named_scope("moe_gmm_down"):
         down_out = _grouped_matmul(
             hidden, params["w_down"], group_sizes, sorted_experts, use_tokamax=cfg.moe_use_tokamax
         )
 
     with jax.named_scope("moe_scatter_combine"):
-        dt = x_flat.dtype
-        scale_w = (sorted_weights[:, None] * float(cfg.routed_scaling_factor)).astype(dt)
-        scaled = down_out * scale_w
-        routed_out = jnp.zeros((num_tokens, d_model), dtype=dt).at[token_indices].add(scaled)
+        routed_out = jnp.zeros((num_tokens, d_model), dtype=dt).at[token_indices].add(down_out)
 
     # 4. Shared expert path (native BF16)
     with jax.named_scope("moe_shared_expert"):

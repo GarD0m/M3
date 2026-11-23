@@ -22,7 +22,7 @@ from loopmoe.config import (
     count_analytic_params,
     is_prime,
 )
-from loopmoe.mhc import sinkhorn_knopp
+from loopmoe.mhc import mhc_post_merge, rms_norm, sinkhorn_knopp
 from loopmoe.mla import quantize_kv_fp4_e2m1
 from loopmoe.model import (
     chunked_cross_entropy_loss,
@@ -326,3 +326,79 @@ def test_local_bpe_tokenizer_bilingual_code_math_smoke(tmp_path: Path) -> None:
     assert tokenizer.token_to_id("</think>") == SPECIAL_TOKEN_IDS["</think>"]
     digit_enc = tokenizer.encode("2026")
     assert len(digit_enc.tokens) == 4, f"Digits should split individually, got {digit_enc.tokens}"
+
+
+def test_rms_norm_custom_vjp_and_mhc_merge_equivalence() -> None:
+    def _ref_rms_norm(x_in: jax.Array, w_in: jax.Array | None = None, eps: float = 1e-6) -> jax.Array:
+        x_f32 = x_in.astype(jnp.float32)
+        inv = jax.lax.rsqrt(jnp.mean(jnp.square(x_f32), axis=-1, keepdims=True) + eps)
+        x_hat = x_f32 * inv
+        if w_in is not None:
+            return (x_hat * w_in.astype(jnp.float32)).astype(x_in.dtype)
+        return x_hat.astype(x_in.dtype)
+
+    k1, k2, k3, k4 = jax.random.split(jax.random.PRNGKey(303), 4)
+    for dtype, tol in ((jnp.float32, 1e-5), (jnp.bfloat16, 2e-2)):
+        x = jax.random.normal(k1, (2, 8, 64), dtype=dtype)
+        w = (1.0 + 0.1 * jax.random.normal(k2, (64,), dtype=dtype)).astype(dtype)
+        cot = jax.random.normal(k3, (2, 8, 64), dtype=dtype)
+
+        # Weighted RMSNorm forward + gradient match
+        y_custom = rms_norm(x, w, eps=1e-6)
+        y_ref = _ref_rms_norm(x, w, eps=1e-6)
+        np.testing.assert_allclose(np.asarray(y_custom, dtype=np.float32), np.asarray(y_ref, dtype=np.float32), atol=tol, rtol=tol)
+
+        dx_c, dw_c = jax.grad(lambda x_, w_: jnp.mean(rms_norm(x_, w_).astype(jnp.float32) * cot.astype(jnp.float32)), argnums=(0, 1))(x, w)
+        dx_r, dw_r = jax.grad(lambda x_, w_: jnp.mean(_ref_rms_norm(x_, w_).astype(jnp.float32) * cot.astype(jnp.float32)), argnums=(0, 1))(x, w)
+        np.testing.assert_allclose(np.asarray(dx_c, dtype=np.float32), np.asarray(dx_r, dtype=np.float32), atol=tol, rtol=tol)
+        np.testing.assert_allclose(np.asarray(dw_c, dtype=np.float32), np.asarray(dw_r, dtype=np.float32), atol=tol, rtol=tol)
+
+        # Unweighted RMSNorm forward + gradient match
+        yu_custom = rms_norm(x, None, eps=1e-6)
+        yu_ref = _ref_rms_norm(x, None, eps=1e-6)
+        np.testing.assert_allclose(np.asarray(yu_custom, dtype=np.float32), np.asarray(yu_ref, dtype=np.float32), atol=tol, rtol=tol)
+
+        dxu_c = jax.grad(lambda x_: jnp.mean(rms_norm(x_, None).astype(jnp.float32) * cot.astype(jnp.float32)))(x)
+        dxu_r = jax.grad(lambda x_: jnp.mean(_ref_rms_norm(x_, None).astype(jnp.float32) * cot.astype(jnp.float32)))(x)
+        np.testing.assert_allclose(np.asarray(dxu_c, dtype=np.float32), np.asarray(dxu_r, dtype=np.float32), atol=tol, rtol=tol)
+
+    # mhc_post_merge equivalence (loop_gate=0.0 identity and loop_gate=0.37 blended)
+    def _ref_mhc_merge(xs: jax.Array, sub_out: jax.Array, hp: jax.Array, hr: jax.Array, lg: jax.Array) -> jax.Array:
+        dt = xs.dtype
+        mixed = jnp.einsum("bsij,bsjd->bsid", hr.astype(dt), xs) + hp.astype(dt)[..., None] * sub_out.astype(dt)[:, :, None, :]
+        g = jnp.asarray(lg, dtype=dt)
+        return (jnp.asarray(1.0, dtype=dt) - g) * xs + g * mixed
+
+    xs = jax.random.normal(k1, (2, 8, 4, 64), dtype=jnp.float32)
+    sub = jax.random.normal(k2, (2, 8, 64), dtype=jnp.float32)
+    hp = jax.random.uniform(k3, (2, 8, 4), minval=0.0, maxval=2.0, dtype=jnp.float32)
+    hr_raw = jax.random.normal(k4, (2, 8, 4, 4), dtype=jnp.float32)
+    hr = sinkhorn_knopp(hr_raw, num_iters=10)
+    cot_m = jax.random.normal(k4, (2, 8, 4, 64), dtype=jnp.float32)
+
+    # Exact identity when loop_gate == 0.0
+    out_zero = mhc_post_merge(xs, sub, hp, hr, loop_gate=0.0)
+    np.testing.assert_allclose(np.asarray(out_zero), np.asarray(xs), atol=1e-6)
+
+    for dtype, tol in ((jnp.float32, 1e-5), (jnp.bfloat16, 2e-2)):
+        xs_d = xs.astype(dtype)
+        sub_d = sub.astype(dtype)
+        hp_d = hp.astype(dtype)
+        hr_d = hr.astype(dtype)
+        cot_d = cot_m.astype(jnp.float32)
+        for gate_val in (0.0, 0.37):
+            lg = jnp.asarray(gate_val, dtype=dtype)
+            out_c = mhc_post_merge(xs_d, sub_d, hp_d, hr_d, loop_gate=lg)
+            out_r = _ref_mhc_merge(xs_d, sub_d, hp_d, hr_d, lg)
+            np.testing.assert_allclose(np.asarray(out_c, dtype=np.float32), np.asarray(out_r, dtype=np.float32), atol=tol, rtol=tol)
+
+            grads_c = jax.grad(
+                lambda a, b, c, d, g: jnp.mean(mhc_post_merge(a, b, c, d, loop_gate=g).astype(jnp.float32) * cot_d),
+                argnums=(0, 1, 2, 3, 4),
+            )(xs_d, sub_d, hp_d, hr_d, lg)
+            grads_r = jax.grad(
+                lambda a, b, c, d, g: jnp.mean(_ref_mhc_merge(a, b, c, d, g).astype(jnp.float32) * cot_d),
+                argnums=(0, 1, 2, 3, 4),
+            )(xs_d, sub_d, hp_d, hr_d, lg)
+            for gc, gr in zip(grads_c, grads_r, strict=True):
+                np.testing.assert_allclose(np.asarray(gc, dtype=np.float32), np.asarray(gr, dtype=np.float32), atol=tol, rtol=tol)

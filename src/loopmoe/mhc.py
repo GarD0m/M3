@@ -2,10 +2,83 @@
 
 from __future__ import annotations
 
+import functools
+
 import jax
 import jax.numpy as jnp
 
 from .config import LoopMoEConfig
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(2,))
+def _rms_norm_weighted(x: jax.Array, weight: jax.Array, eps: float) -> jax.Array:
+    x_f32 = x.astype(jnp.float32)
+    inv_rms = jax.lax.rsqrt(jnp.mean(jnp.square(x_f32), axis=-1, keepdims=True) + eps)
+    x_hat = x_f32 * inv_rms
+    return (x_hat * weight.astype(jnp.float32)).astype(x.dtype)
+
+
+def _rms_norm_weighted_fwd(
+    x: jax.Array, weight: jax.Array, eps: float
+) -> tuple[jax.Array, tuple[jax.Array, jax.Array, jax.Array]]:
+    x_f32 = x.astype(jnp.float32)
+    inv_rms = jax.lax.rsqrt(jnp.mean(jnp.square(x_f32), axis=-1, keepdims=True) + eps)
+    x_hat = x_f32 * inv_rms
+    y = (x_hat * weight.astype(jnp.float32)).astype(x.dtype)
+    return y, (x, weight, inv_rms)
+
+
+def _rms_norm_weighted_bwd(
+    eps: float,
+    res: tuple[jax.Array, jax.Array, jax.Array],
+    dy: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    del eps
+    x, weight, inv_rms = res
+    x_hat = x.astype(jnp.float32) * inv_rms
+    dy_f32 = dy.astype(jnp.float32)
+    sum_axes = tuple(range(x.ndim - 1))
+    dw = jnp.sum(dy_f32 * x_hat, axis=sum_axes).astype(weight.dtype)
+    g = dy_f32 * weight.astype(jnp.float32)
+    dot_mean = jnp.mean(g * x_hat, axis=-1, keepdims=True)
+    dx = (inv_rms * (g - x_hat * dot_mean)).astype(x.dtype)
+    return dx, dw
+
+
+_rms_norm_weighted.defvjp(_rms_norm_weighted_fwd, _rms_norm_weighted_bwd)
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(1,))
+def _rms_norm_unweighted(x: jax.Array, eps: float) -> jax.Array:
+    x_f32 = x.astype(jnp.float32)
+    inv_rms = jax.lax.rsqrt(jnp.mean(jnp.square(x_f32), axis=-1, keepdims=True) + eps)
+    return (x_f32 * inv_rms).astype(x.dtype)
+
+
+def _rms_norm_unweighted_fwd(
+    x: jax.Array, eps: float
+) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
+    x_f32 = x.astype(jnp.float32)
+    inv_rms = jax.lax.rsqrt(jnp.mean(jnp.square(x_f32), axis=-1, keepdims=True) + eps)
+    y = (x_f32 * inv_rms).astype(x.dtype)
+    return y, (x, inv_rms)
+
+
+def _rms_norm_unweighted_bwd(
+    eps: float,
+    res: tuple[jax.Array, jax.Array],
+    dy: jax.Array,
+) -> tuple[jax.Array]:
+    del eps
+    x, inv_rms = res
+    x_hat = x.astype(jnp.float32) * inv_rms
+    dy_f32 = dy.astype(jnp.float32)
+    dot_mean = jnp.mean(dy_f32 * x_hat, axis=-1, keepdims=True)
+    dx = (inv_rms * (dy_f32 - x_hat * dot_mean)).astype(x.dtype)
+    return (dx,)
+
+
+_rms_norm_unweighted.defvjp(_rms_norm_unweighted_fwd, _rms_norm_unweighted_bwd)
 
 
 def rms_norm(
@@ -13,13 +86,10 @@ def rms_norm(
     weight: jax.Array | None = None,
     eps: float = 1e-6,
 ) -> jax.Array:
-    """Compute RMSNorm in float32 for numerical stability and cast back to input dtype."""
-    x_f32 = x.astype(jnp.float32)
-    inv_rms = jax.lax.rsqrt(jnp.mean(jnp.square(x_f32), axis=-1, keepdims=True) + eps)
-    y = (x_f32 * inv_rms).astype(x.dtype)
+    """Compute RMSNorm in float32 using memory-lean custom VJP (avoids saving FP32 residuals)."""
     if weight is not None:
-        y = y * weight.astype(x.dtype)
-    return y
+        return _rms_norm_weighted(x, weight, eps)
+    return _rms_norm_unweighted(x, eps)
 
 
 def sinkhorn_knopp(logits: jax.Array, num_iters: int = 10, eps: float = 1e-6) -> jax.Array:
@@ -137,17 +207,17 @@ def mhc_post_merge(
     with jax.named_scope("mhc_post_merge"):
         dt = x_streams.dtype
         n_streams = x_streams.shape[2]
-        h_res_dt = h_res.astype(dt)
-        h_post_dt = h_post.astype(dt)
+        gate = jnp.asarray(loop_gate, dtype=dt)
+        one_minus_gate = jnp.asarray(1.0, dtype=dt) - gate
+        eye = jnp.eye(n_streams, dtype=dt)[None, None, :, :]
+        h_res_eff = one_minus_gate * eye + gate * h_res.astype(dt)
+        h_post_eff = gate * h_post.astype(dt)
         out_dt = sublayer_out.astype(dt)
         streams = [x_streams[:, :, j, :] for j in range(n_streams)]
-        mixed_streams = []
+        out_streams = []
         for i in range(n_streams):
-            acc = h_res_dt[:, :, i, 0, None] * streams[0]
+            acc = h_res_eff[:, :, i, 0, None] * streams[0]
             for j in range(1, n_streams):
-                acc = acc + h_res_dt[:, :, i, j, None] * streams[j]
-            mixed_streams.append(acc + h_post_dt[:, :, i, None] * out_dt)
-        mixed = jnp.stack(mixed_streams, axis=2)
-        gate = jnp.asarray(loop_gate, dtype=dt)
-        one = jnp.asarray(1.0, dtype=dt)
-        return (one - gate) * x_streams + gate * mixed
+                acc = acc + h_res_eff[:, :, i, j, None] * streams[j]
+            out_streams.append(acc + h_post_eff[:, :, i, None] * out_dt)
+        return jnp.stack(out_streams, axis=2)
