@@ -61,10 +61,20 @@ def _grouped_matmul(
                 tile_k=min(k_dim, 2048),
                 tile_n=min(n_dim, 1024),
             )
+            dlhs_cfg = _tpu_rd.Config(
+                tile_m=256,
+                tile_k=min(n_dim, 2048),
+                tile_n=min(k_dim, 2048),
+            )
+            drhs_cfg = _tpu_rd.Config(
+                tile_m=256,
+                tile_k=min(k_dim, 2048),
+                tile_n=min(n_dim, 2048),
+            )
             op = _tpu_rd.PallasMosaicTpuV2RaggedDot(
                 config=fwd_cfg,
-                dlhs_config=_tpu_rd.Config(),
-                drhs_config=_tpu_rd.Config(),
+                dlhs_config=dlhs_cfg,
+                drhs_config=drhs_cfg,
             )
             return op(lhs, rhs, group_sizes=group_sizes)
         except Exception:
@@ -96,6 +106,16 @@ def _grouped_matmul(
     return jnp.einsum("mk,mkn->mn", lhs, gathered_w)
 
 
+def _gather_sum_topk(arr: jax.Array, inv_order: jax.Array, top_k: int) -> jax.Array:
+    """Stream K TPU-aligned [N, D] gathers into an FP32 accumulator (avoids K=5 non-8-aligned retile copies)."""
+    num_tokens = inv_order.shape[0] // top_k
+    inv_2d = inv_order.reshape(num_tokens, top_k)
+    acc = arr[inv_2d[:, 0]].astype(jnp.float32)
+    for k in range(1, top_k):
+        acc = acc + arr[inv_2d[:, k]].astype(jnp.float32)
+    return acc.astype(arr.dtype)
+
+
 @functools.partial(jax.custom_vjp, nondiff_argnums=(3,))
 def _moe_dispatch(
     x_flat: jax.Array,
@@ -124,13 +144,7 @@ def _moe_dispatch_bwd(
     d_sorted_x: jax.Array,
 ) -> tuple[jax.Array, None, None]:
     (inv_order,) = res
-    num_tokens = inv_order.shape[0] // top_k
-    d_x = jnp.sum(
-        d_sorted_x[inv_order].reshape(num_tokens, top_k, d_sorted_x.shape[-1]),
-        axis=1,
-        dtype=jnp.float32,
-    ).astype(d_sorted_x.dtype)
-    return (d_x, None, None)
+    return (_gather_sum_topk(d_sorted_x, inv_order, top_k), None, None)
 
 
 _moe_dispatch.defvjp(_moe_dispatch_fwd, _moe_dispatch_bwd)
@@ -145,12 +159,7 @@ def _moe_combine(
 ) -> jax.Array:
     """Combine expert-sorted outputs per token via conflict-free inv_order gather+sum (zero scatter-add)."""
     del token_indices
-    num_tokens = inv_order.shape[0] // top_k
-    return jnp.sum(
-        down_out[inv_order].reshape(num_tokens, top_k, down_out.shape[-1]),
-        axis=1,
-        dtype=jnp.float32,
-    ).astype(down_out.dtype)
+    return _gather_sum_topk(down_out, inv_order, top_k)
 
 
 def _moe_combine_fwd(
@@ -159,13 +168,7 @@ def _moe_combine_fwd(
     inv_order: jax.Array,
     top_k: int,
 ) -> tuple[jax.Array, tuple[jax.Array]]:
-    num_tokens = inv_order.shape[0] // top_k
-    out = jnp.sum(
-        down_out[inv_order].reshape(num_tokens, top_k, down_out.shape[-1]),
-        axis=1,
-        dtype=jnp.float32,
-    ).astype(down_out.dtype)
-    return out, (token_indices,)
+    return _gather_sum_topk(down_out, inv_order, top_k), (token_indices,)
 
 
 def _moe_combine_bwd(

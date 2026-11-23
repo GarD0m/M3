@@ -135,7 +135,12 @@ def _single_loop_step(
                 h_in_m_norm = apply_adaln(
                     h_in_m, p["iter_adaln"]["norm_moe_w"], scm, sm, cfg.rms_norm_eps
                 )
-                moe_out, ec, aux_l = apply_moe(p["moe"], h_in_m_norm, lidx, cfg)
+                if cfg.remat_moe and not cfg.remat_sublayers:
+                    moe_out, ec, aux_l = jax.checkpoint(
+                        lambda pm, h_in, li: apply_moe(pm, h_in, li, cfg)
+                    )(p["moe"], h_in_m_norm, lidx)
+                else:
+                    moe_out, ec, aux_l = apply_moe(p["moe"], h_in_m_norm, lidx, cfg)
                 moe_out = moe_out * gm.astype(dt)
 
                 if cfg.use_mhc:
@@ -144,11 +149,7 @@ def _single_loop_step(
                     next_xs = xs + am * moe_out[:, :, None, :]
                 return next_xs, ec, aux_l
 
-        moe_fn = (
-            jax.checkpoint(_moe_sublayer)
-            if (cfg.remat_sublayers or cfg.remat_moe)
-            else _moe_sublayer
-        )
+        moe_fn = jax.checkpoint(_moe_sublayer) if cfg.remat_sublayers else _moe_sublayer
         x_streams, expert_counts, seq_aux_loss = moe_fn(
             params, x_streams, shift_m, scale_m, gate_m, alpha_moe, loop_idx
         )
