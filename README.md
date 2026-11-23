@@ -64,5 +64,6 @@ python scripts/train_tpu.py \
   --data-mode stream \
   --tokenizer artifacts/tokenizer_64k/tokenizer.json \
   --ckpt-dir checkpoints \
+  --cache-dir jax_cache \
   --keep-last-k 3
 ```

@@ -221,11 +221,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tiny", action="store_true", help="Use tiny model config for local debugging.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log-every", type=int, default=10)
+    parser.add_argument(
+        "--cache-dir",
+        type=str,
+        default=None,
+        help="Optional JAX persistent compilation cache directory to skip repeated jit.compile across runs.",
+    )
     return parser.parse_args()
+
+
+def _configure_compilation_cache(cache_dir: str | None) -> None:
+    """Enable JAX persistent compilation cache prior to device initialization or JIT."""
+    if not cache_dir:
+        return
+    cache_path = Path(cache_dir).expanduser().resolve()
+    cache_path.mkdir(parents=True, exist_ok=True)
+    jax.config.update("jax_compilation_cache_dir", str(cache_path))
+    jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+    jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+    print(f"[JAX Cache] Persistent compilation cache enabled: {cache_path}")
 
 
 def main() -> None:
     args = parse_args()
+    _configure_compilation_cache(args.cache_dir)
     print(f"JAX backend: {jax.default_backend()} | devices: {jax.devices()}")
 
     base_cfg = LoopMoEConfig.tiny() if args.tiny else LoopMoEConfig()

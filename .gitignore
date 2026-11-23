@@ -9,6 +9,8 @@ dist/
 venv/
 checkpoints/
 _smoke_ckpt/
+jax_cache/
+_smoke_cache/
 artifacts/shards/
 *.bin
 *.msgpack
