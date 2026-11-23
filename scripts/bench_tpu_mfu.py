@@ -135,8 +135,6 @@ def run_module_breakdown(
 ) -> dict[str, Any]:
     """Micro-profile each architectural component individually to expose exact bottlenecks."""
     params = init_model_params(jax.random.PRNGKey(seed), cfg)
-    opt = create_muon_adamw_optimizer(OptimConfig(warmup_steps=100))
-    opt_state = opt.init(params)
 
     rng = np.random.default_rng(seed)
     x_ids = jnp.asarray(rng.integers(64, cfg.vocab_size, size=(micro_bs, seq_len), dtype=np.int32))
@@ -231,8 +229,13 @@ def run_module_breakdown(
 
         (_, _), sample_grads = jax.jit(val_grad_fn)(params, x_ids, y_ids)
         jax.block_until_ready(sample_grads)
-        del val_grad_fn
+        del val_grad_fn, x_ids, y_ids
         gc.collect()
+        jax.clear_caches()
+
+    # Defer optimizer state allocation until after full_fwd_bwd so 16 GB HBM fits 9.1 GB program scratch
+    opt = create_muon_adamw_optimizer(OptimConfig(warmup_steps=100))
+    opt_state = opt.init(params)
 
     @jax.jit(donate_argnums=(0, 1))
     def _opt_step(p, s, g):
@@ -252,7 +255,7 @@ def run_module_breakdown(
         ((time.perf_counter() - t0) / float(iters)) * 1000.0, 3
     )
 
-    del params, opt_state, sample_grads, x_ids, y_ids, _opt_step
+    del params, opt_state, sample_grads, _opt_step
     gc.collect()
     jax.clear_caches()
 

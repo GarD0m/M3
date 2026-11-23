@@ -220,6 +220,13 @@ def chunked_cross_entropy_loss(
         else loss_mask.reshape(total_tokens).astype(jnp.float32)
     )
 
+    denom = jnp.maximum(jnp.sum(m_flat), 1.0)
+    if chunk_size >= total_tokens:
+        logits = (h_flat @ lm_head_weight).astype(jnp.float32)
+        log_probs = jax.nn.log_softmax(logits, axis=-1)
+        token_nll = -jnp.take_along_axis(log_probs, t_flat[:, None], axis=-1).squeeze(-1)
+        return jnp.sum(token_nll * m_flat) / denom
+
     effective_chunk = min(chunk_size, total_tokens)
     if total_tokens % effective_chunk != 0:
         effective_chunk = math.gcd(total_tokens, chunk_size)
@@ -240,7 +247,6 @@ def chunked_cross_entropy_loss(
 
     remat_chunk_loss = jax.checkpoint(_chunk_loss)
     chunk_losses = jax.lax.map(remat_chunk_loss, (h_chunks, t_chunks, m_chunks))
-    denom = jnp.maximum(jnp.sum(m_flat), 1.0)
     return jnp.sum(chunk_losses) / denom
 
 

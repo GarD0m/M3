@@ -78,7 +78,7 @@ class LoopMoEConfig:
     tie_word_embeddings: bool = True
     dtype_name: str = "bfloat16"
     rms_norm_eps: float = 1e-6
-    chunk_ce_size: int = 4096
+    chunk_ce_size: int = 16384
 
     # RoPE / YaRN long-context scaling
     rope_theta: float = 10_000.0
@@ -92,7 +92,7 @@ class LoopMoEConfig:
     # DeepSeek-V4.1-Flash Single-Pass mHC
     use_mhc: bool = True
     mhc_streams: int = 4
-    mhc_sinkhorn_iters: int = 20
+    mhc_sinkhorn_iters: int = 10
     mhc_alpha_init: float = 0.01
 
     # DeepSeek-V4.1-Flash Engram Conditional Memory (~22.5% of sparse capacity)
@@ -228,7 +228,7 @@ class LoopMoEConfig:
         """Full 1B preset tuned for TPU v5e-1 (16 GB HBM, 197 TFLOPS, 128x128 MXU)."""
         return cls(
             num_loops=num_loops,
-            chunk_ce_size=4096,
+            chunk_ce_size=16384,
             use_csa2_indexer=use_csa2_indexer,
             remat_per_loop=True,
             remat_sublayers=False,
@@ -244,7 +244,7 @@ TPU_SPECS: dict[str, dict[str, float]] = {
         "ridge_flops_per_byte": (197.0 * 1e12) / (819.0 * 1e9),
         "default_microbatch": 4.0,
         "default_grad_accum": 16.0,
-        "default_chunk_ce_size": 4096.0,
+        "default_chunk_ce_size": 16384.0,
     },
     "v6e-1": {
         "peak_tflops_bf16": 918.0,
@@ -254,7 +254,7 @@ TPU_SPECS: dict[str, dict[str, float]] = {
         "ridge_flops_per_byte": (918.0 * 1e12) / (1600.0 * 1e9),
         "default_microbatch": 8.0,
         "default_grad_accum": 8.0,
-        "default_chunk_ce_size": 4096.0,
+        "default_chunk_ce_size": 16384.0,
     },
 }
 
