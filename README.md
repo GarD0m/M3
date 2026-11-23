@@ -1,6 +1,6 @@
 # 1B 1-Layer DeepSeek-V4.1-Flash LoopMoE
 
-A ~1.00B parameter, **single physical layer (`L=1`)** LLM combining **DeepSeek-V4.1-Flash** architectural primitives with **LoopMoE** (`arXiv:2606.04438`), engineered for local 64K bilingual tokenizer construction and high-MFU single-chip Google Colab **TPU v6e-1** (`918 TFLOPS BF16`, `32 GB HBM`) training via **JAX + Optax + OpenXLA Tokamax**.
+A ~1.17B parameter, **single physical layer (`L=1`)** LLM combining **DeepSeek-V4.1-Flash** architectural primitives with **LoopMoE** (`arXiv:2606.04438`), engineered for local 64K bilingual tokenizer construction and high-MFU single-chip Google Colab **TPU v6e-1** (`918 TFLOPS BF16`, `32 GB HBM`) training via **JAX + Optax + OpenXLA Tokamax**.
 
 ---
 
@@ -9,19 +9,19 @@ A ~1.00B parameter, **single physical layer (`L=1`)** LLM combining **DeepSeek-V
 | Module | Design | Parameters |
 | :--- | :--- | :---: |
 | **Tied Token Embedding / Head** | `65,536 × 2048`, exact 256×256 MXU aligned | **134.22M** |
-| **Engram Conditional Memory** (`arXiv:2601.07372`) | 8 prime tables (`~1.46M × 128`, 2-gram & 3-gram), pre-loop single gather, RMSNorm context gating + causal conv | **191.13M** (22.5% sparse) |
-| **Single-Pass mHC** (`arXiv:2512.24880`) | `n_streams = 4`, Sinkhorn-Knopp doubly stochastic `H_res` (20 iters) + bounded `H_pre`, `H_post` | **0.40M** |
+| **Engram Conditional Memory** (`arXiv:2601.07372`) | 8 prime tables (`1.60M × 128`, 2-gram & 3-gram), pre-loop single gather, RMSNorm context gating + causal conv | **209.04M** (20.5% sparse) |
+| **Single-Pass mHC** (`arXiv:2512.24880`) | `n_streams = 4`, Sinkhorn-Knopp doubly stochastic `H_res` (10 iters) + bounded `H_pre`, `H_post` | **0.40M** |
 | **LoopMoE IterAdaLN** (`arXiv:2606.04438`) | Joint `(h_t, loop_emb[t])` bottleneck MLP + `loop_alpha[t]` step-0 identity gating for `R=1 -> R=8` | **2.10M** |
-| **MLA + YaRN (+ optional CSA2)** | `16` heads, `d_q_lora=768`, `d_kv_lora=512`, `d_qk=128+64`, `d_v=128`; **Tokamax / Pallas Splash Attention** | **11.40M** |
-| **Fine-Grained DeepSeek MoE** | `416` routed (`d_ff=256`, top-12) + `1` shared (`d_ff=512`), **Tokamax Megablox `ragged_dot`**, Aux-Loss-Free per-loop bias | **658.31M** |
-| **Total** | Active non-emb/loop: `40.17M` (`Attn:FFN = 1:1.93`) | **997.61M (~1.00B)** |
+| **MLA + YaRN (+ optional CSA2)** | `16` heads, `d_q_lora=768`, `d_kv_lora=512`, `d_qk=96+32=128`, `d_v=128`; **Tokamax / Pallas Splash Attention** | **10.29M** |
+| **Fine-Grained DeepSeek MoE** | `256` routed (`d_ff=512`, top-5) + `1` shared (`d_ff=512`), **Tokamax Megablox `ragged_dot`**, Aux-Loss-Free per-loop bias | **808.98M** |
+| **Total** | Active non-emb/loop: `35.92M` (`Attn:FFN = 1:1.83`) | **1,165.07M (~1.17B)** |
 
 ---
 
 ## 7-Stage Progressive Curriculum (21B Tokens Total)
 
 Global batch size: **262,144 tokens/step** (`32,768` microbatch tokens × `8` grad accum steps).  
-Optimizer: **Muon** (`lr=0.015`, 3D `vmap` per-expert Newton-Schulz `ns_steps=5`, Moonshot `consistent_rms=0.2`) + BF16 **AdamW** (`lr=1.5e-3`, `b2=0.95`) with **Warmup-Stable schedule (NO decay)**.
+Optimizer: **Muon** (`lr=0.015`, 3D `vmap` per-expert Newton-Schulz `ns_steps=4`, Moonshot `consistent_rms=0.2`) + BF16 **AdamW** (`lr=1.5e-3`, `b2=0.95`) with **Warmup-Stable schedule (NO decay)**.
 
 | Stage | Seq Len | Tokens | Loops | Web EN | Web ZH | Code | Math | Tiers |
 | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- |
@@ -39,7 +39,7 @@ Optimizer: **Muon** (`lr=0.015`, 3D `vmap` per-expert Newton-Schulz `ns_steps=5`
 
 ### 1. Local Setup & Verification
 ```bash
-pip install -r requirements-local.txt
+pip install -r requirements.txt
 pytest -v tests/test_loopmoe.py
 ```
 

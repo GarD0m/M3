@@ -7,6 +7,7 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+import optax
 
 from .config import LoopMoEConfig, count_analytic_params
 from .engram import apply_engram_step, init_engram_params, prefetch_engram_embeddings
@@ -67,65 +68,93 @@ def _single_loop_step(
     cfg: LoopMoEConfig,
 ) -> tuple[jax.Array, tuple[jax.Array, jax.Array, jax.Array]]:
     """Execute one recurrent iteration of Engram + IterAdaLN + Single-Pass mHC(MLA) + Single-Pass mHC(MoE)."""
-    alphas = params["iter_adaln"]["loop_alpha"][loop_idx]  # [3]
-    dt = x_streams.dtype
-    alpha_engram = alphas[0].astype(dt)
-    alpha_attn = alphas[1].astype(dt)
-    alpha_moe = alphas[2].astype(dt)
+    with jax.named_scope("loop_step"):
+        alphas = params["iter_adaln"]["loop_alpha"][loop_idx]  # [3]
+        dt = x_streams.dtype
+        alpha_engram = alphas[0].astype(dt)
+        alpha_attn = alphas[1].astype(dt)
+        alpha_moe = alphas[2].astype(dt)
 
-    # 1. Context-aware Engram conditional memory refinement
-    if cfg.use_engram:
-        h_summary = collapse_streams(x_streams)
-        engram_delta, engram_gate_mean = apply_engram_step(params["engram"], h_summary, engram_e, cfg)
-        x_streams = x_streams + alpha_engram * engram_delta[:, :, None, :]
-    else:
-        engram_gate_mean = jnp.asarray(0.0, dtype=jnp.float32)
+        # 1. Context-aware Engram conditional memory refinement
+        if cfg.use_engram:
+            def _engram_sublayer(p, xs, ee, ae):
+                with jax.named_scope("engram_step"):
+                    h_summary = collapse_streams(xs)
+                    engram_delta, gate_mean = apply_engram_step(p["engram"], h_summary, ee, cfg)
+                    return xs + ae * engram_delta[:, :, None, :], gate_mean
 
-    # 2. LoopMoE IterAdaLN modulation jointly conditioned on h_t and loop_idx
-    h_mod = collapse_streams(x_streams)
-    shift_a, scale_a, gate_a, shift_m, scale_m, gate_m = compute_iter_adaln_modulations(
-        params["iter_adaln"], h_mod, loop_idx
-    )
+            engram_fn = (
+                jax.checkpoint(_engram_sublayer)
+                if (cfg.remat_sublayers or cfg.remat_moe)
+                else _engram_sublayer
+            )
+            x_streams, engram_gate_mean = engram_fn(params, x_streams, engram_e, alpha_engram)
+        else:
+            engram_gate_mean = jnp.asarray(0.0, dtype=jnp.float32)
 
-    # 3. MLA sublayer inside Single-Pass mHC
-    if cfg.use_mhc:
-        h_in_a, _, h_post_a, h_res_a = mhc_compute_gates(
-            params["mhc"]["attn"], x_streams, cfg.mhc_sinkhorn_iters, cfg.rms_norm_eps
+        # 2. LoopMoE IterAdaLN modulation jointly conditioned on h_t and loop_idx
+        with jax.named_scope("iter_adaln"):
+            h_mod = collapse_streams(x_streams)
+            shift_a, scale_a, gate_a, shift_m, scale_m, gate_m = compute_iter_adaln_modulations(
+                params["iter_adaln"], h_mod, loop_idx
+            )
+
+        # 3. MLA sublayer inside Single-Pass mHC
+        def _attn_sublayer(p, xs, sa, sca, ga, aa):
+            with jax.named_scope("mhc_attn_sublayer"):
+                if cfg.use_mhc:
+                    h_in_a, _, h_post_a, h_res_a = mhc_compute_gates(
+                        p["mhc"]["attn"], xs, cfg.mhc_sinkhorn_iters, cfg.rms_norm_eps
+                    )
+                else:
+                    h_in_a = xs[:, :, 0, :]
+
+                h_in_a_norm = apply_adaln(
+                    h_in_a, p["iter_adaln"]["norm_attn_w"], sca, sa, cfg.rms_norm_eps
+                )
+                attn_out, _ = apply_mla(p["mla"], h_in_a_norm, cfg)
+                attn_out = attn_out * ga.astype(dt)
+
+                if cfg.use_mhc:
+                    return mhc_post_merge(xs, attn_out, h_post_a, h_res_a, loop_gate=aa)
+                return xs + aa * attn_out[:, :, None, :]
+
+        attn_fn = jax.checkpoint(_attn_sublayer) if cfg.remat_sublayers else _attn_sublayer
+        x_streams = attn_fn(params, x_streams, shift_a, scale_a, gate_a, alpha_attn)
+
+        # 4. DeepSeek MoE sublayer inside Single-Pass mHC
+        def _moe_sublayer(p, xs, sm, scm, gm, am, lidx):
+            with jax.named_scope("mhc_moe_sublayer"):
+                if cfg.use_mhc:
+                    h_in_m, _, h_post_m, h_res_m = mhc_compute_gates(
+                        p["mhc"]["moe"], xs, cfg.mhc_sinkhorn_iters, cfg.rms_norm_eps
+                    )
+                else:
+                    h_in_m = xs[:, :, 0, :]
+
+                h_in_m_norm = apply_adaln(
+                    h_in_m, p["iter_adaln"]["norm_moe_w"], scm, sm, cfg.rms_norm_eps
+                )
+                if cfg.remat_moe and not cfg.remat_sublayers:
+                    moe_out, ec, aux_l = jax.checkpoint(
+                        lambda pm, h_in, li: apply_moe(pm, h_in, li, cfg)
+                    )(p["moe"], h_in_m_norm, lidx)
+                else:
+                    moe_out, ec, aux_l = apply_moe(p["moe"], h_in_m_norm, lidx, cfg)
+                moe_out = moe_out * gm.astype(dt)
+
+                if cfg.use_mhc:
+                    next_xs = mhc_post_merge(xs, moe_out, h_post_m, h_res_m, loop_gate=am)
+                else:
+                    next_xs = xs + am * moe_out[:, :, None, :]
+                return next_xs, ec, aux_l
+
+        moe_fn = jax.checkpoint(_moe_sublayer) if cfg.remat_sublayers else _moe_sublayer
+        x_streams, expert_counts, seq_aux_loss = moe_fn(
+            params, x_streams, shift_m, scale_m, gate_m, alpha_moe, loop_idx
         )
-    else:
-        h_in_a = x_streams[:, :, 0, :]
 
-    h_in_a_norm = apply_adaln(
-        h_in_a, params["iter_adaln"]["norm_attn_w"], scale_a, shift_a, cfg.rms_norm_eps
-    )
-    attn_out, _ = apply_mla(params["mla"], h_in_a_norm, cfg)
-    attn_out = attn_out * gate_a.astype(dt)
-
-    if cfg.use_mhc:
-        x_streams = mhc_post_merge(x_streams, attn_out, h_post_a, h_res_a, loop_gate=alpha_attn)
-    else:
-        x_streams = x_streams + alpha_attn * attn_out[:, :, None, :]
-
-    # 4. DeepSeek MoE sublayer inside Single-Pass mHC
-    if cfg.use_mhc:
-        h_in_m, _, h_post_m, h_res_m = mhc_compute_gates(
-            params["mhc"]["moe"], x_streams, cfg.mhc_sinkhorn_iters, cfg.rms_norm_eps
-        )
-    else:
-        h_in_m = x_streams[:, :, 0, :]
-
-    h_in_m_norm = apply_adaln(
-        h_in_m, params["iter_adaln"]["norm_moe_w"], scale_m, shift_m, cfg.rms_norm_eps
-    )
-    moe_out, expert_counts, seq_aux_loss = apply_moe(params["moe"], h_in_m_norm, loop_idx, cfg)
-    moe_out = moe_out * gate_m.astype(dt)
-
-    if cfg.use_mhc:
-        x_streams = mhc_post_merge(x_streams, moe_out, h_post_m, h_res_m, loop_gate=alpha_moe)
-    else:
-        x_streams = x_streams + alpha_moe * moe_out[:, :, None, :]
-
-    return x_streams, (expert_counts, seq_aux_loss, engram_gate_mean)
+        return x_streams, (expert_counts, seq_aux_loss, engram_gate_mean)
 
 
 def forward_hidden(
@@ -135,9 +164,10 @@ def forward_hidden(
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     """Run embedding + single pre-loop Engram gather + R-loop LoopMoE block + final RMSNorm."""
     x = params["embed_tokens"][input_ids]  # [B, S, D]
-    engram_e = (
-        prefetch_engram_embeddings(params["engram"], input_ids, cfg) if cfg.use_engram else None
-    )
+    with jax.named_scope("engram_prefetch"):
+        engram_e = (
+            prefetch_engram_embeddings(params["engram"], input_ids, cfg) if cfg.use_engram else None
+        )
 
     stream_init = params["mhc"]["stream_init"] if cfg.use_mhc else None
     x_streams = expand_streams(x, stream_init)
@@ -145,7 +175,8 @@ def forward_hidden(
     def scan_body(carry: jax.Array, loop_idx: jax.Array):
         return _single_loop_step(params, carry, engram_e, loop_idx, cfg)
 
-    step_fn = jax.checkpoint(scan_body) if (cfg.remat_per_loop and cfg.num_loops > 1) else scan_body
+    use_loop_remat = cfg.remat_per_loop and (cfg.num_loops > 1)
+    step_fn = jax.checkpoint(scan_body) if use_loop_remat else scan_body
     loop_indices = jnp.arange(cfg.num_loops, dtype=jnp.int32)
     x_streams, (expert_counts, seq_aux_losses, gate_means) = jax.lax.scan(
         step_fn, x_streams, loop_indices
@@ -180,16 +211,344 @@ def forward_logits(
     return logits, aux
 
 
+def _ce_chunk_loss_and_lse(
+    logits_bf16: jax.Array,
+    tc: jax.Array,
+    mc: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    lse = jax.scipy.special.logsumexp(logits_bf16.astype(jnp.float32), axis=-1)
+    z_t = (
+        jnp.take_along_axis(logits_bf16, tc[:, None], axis=-1)
+        .squeeze(-1)
+        .astype(jnp.float32)
+    )
+    return jnp.sum((lse - z_t) * mc), lse
+
+
+def _ce_chunk_dlogits(
+    logits_bf16: jax.Array,
+    lse_c: jax.Array,
+    tc: jax.Array,
+    mc: jax.Array,
+    vocab_idx: jax.Array,
+    scale_factor: jax.Array,
+    out_dtype: jnp.dtype,
+) -> jax.Array:
+    # Pure elementwise pipeline fuses exp -> where -> scale -> bf16 in VPU without FP32 [chunk, V] HBM spills
+    probs = jnp.exp(logits_bf16.astype(jnp.float32) - lse_c[:, None])
+    diff = jnp.where(vocab_idx == tc[:, None], probs - 1.0, probs)
+    return (diff * (mc * scale_factor)[:, None]).astype(out_dtype)
+
+
+def _run_scan_ce_fwd(
+    h_chunks: jax.Array,
+    lm_head_weight: jax.Array,
+    t_chunks: jax.Array,
+    m_chunks: jax.Array,
+    denom: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Accumulate scalar CE loss over chunks while retaining only [num_chunks, chunk] LSE."""
+
+    def _fwd_step(loss_acc: jax.Array, chunk_in: tuple[jax.Array, jax.Array, jax.Array]):
+        hc, tc, mc = chunk_in
+        logits_bf16 = hc @ lm_head_weight
+        chunk_loss, lse = _ce_chunk_loss_and_lse(logits_bf16, tc, mc)
+        return loss_acc + chunk_loss, lse
+
+    total_loss, lse_chunks = jax.lax.scan(
+        _fwd_step,
+        jnp.asarray(0.0, dtype=jnp.float32),
+        (h_chunks, t_chunks, m_chunks),
+        unroll=1,
+    )
+    return total_loss / denom, lse_chunks
+
+
+@jax.custom_vjp
+def _scan_chunked_ce(
+    h_chunks: jax.Array,
+    lm_head_weight: jax.Array,
+    t_chunks: jax.Array,
+    m_chunks: jax.Array,
+    denom: jax.Array,
+) -> jax.Array:
+    out, _ = _run_scan_ce_fwd(h_chunks, lm_head_weight, t_chunks, m_chunks, denom)
+    return out
+
+
+def _scan_chunked_ce_fwd(
+    h_chunks: jax.Array,
+    lm_head_weight: jax.Array,
+    t_chunks: jax.Array,
+    m_chunks: jax.Array,
+    denom: jax.Array,
+) -> tuple[jax.Array, tuple[jax.Array, ...]]:
+    out, lse_chunks = _run_scan_ce_fwd(h_chunks, lm_head_weight, t_chunks, m_chunks, denom)
+    return out, (h_chunks, lm_head_weight, t_chunks, m_chunks, lse_chunks, denom)
+
+
+def _scan_chunked_ce_bwd(
+    res: tuple[jax.Array, ...],
+    g_out: jax.Array,
+) -> tuple[jax.Array, jax.Array, None, None, None]:
+    h_chunks, lm_head_weight, t_chunks, m_chunks, lse_chunks, denom = res
+    vocab_size = lm_head_weight.shape[1]
+    vocab_idx = jnp.arange(vocab_size, dtype=t_chunks.dtype)[None, :]
+    scale_factor = g_out / denom
+
+    def _bwd_step(
+        d_lm_acc: jax.Array, chunk_in: tuple[jax.Array, jax.Array, jax.Array, jax.Array]
+    ) -> tuple[jax.Array, jax.Array]:
+        hc, tc, mc, lse_c = chunk_in
+        logits_bf16 = hc @ lm_head_weight
+        d_logits = _ce_chunk_dlogits(logits_bf16, lse_c, tc, mc, vocab_idx, scale_factor, hc.dtype)
+        d_hc = (d_logits @ lm_head_weight.T).astype(hc.dtype)
+        d_lm_acc = d_lm_acc + (hc.T @ d_logits).astype(d_lm_acc.dtype)
+        return d_lm_acc, d_hc
+
+    d_lm_w, d_h_chunks = jax.lax.scan(
+        _bwd_step,
+        jnp.zeros_like(lm_head_weight),
+        (h_chunks, t_chunks, m_chunks, lse_chunks),
+        unroll=1,
+    )
+    return d_h_chunks, d_lm_w, None, None, None
+
+
+_scan_chunked_ce.defvjp(_scan_chunked_ce_fwd, _scan_chunked_ce_bwd)
+
+
+def _run_scan_ce_fwd_vd(
+    h_chunks: jax.Array,
+    lm_weight_vd: jax.Array,
+    t_chunks: jax.Array,
+    m_chunks: jax.Array,
+    denom: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Layout-native [V, D] chunked CE forward avoiding [V, D] -> [D, V] transpose copy."""
+
+    def _fwd_step(loss_acc: jax.Array, chunk_in: tuple[jax.Array, jax.Array, jax.Array]):
+        hc, tc, mc = chunk_in
+        logits_bf16 = jax.lax.dot_general(hc, lm_weight_vd, (((1,), (1,)), ((), ())))
+        chunk_loss, lse = _ce_chunk_loss_and_lse(logits_bf16, tc, mc)
+        return loss_acc + chunk_loss, lse
+
+    total_loss, lse_chunks = jax.lax.scan(
+        _fwd_step,
+        jnp.asarray(0.0, dtype=jnp.float32),
+        (h_chunks, t_chunks, m_chunks),
+        unroll=1,
+    )
+    return total_loss / denom, lse_chunks
+
+
+@jax.custom_vjp
+def _scan_chunked_ce_vd(
+    h_chunks: jax.Array,
+    lm_weight_vd: jax.Array,
+    t_chunks: jax.Array,
+    m_chunks: jax.Array,
+    denom: jax.Array,
+) -> jax.Array:
+    out, _ = _run_scan_ce_fwd_vd(h_chunks, lm_weight_vd, t_chunks, m_chunks, denom)
+    return out
+
+
+def _scan_chunked_ce_vd_fwd(
+    h_chunks: jax.Array,
+    lm_weight_vd: jax.Array,
+    t_chunks: jax.Array,
+    m_chunks: jax.Array,
+    denom: jax.Array,
+) -> tuple[jax.Array, tuple[jax.Array, ...]]:
+    out, lse_chunks = _run_scan_ce_fwd_vd(h_chunks, lm_weight_vd, t_chunks, m_chunks, denom)
+    return out, (h_chunks, lm_weight_vd, t_chunks, m_chunks, lse_chunks, denom)
+
+
+def _scan_chunked_ce_vd_bwd(
+    res: tuple[jax.Array, ...],
+    g_out: jax.Array,
+) -> tuple[jax.Array, jax.Array, None, None, None]:
+    h_chunks, lm_weight_vd, t_chunks, m_chunks, lse_chunks, denom = res
+    vocab_size = lm_weight_vd.shape[0]
+    vocab_idx = jnp.arange(vocab_size, dtype=t_chunks.dtype)[None, :]
+    scale_factor = g_out / denom
+
+    def _bwd_step(
+        d_w_acc: jax.Array, chunk_in: tuple[jax.Array, jax.Array, jax.Array, jax.Array]
+    ) -> tuple[jax.Array, jax.Array]:
+        hc, tc, mc, lse_c = chunk_in
+        logits_bf16 = jax.lax.dot_general(hc, lm_weight_vd, (((1,), (1,)), ((), ())))
+        d_logits = _ce_chunk_dlogits(logits_bf16, lse_c, tc, mc, vocab_idx, scale_factor, hc.dtype)
+        d_hc = (d_logits @ lm_weight_vd).astype(hc.dtype)
+        d_w_acc = d_w_acc + jax.lax.dot_general(
+            d_logits, hc, (((0,), (0,)), ((), ()))
+        ).astype(d_w_acc.dtype)
+        return d_w_acc, d_hc
+
+    d_lm_w_vd, d_h_chunks = jax.lax.scan(
+        _bwd_step,
+        jnp.zeros_like(lm_weight_vd),
+        (h_chunks, t_chunks, m_chunks, lse_chunks),
+        unroll=1,
+    )
+    return d_h_chunks, d_lm_w_vd, None, None, None
+
+
+_scan_chunked_ce_vd.defvjp(_scan_chunked_ce_vd_fwd, _scan_chunked_ce_vd_bwd)
+
+
+def _run_saved_logits_ce_fwd(
+    h_chunks: jax.Array,
+    lm_weight: jax.Array,
+    t_chunks: jax.Array,
+    m_chunks: jax.Array,
+    denom: jax.Array,
+    weight_is_vd: bool,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Compute single-GEMM BF16 logits and scan LSE over sub-chunks (zero dynamic_update_slice)."""
+    num_chunks, sub_chunk, d_model = h_chunks.shape
+    h_flat = h_chunks.reshape(num_chunks * sub_chunk, d_model)
+    logits_all = (
+        jax.lax.dot_general(h_flat, lm_weight, (((1,), (1,)), ((), ())))
+        if weight_is_vd
+        else (h_flat @ lm_weight)
+    )
+    logits_chunks = logits_all.reshape(num_chunks, sub_chunk, logits_all.shape[-1])
+
+    def _lse_step(loss_acc: jax.Array, chunk_in: tuple[jax.Array, jax.Array, jax.Array]):
+        logits_c, tc, mc = chunk_in
+        chunk_loss, lse = _ce_chunk_loss_and_lse(logits_c, tc, mc)
+        return loss_acc + chunk_loss, lse
+
+    total_loss, lse_chunks = jax.lax.scan(
+        _lse_step,
+        jnp.asarray(0.0, dtype=jnp.float32),
+        (logits_chunks, t_chunks, m_chunks),
+        unroll=1,
+    )
+    return total_loss / denom, logits_chunks, lse_chunks
+
+
+def _run_saved_logits_ce_bwd(
+    res: tuple[jax.Array, ...],
+    g_out: jax.Array,
+    weight_is_vd: bool,
+) -> tuple[jax.Array, jax.Array, None, None, None]:
+    h_chunks, lm_weight, logits_chunks, t_chunks, m_chunks, lse_chunks, denom = res
+    vocab_size = lm_weight.shape[0] if weight_is_vd else lm_weight.shape[1]
+    vocab_idx = jnp.arange(vocab_size, dtype=t_chunks.dtype)[None, :]
+    scale_factor = g_out / denom
+
+    def _bwd_step(
+        d_w_acc: jax.Array,
+        chunk_in: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
+    ) -> tuple[jax.Array, jax.Array]:
+        hc, logits_c, tc, mc, lse_c = chunk_in
+        d_logits = _ce_chunk_dlogits(logits_c, lse_c, tc, mc, vocab_idx, scale_factor, hc.dtype)
+        if weight_is_vd:
+            d_hc = (d_logits @ lm_weight).astype(hc.dtype)
+            d_w_acc = d_w_acc + jax.lax.dot_general(
+                d_logits, hc, (((0,), (0,)), ((), ()))
+            ).astype(d_w_acc.dtype)
+        else:
+            d_hc = (d_logits @ lm_weight.T).astype(hc.dtype)
+            d_w_acc = d_w_acc + (hc.T @ d_logits).astype(d_w_acc.dtype)
+        return d_w_acc, d_hc
+
+    d_lm_w, d_h_chunks = jax.lax.scan(
+        _bwd_step,
+        jnp.zeros_like(lm_weight),
+        (h_chunks, logits_chunks, t_chunks, m_chunks, lse_chunks),
+        unroll=1,
+    )
+    return d_h_chunks, d_lm_w, None, None, None
+
+
+@jax.custom_vjp
+def _saved_logits_ce(
+    h_chunks: jax.Array,
+    lm_head_weight: jax.Array,
+    t_chunks: jax.Array,
+    m_chunks: jax.Array,
+    denom: jax.Array,
+) -> jax.Array:
+    out, _, _ = _run_saved_logits_ce_fwd(h_chunks, lm_head_weight, t_chunks, m_chunks, denom, False)
+    return out
+
+
+def _saved_logits_ce_fwd(
+    h_chunks: jax.Array,
+    lm_head_weight: jax.Array,
+    t_chunks: jax.Array,
+    m_chunks: jax.Array,
+    denom: jax.Array,
+) -> tuple[jax.Array, tuple[jax.Array, ...]]:
+    out, logits_chunks, lse_chunks = _run_saved_logits_ce_fwd(
+        h_chunks, lm_head_weight, t_chunks, m_chunks, denom, False
+    )
+    return out, (h_chunks, lm_head_weight, logits_chunks, t_chunks, m_chunks, lse_chunks, denom)
+
+
+def _saved_logits_ce_bwd(
+    res: tuple[jax.Array, ...],
+    g_out: jax.Array,
+) -> tuple[jax.Array, jax.Array, None, None, None]:
+    return _run_saved_logits_ce_bwd(res, g_out, False)
+
+
+_saved_logits_ce.defvjp(_saved_logits_ce_fwd, _saved_logits_ce_bwd)
+
+
+@jax.custom_vjp
+def _saved_logits_ce_vd(
+    h_chunks: jax.Array,
+    lm_weight_vd: jax.Array,
+    t_chunks: jax.Array,
+    m_chunks: jax.Array,
+    denom: jax.Array,
+) -> jax.Array:
+    out, _, _ = _run_saved_logits_ce_fwd(h_chunks, lm_weight_vd, t_chunks, m_chunks, denom, True)
+    return out
+
+
+def _saved_logits_ce_vd_fwd(
+    h_chunks: jax.Array,
+    lm_weight_vd: jax.Array,
+    t_chunks: jax.Array,
+    m_chunks: jax.Array,
+    denom: jax.Array,
+) -> tuple[jax.Array, tuple[jax.Array, ...]]:
+    out, logits_chunks, lse_chunks = _run_saved_logits_ce_fwd(
+        h_chunks, lm_weight_vd, t_chunks, m_chunks, denom, True
+    )
+    return out, (h_chunks, lm_weight_vd, logits_chunks, t_chunks, m_chunks, lse_chunks, denom)
+
+
+def _saved_logits_ce_vd_bwd(
+    res: tuple[jax.Array, ...],
+    g_out: jax.Array,
+) -> tuple[jax.Array, jax.Array, None, None, None]:
+    return _run_saved_logits_ce_bwd(res, g_out, True)
+
+
+_saved_logits_ce_vd.defvjp(_saved_logits_ce_vd_fwd, _saved_logits_ce_vd_bwd)
+
+
 def chunked_cross_entropy_loss(
     hidden: jax.Array,
     lm_head_weight: jax.Array,
     targets: jax.Array,
     chunk_size: int = 2048,
     loss_mask: jax.Array | None = None,
+    weight_is_vd: bool = False,
 ) -> jax.Array:
     """Memory-efficient chunked linear projection + softmax cross-entropy.
 
-    Avoids materializing full [B*S, vocab_size] FP32 logits in HBM (critical for 16K/32K on 32GB TPU v6e).
+    Supports `[D, V]` (`weight_is_vd=False`) or layout-native tied `[V, D]` (`weight_is_vd=True`)
+    without transposing the full `[65536, 2048]` embedding table. When `chunk_size >= total_tokens`,
+    uses single-GEMM BF16-saved sub-chunking (`<=4096` tok/chunk) to skip backward logits matmul
+    recompute without allocating full FP32 `[N, V]` logits in HBM.
     """
     bsz, seq_len, d_model = hidden.shape
     total_tokens = bsz * seq_len
@@ -201,6 +560,20 @@ def chunked_cross_entropy_loss(
         else loss_mask.reshape(total_tokens).astype(jnp.float32)
     )
 
+    denom = jnp.maximum(jnp.sum(m_flat), 1.0)
+    if chunk_size >= total_tokens:
+        sub_chunk = min(total_tokens, 4096)
+        if total_tokens % sub_chunk != 0:
+            sub_chunk = math.gcd(total_tokens, sub_chunk)
+            if sub_chunk == 1 and total_tokens <= 4096:
+                sub_chunk = total_tokens
+        num_chunks = total_tokens // sub_chunk
+        h_chunks = h_flat.reshape(num_chunks, sub_chunk, d_model)
+        t_chunks = t_flat.reshape(num_chunks, sub_chunk)
+        m_chunks = m_flat.reshape(num_chunks, sub_chunk)
+        saved_fn = _saved_logits_ce_vd if weight_is_vd else _saved_logits_ce
+        return saved_fn(h_chunks, lm_head_weight, t_chunks, m_chunks, denom)
+
     effective_chunk = min(chunk_size, total_tokens)
     if total_tokens % effective_chunk != 0:
         effective_chunk = math.gcd(total_tokens, chunk_size)
@@ -211,18 +584,8 @@ def chunked_cross_entropy_loss(
     h_chunks = h_flat.reshape(num_chunks, effective_chunk, d_model)
     t_chunks = t_flat.reshape(num_chunks, effective_chunk)
     m_chunks = m_flat.reshape(num_chunks, effective_chunk)
-
-    def _chunk_loss(chunk_in: tuple[jax.Array, jax.Array, jax.Array]) -> jax.Array:
-        hc, tc, mc = chunk_in
-        logits = (hc @ lm_head_weight).astype(jnp.float32)
-        log_probs = jax.nn.log_softmax(logits, axis=-1)
-        token_nll = -jnp.take_along_axis(log_probs, tc[:, None], axis=-1).squeeze(-1)
-        return jnp.sum(token_nll * mc)
-
-    remat_chunk_loss = jax.checkpoint(_chunk_loss)
-    chunk_losses = jax.lax.map(remat_chunk_loss, (h_chunks, t_chunks, m_chunks))
-    denom = jnp.maximum(jnp.sum(m_flat), 1.0)
-    return jnp.sum(chunk_losses) / denom
+    scan_fn = _scan_chunked_ce_vd if weight_is_vd else _scan_chunked_ce
+    return scan_fn(h_chunks, lm_head_weight, t_chunks, m_chunks, denom)
 
 
 def forward_model(
@@ -234,14 +597,21 @@ def forward_model(
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     """Forward pass returning total loss (CE + tiny seq aux) and auxiliary telemetry."""
     hidden, aux = forward_hidden(params, input_ids, cfg)
-    lm_w = get_lm_head_weight(params, cfg)
-    ce_loss = chunked_cross_entropy_loss(
-        hidden,
-        lm_w,
-        targets,
-        chunk_size=cfg.chunk_ce_size,
-        loss_mask=loss_mask,
-    )
+    if cfg.tie_word_embeddings:
+        lm_w = params["embed_tokens"]
+        weight_is_vd = True
+    else:
+        lm_w = params["lm_head"]
+        weight_is_vd = False
+    with jax.named_scope("chunked_ce_loss"):
+        ce_loss = chunked_cross_entropy_loss(
+            hidden,
+            lm_w,
+            targets,
+            chunk_size=cfg.chunk_ce_size,
+            loss_mask=loss_mask,
+            weight_is_vd=weight_is_vd,
+        )
     total_loss = ce_loss + aux["seq_aux_loss"]
     aux["ce_loss"] = ce_loss
     return total_loss, aux

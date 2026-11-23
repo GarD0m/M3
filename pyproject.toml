@@ -7,21 +7,24 @@ name = "loopmoe"
 version = "0.1.0"
 description = "1B 1-Layer DeepSeek-V4.1-Flash LoopMoE for local 64K tokenizer and high-MFU TPU v6e-1 training"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
-    "numpy>=1.26",
-    "jax>=0.5.0",
-    "flax>=0.10.0",
-    "optax>=0.2.5",
-    "tokenizers>=0.20.0",
-    "datasets>=3.0.0",
-    "huggingface_hub>=0.26.0",
-    "tqdm>=4.66.0",
+    "numpy>=2.5.5",
+    "jax>=0.12.1",
+    "flax>=0.12.12",
+    "optax>=0.2.9",
+    "tokenizers>=0.23.3",
+    "datasets>=5.2.0",
+    "huggingface_hub>=2.4.0",
+    "pyarrow>=26.0.1",
+    "fsspec>=2026.9.0",
+    "tqdm>=4.70.1",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0.0"]
-tpu = ["tokamax"]
+dev = ["pytest>=9.2.0"]
+tpu = ["tokamax>=0.0.18"]
+profile = ["tensorboard>=2.21.0", "tensorboard-plugin-profile>=2.24.2", "xprof>=2.24.2"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

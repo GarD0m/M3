@@ -78,7 +78,7 @@ class LoopMoEConfig:
     tie_word_embeddings: bool = True
     dtype_name: str = "bfloat16"
     rms_norm_eps: float = 1e-6
-    chunk_ce_size: int = 2048
+    chunk_ce_size: int = 32768
 
     # RoPE / YaRN long-context scaling
     rope_theta: float = 10_000.0
@@ -92,15 +92,15 @@ class LoopMoEConfig:
     # DeepSeek-V4.1-Flash Single-Pass mHC
     use_mhc: bool = True
     mhc_streams: int = 4
-    mhc_sinkhorn_iters: int = 20
+    mhc_sinkhorn_iters: int = 10
     mhc_alpha_init: float = 0.01
 
-    # DeepSeek-V4.1-Flash Engram Conditional Memory (~22.5% of sparse capacity)
+    # DeepSeek-V4.1-Flash Engram Conditional Memory (~20.5% of sparse capacity)
     use_engram: bool = True
     engram_orders: tuple[int, ...] = (2, 3)
     engram_hash_heads: int = 4
     engram_head_dim: int = 128
-    engram_total_slots: int = 1_460_000
+    engram_total_slots: int = 1_600_000
     engram_conv_kernel: int = 4
     engram_conv_dilation: int = 3
     engram_seed: int = 20260112
@@ -109,8 +109,8 @@ class LoopMoEConfig:
     n_heads: int = 16
     d_q_lora: int = 768
     d_kv_lora: int = 512
-    d_qk_nope: int = 128
-    d_qk_rope: int = 64
+    d_qk_nope: int = 96
+    d_qk_rope: int = 32
     d_v: int = 128
     attn_use_tokamax: bool = True
     use_csa2_indexer: bool = False
@@ -119,11 +119,11 @@ class LoopMoEConfig:
     csa2_topk: int = 2048
 
     # DeepSeek fine-grained MoE + LoopMoE Capacity Balancing
-    n_routed_experts: int = 416
-    d_ff_expert: int = 256
+    n_routed_experts: int = 256
+    d_ff_expert: int = 512
     n_shared_experts: int = 1
     d_ff_shared: int = 512
-    top_k: int = 12
+    top_k: int = 5
     routed_scaling_factor: float = 2.5
     router_bias_update_rate: float = 1e-3
     seq_aux_loss_weight: float = 1e-4
@@ -134,6 +134,8 @@ class LoopMoEConfig:
 
     # TPU execution
     remat_per_loop: bool = True
+    remat_sublayers: bool = False
+    remat_moe: bool = False
 
     @property
     def num_engram_tables(self) -> int:
@@ -219,6 +221,8 @@ class LoopMoEConfig:
             moe_use_tokamax=False,
             iter_adaln_bottleneck=16,
             remat_per_loop=False,
+            remat_sublayers=False,
+            remat_moe=False,
         )
 
 

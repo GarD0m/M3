@@ -91,10 +91,9 @@ def make_train_step(
         def accum_body(carry, microbatch):
             g_acc, loss_acc, ce_acc, gate_acc, cnt_acc = carry
             x_mb, y_mb = microbatch
-            (loss, aux), grads = grad_fn(params, x_mb, y_mb)
-            g_acc = jax.tree_util.tree_map(
-                lambda a, g: a + g * jnp.asarray(inv_g, dtype=g.dtype), g_acc, grads
-            )
+            with jax.named_scope("fwd_bwd_microbatch"):
+                (loss, aux), grads = grad_fn(params, x_mb, y_mb)
+            g_acc = jax.tree_util.tree_map(lambda a, g: a + g, g_acc, grads)
             return (
                 g_acc,
                 loss_acc + loss * inv_g,
@@ -103,22 +102,28 @@ def make_train_step(
                 cnt_acc + aux["expert_counts"] * inv_g,
             ), None
 
-        (grads_mean, loss_mean, ce_mean, gate_mean, counts_mean), _ = jax.lax.scan(
-            accum_body, init_carry, (batch_xs, batch_ys)
+        with jax.named_scope("grad_accum_scan"):
+            (grads_sum, loss_mean, ce_mean, gate_mean, counts_mean), _ = jax.lax.scan(
+                accum_body, init_carry, (batch_xs, batch_ys)
+            )
+        grads_mean = jax.tree_util.tree_map(
+            lambda g: g * jnp.asarray(inv_g, dtype=g.dtype), grads_sum
         )
 
-        updates, new_opt_state = optimizer.update(grads_mean, opt_state, params)
-        new_params = optax.apply_updates(params, updates)
+        with jax.named_scope("optimizer_muon_adamw"):
+            updates, new_opt_state = optimizer.update(grads_mean, opt_state, params)
+            new_params = optax.apply_updates(params, updates)
 
         # Auxiliary-Loss-Free dynamic bias adjustment outside gradient flow
-        moe_dict = dict(new_params["moe"])
-        moe_dict["router_bias"] = update_router_biases(
-            moe_dict["router_bias"],
-            counts_mean,
-            num_loops=model_cfg.num_loops,
-            update_rate=model_cfg.router_bias_update_rate,
-        )
-        new_params = {**new_params, "moe": moe_dict}
+        with jax.named_scope("router_bias_update"):
+            moe_dict = dict(new_params["moe"])
+            moe_dict["router_bias"] = update_router_biases(
+                moe_dict["router_bias"],
+                counts_mean,
+                num_loops=model_cfg.num_loops,
+                update_rate=model_cfg.router_bias_update_rate,
+            )
+            new_params = {**new_params, "moe": moe_dict}
 
         expert_mean = jnp.mean(counts_mean)
         expert_cv = jnp.std(counts_mean) / jnp.maximum(expert_mean, 1e-6)
