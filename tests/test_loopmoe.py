@@ -246,15 +246,21 @@ def test_chunked_cross_entropy_equivalence() -> None:
     targets = jax.random.randint(k_t, (2, 16), 0, 512, dtype=jnp.int32)
     mask = jax.random.bernoulli(k_m, p=0.8, shape=(2, 16)).astype(jnp.float32)
 
-    dense_logits = (hidden @ lm_w).astype(jnp.float32)
-    dense_nll = optax.softmax_cross_entropy_with_integer_labels(dense_logits, targets)
-    dense_loss = jnp.sum(dense_nll * mask) / jnp.sum(mask)
+    def _dense_loss_fn(h, w):
+        logits = (h @ w).astype(jnp.float32)
+        nll = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
+        return jnp.sum(nll * mask) / jnp.sum(mask)
+
+    dense_loss, (dense_dh, dense_dw) = jax.value_and_grad(_dense_loss_fn, argnums=(0, 1))(hidden, lm_w)
 
     for chunk_sz in (8, 16, 32):
-        chunked = chunked_cross_entropy_loss(
-            hidden, lm_w, targets, chunk_size=chunk_sz, loss_mask=mask
-        )
+        def _chunked_fn(h, w, csz=chunk_sz):
+            return chunked_cross_entropy_loss(h, w, targets, chunk_size=csz, loss_mask=mask)
+
+        chunked, (ch_dh, ch_dw) = jax.value_and_grad(_chunked_fn, argnums=(0, 1))(hidden, lm_w)
         np.testing.assert_allclose(float(chunked), float(dense_loss), atol=1e-4)
+        np.testing.assert_allclose(np.asarray(ch_dh, dtype=np.float32), np.asarray(dense_dh, dtype=np.float32), atol=5e-3)
+        np.testing.assert_allclose(np.asarray(ch_dw, dtype=np.float32), np.asarray(dense_dw, dtype=np.float32), atol=5e-3)
 
 
 def test_checkpoint_roundtrip_and_fp4_kv(tmp_path: Path) -> None:

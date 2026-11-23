@@ -48,15 +48,15 @@ def init_engram_params(
     if not cfg.use_engram:
         return {}
 
-    k_tab, k_wk, k_wv, k_conv = jax.random.split(key, 4)
+    k_tab, k_wkv, k_conv = jax.random.split(key, 3)
     total_slots = sum(cfg.engram_table_sizes)
     d = cfg.d_model
     d_engram = cfg.d_engram
 
     return {
         "tables": jax.random.normal(k_tab, (total_slots, cfg.engram_head_dim), dtype=dtype) * 0.02,
-        "w_k": jax.random.normal(k_wk, (d_engram, d), dtype=dtype) * (1.0 / jnp.sqrt(float(d_engram))),
-        "w_v": jax.random.normal(k_wv, (d_engram, d), dtype=dtype) * (1.0 / jnp.sqrt(float(d_engram))),
+        "w_kv": jax.random.normal(k_wkv, (d_engram, 2 * d), dtype=dtype)
+        * (1.0 / jnp.sqrt(float(d_engram))),
         "norm_q_w": jnp.ones((d,), dtype=dtype),
         "norm_k_w": jnp.ones((d,), dtype=dtype),
         "norm_conv_w": jnp.ones((d,), dtype=dtype),
@@ -140,15 +140,17 @@ def apply_engram_step(
     if not cfg.use_engram or engram_e is None:
         return jnp.zeros_like(h_t), jnp.asarray(0.0, dtype=jnp.float32)
 
-    k = engram_e @ params["w_k"]
-    v = engram_e @ params["w_v"]
+    kv = engram_e @ params["w_kv"]
+    k, v = jnp.split(kv, 2, axis=-1)
 
-    h_norm = rms_norm(h_t, params["norm_q_w"], eps=cfg.rms_norm_eps).astype(jnp.float32)
-    k_norm = rms_norm(k, params["norm_k_w"], eps=cfg.rms_norm_eps).astype(jnp.float32)
+    h_norm = rms_norm(h_t, params["norm_q_w"], eps=cfg.rms_norm_eps)
+    k_norm = rms_norm(k, params["norm_k_w"], eps=cfg.rms_norm_eps)
 
-    gate_logits = jnp.sum(h_norm * k_norm, axis=-1, keepdims=True) / jnp.sqrt(float(cfg.d_model))
-    gate = jax.nn.sigmoid(gate_logits)
-    u = gate.astype(h_t.dtype) * v
+    gate_logits = jnp.sum(h_norm * k_norm, axis=-1, keepdims=True, dtype=jnp.float32) / jnp.sqrt(
+        float(cfg.d_model)
+    )
+    gate = jax.nn.sigmoid(gate_logits).astype(h_t.dtype)
+    u = gate * v
 
     u_norm = rms_norm(u, params["norm_conv_w"], eps=cfg.rms_norm_eps)
     conv_out = _causal_depthwise_conv1d(
@@ -158,4 +160,4 @@ def apply_engram_step(
         dilation=cfg.engram_conv_dilation,
     )
     delta = u + conv_out
-    return delta, jnp.mean(gate)
+    return delta, jnp.mean(gate.astype(jnp.float32))

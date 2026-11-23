@@ -200,6 +200,84 @@ def forward_logits(
     return logits, aux
 
 
+def _run_scan_ce_fwd(
+    h_chunks: jax.Array,
+    lm_head_weight: jax.Array,
+    t_chunks: jax.Array,
+    m_chunks: jax.Array,
+    denom: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Accumulate scalar CE loss over chunks while retaining only [num_chunks, chunk] LSE."""
+
+    def _fwd_step(loss_acc: jax.Array, chunk_in: tuple[jax.Array, jax.Array, jax.Array]):
+        hc, tc, mc = chunk_in
+        logits = (hc @ lm_head_weight).astype(jnp.float32)
+        lse = jax.scipy.special.logsumexp(logits, axis=-1)
+        z_t = jnp.take_along_axis(logits, tc[:, None], axis=-1).squeeze(-1)
+        loss_acc = loss_acc + jnp.sum((lse - z_t) * mc)
+        return loss_acc, lse
+
+    total_loss, lse_chunks = jax.lax.scan(
+        _fwd_step, jnp.asarray(0.0, dtype=jnp.float32), (h_chunks, t_chunks, m_chunks)
+    )
+    return total_loss / denom, lse_chunks
+
+
+@jax.custom_vjp
+def _scan_chunked_ce(
+    h_chunks: jax.Array,
+    lm_head_weight: jax.Array,
+    t_chunks: jax.Array,
+    m_chunks: jax.Array,
+    denom: jax.Array,
+) -> jax.Array:
+    out, _ = _run_scan_ce_fwd(h_chunks, lm_head_weight, t_chunks, m_chunks, denom)
+    return out
+
+
+def _scan_chunked_ce_fwd(
+    h_chunks: jax.Array,
+    lm_head_weight: jax.Array,
+    t_chunks: jax.Array,
+    m_chunks: jax.Array,
+    denom: jax.Array,
+) -> tuple[jax.Array, tuple[jax.Array, ...]]:
+    out, lse_chunks = _run_scan_ce_fwd(h_chunks, lm_head_weight, t_chunks, m_chunks, denom)
+    return out, (h_chunks, lm_head_weight, t_chunks, m_chunks, lse_chunks, denom)
+
+
+def _scan_chunked_ce_bwd(
+    res: tuple[jax.Array, ...],
+    g_out: jax.Array,
+) -> tuple[jax.Array, jax.Array, None, None, None]:
+    h_chunks, lm_head_weight, t_chunks, m_chunks, lse_chunks, denom = res
+    chunk_len = h_chunks.shape[1]
+    row_idx = jnp.arange(chunk_len)
+    scale_factor = g_out / denom
+
+    def _bwd_step(
+        d_lm_acc: jax.Array, chunk_in: tuple[jax.Array, jax.Array, jax.Array, jax.Array]
+    ) -> tuple[jax.Array, jax.Array]:
+        hc, tc, mc, lse_c = chunk_in
+        logits = (hc @ lm_head_weight).astype(jnp.float32)
+        probs = jnp.exp(logits - lse_c[:, None])
+        probs = probs.at[row_idx, tc].add(-1.0)
+        d_logits = (probs * (mc * scale_factor)[:, None]).astype(hc.dtype)
+        d_hc = (d_logits @ lm_head_weight.T).astype(hc.dtype)
+        d_lm_acc = d_lm_acc + (hc.T @ d_logits).astype(d_lm_acc.dtype)
+        return d_lm_acc, d_hc
+
+    d_lm_w, d_h_chunks = jax.lax.scan(
+        _bwd_step,
+        jnp.zeros_like(lm_head_weight),
+        (h_chunks, t_chunks, m_chunks, lse_chunks),
+    )
+    return d_h_chunks, d_lm_w, None, None, None
+
+
+_scan_chunked_ce.defvjp(_scan_chunked_ce_fwd, _scan_chunked_ce_bwd)
+
+
 def chunked_cross_entropy_loss(
     hidden: jax.Array,
     lm_head_weight: jax.Array,
@@ -237,16 +315,7 @@ def chunked_cross_entropy_loss(
     h_chunks = h_flat.reshape(num_chunks, effective_chunk, d_model)
     t_chunks = t_flat.reshape(num_chunks, effective_chunk)
     m_chunks = m_flat.reshape(num_chunks, effective_chunk)
-
-    def _chunk_loss(chunk_in: tuple[jax.Array, jax.Array, jax.Array]) -> jax.Array:
-        hc, tc, mc = chunk_in
-        logits = (hc @ lm_head_weight).astype(jnp.float32)
-        token_nll = optax.softmax_cross_entropy_with_integer_labels(logits, tc)
-        return jnp.sum(token_nll * mc)
-
-    remat_chunk_loss = jax.checkpoint(_chunk_loss)
-    chunk_losses = jax.lax.map(remat_chunk_loss, (h_chunks, t_chunks, m_chunks))
-    return jnp.sum(chunk_losses) / denom
+    return _scan_chunked_ce(h_chunks, lm_head_weight, t_chunks, m_chunks, denom)
 
 
 def forward_model(

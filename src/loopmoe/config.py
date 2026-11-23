@@ -109,8 +109,8 @@ class LoopMoEConfig:
     n_heads: int = 16
     d_q_lora: int = 768
     d_kv_lora: int = 512
-    d_qk_nope: int = 128
-    d_qk_rope: int = 64
+    d_qk_nope: int = 96
+    d_qk_rope: int = 32
     d_v: int = 128
     attn_use_tokamax: bool = True
     use_csa2_indexer: bool = False

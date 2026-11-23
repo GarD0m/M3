@@ -19,7 +19,7 @@ class OptimConfig:
     adam_lr: float = 1.5e-3
     warmup_steps: int = 1000
     muon_momentum: float = 0.95
-    muon_ns_steps: int = 5
+    muon_ns_steps: int = 4
     muon_weight_decay: float = 0.01
     muon_consistent_rms: float = 0.2
     adam_b1: float = 0.9
@@ -78,7 +78,7 @@ def classify_param(path_str: str, arr: Any) -> str:
             return "muon"
         if path_str.startswith("moe/") and leaf in ("shared_w_gate_up", "shared_w_gate", "shared_w_up", "shared_w_down"):
             return "muon"
-        if path_str.startswith("engram/") and leaf in ("w_k", "w_v"):
+        if path_str.startswith("engram/") and leaf in ("w_kv", "w_k", "w_v"):
             return "muon"
         if path_str.startswith("iter_adaln/") and leaf in ("w_h", "w_t", "w_out"):
             return "muon"
