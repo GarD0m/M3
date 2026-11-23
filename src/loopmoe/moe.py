@@ -184,6 +184,29 @@ def _moe_combine_bwd(
 _moe_combine.defvjp(_moe_combine_fwd, _moe_combine_bwd)
 
 
+@jax.custom_vjp
+def _permute_1d(arr: jax.Array, order: jax.Array, inv_order: jax.Array) -> jax.Array:
+    """Gather 1D tensor by permutation `order`; backward uses inverse permutation (zero scatter-add)."""
+    del inv_order
+    return arr[order]
+
+
+def _permute_1d_fwd(
+    arr: jax.Array, order: jax.Array, inv_order: jax.Array
+) -> tuple[jax.Array, tuple[jax.Array]]:
+    return arr[order], (inv_order,)
+
+
+def _permute_1d_bwd(
+    res: tuple[jax.Array], d_out: jax.Array
+) -> tuple[jax.Array, None, None]:
+    (inv_order,) = res
+    return (d_out[inv_order], None, None)
+
+
+_permute_1d.defvjp(_permute_1d_fwd, _permute_1d_bwd)
+
+
 def apply_moe(
     params: dict[str, jax.Array],
     x: jax.Array,
@@ -215,8 +238,9 @@ def apply_moe(
     # 2. Sort token-expert pairs once; reuse sorted_experts for zero-scatter counts and inv_order for combine/bwd
     with jax.named_scope("moe_sort_dispatch"):
         flat_experts = topk_idx.reshape(-1)
-        sort_order = jnp.argsort(flat_experts)
-        sorted_experts = flat_experts[sort_order]
+        sorted_experts, sort_order = jax.lax.sort_key_val(
+            flat_experts, jnp.arange(flat_experts.shape[0], dtype=jnp.int32)
+        )
         token_indices = sort_order // cfg.top_k
         inv_order = jnp.empty_like(sort_order).at[sort_order].set(
             jnp.arange(sort_order.shape[0], dtype=sort_order.dtype)
@@ -226,7 +250,7 @@ def apply_moe(
             jnp.float32
         )
 
-        sorted_weights = topk_weights.reshape(-1)[sort_order]
+        sorted_weights = _permute_1d(topk_weights.reshape(-1), sort_order, inv_order)
         sorted_x = _moe_dispatch(x_flat, token_indices, inv_order, cfg.top_k)  # [N*K, D]
         group_sizes = expert_counts.astype(jnp.int32)
 

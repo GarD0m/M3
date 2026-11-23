@@ -31,6 +31,8 @@ from loopmoe.mhc import (
 )
 from loopmoe.mla import quantize_kv_fp4_e2m1
 from loopmoe.model import (
+    _saved_logits_ce,
+    _saved_logits_ce_vd,
     chunked_cross_entropy_loss,
     count_tree_params,
     expand_checkpoint_1_to_8_loops,
@@ -38,7 +40,7 @@ from loopmoe.model import (
     forward_model,
     init_model_params,
 )
-from loopmoe.moe import _moe_combine, _moe_dispatch, update_router_biases
+from loopmoe.moe import _moe_combine, _moe_dispatch, _permute_1d, update_router_biases
 from loopmoe.optim import (
     OptimConfig,
     classify_param,
@@ -279,6 +281,22 @@ def test_chunked_cross_entropy_equivalence() -> None:
         np.testing.assert_allclose(np.asarray(ch_vd_dh, dtype=np.float32), np.asarray(dense_dh, dtype=np.float32), atol=5e-3)
         np.testing.assert_allclose(np.asarray(ch_vd_dw.T, dtype=np.float32), np.asarray(dense_dw, dtype=np.float32), atol=5e-3)
 
+    # Also verify multi-chunk BF16-saved CE (_saved_logits_ce and _saved_logits_ce_vd) with num_chunks=2
+    denom = jnp.maximum(jnp.sum(mask), 1.0)
+    sv_loss, (sv_dh, sv_dw) = jax.value_and_grad(
+        lambda h, w: _saved_logits_ce(h, w, targets, mask, denom), argnums=(0, 1)
+    )(hidden, lm_w)
+    np.testing.assert_allclose(float(sv_loss), float(dense_loss), atol=1e-4)
+    np.testing.assert_allclose(np.asarray(sv_dh, dtype=np.float32), np.asarray(dense_dh, dtype=np.float32), atol=5e-3)
+    np.testing.assert_allclose(np.asarray(sv_dw, dtype=np.float32), np.asarray(dense_dw, dtype=np.float32), atol=5e-3)
+
+    sv_vd_loss, (sv_vd_dh, sv_vd_dw) = jax.value_and_grad(
+        lambda h, w_vd: _saved_logits_ce_vd(h, w_vd, targets, mask, denom), argnums=(0, 1)
+    )(hidden, lm_w_vd)
+    np.testing.assert_allclose(float(sv_vd_loss), float(dense_loss), atol=1e-4)
+    np.testing.assert_allclose(np.asarray(sv_vd_dh, dtype=np.float32), np.asarray(dense_dh, dtype=np.float32), atol=5e-3)
+    np.testing.assert_allclose(np.asarray(sv_vd_dw.T, dtype=np.float32), np.asarray(dense_dw, dtype=np.float32), atol=5e-3)
+
 
 def test_checkpoint_roundtrip_and_fp4_kv(tmp_path: Path) -> None:
     cfg = LoopMoEConfig.tiny(num_loops=2)
@@ -505,3 +523,13 @@ def test_mhc_compute_gates_and_moe_dispatch_combine_equivalence() -> None:
         gd_fast = jax.grad(lambda d_: jnp.mean(_moe_combine(d_, token_indices, inv_order, top_k).astype(jnp.float32) * cot_comb))(down_out)
         gd_ref = jax.grad(lambda d_: jnp.mean(jnp.zeros((num_tokens, d_model), dtype=dtype).at[token_indices].add(d_).astype(jnp.float32) * cot_comb))(down_out)
         np.testing.assert_allclose(np.asarray(gd_fast, dtype=np.float32), np.asarray(gd_ref, dtype=np.float32), atol=tol, rtol=tol)
+
+        # Verify _permute_1d forward & gradient equivalence
+        w_1d = jax.random.normal(k2, (num_tokens * top_k,), dtype=dtype)
+        cot_1d = jax.random.normal(k3, (num_tokens * top_k,), dtype=jnp.float32)
+        p_fast = _permute_1d(w_1d, sort_order, inv_order)
+        p_ref = w_1d[sort_order]
+        np.testing.assert_allclose(np.asarray(p_fast, dtype=np.float32), np.asarray(p_ref, dtype=np.float32), atol=tol)
+        gp_fast = jax.grad(lambda w_: jnp.mean(_permute_1d(w_, sort_order, inv_order).astype(jnp.float32) * cot_1d))(w_1d)
+        gp_ref = jax.grad(lambda w_: jnp.mean(w_[sort_order].astype(jnp.float32) * cot_1d))(w_1d)
+        np.testing.assert_allclose(np.asarray(gp_fast, dtype=np.float32), np.asarray(gp_ref, dtype=np.float32), atol=tol, rtol=tol)

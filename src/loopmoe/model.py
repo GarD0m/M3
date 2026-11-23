@@ -398,6 +398,140 @@ def _scan_chunked_ce_vd_bwd(
 _scan_chunked_ce_vd.defvjp(_scan_chunked_ce_vd_fwd, _scan_chunked_ce_vd_bwd)
 
 
+def _run_saved_logits_ce_fwd(
+    h_chunks: jax.Array,
+    lm_weight: jax.Array,
+    t_chunks: jax.Array,
+    m_chunks: jax.Array,
+    denom: jax.Array,
+    weight_is_vd: bool,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Compute scalar CE over sub-chunks while saving only BF16 logits and FP32 LSE."""
+
+    def _fwd_step(loss_acc: jax.Array, chunk_in: tuple[jax.Array, jax.Array, jax.Array]):
+        hc, tc, mc = chunk_in
+        logits_bf16 = (
+            jax.lax.dot_general(hc, lm_weight, (((1,), (1,)), ((), ())))
+            if weight_is_vd
+            else (hc @ lm_weight)
+        )
+        chunk_loss, lse = _ce_chunk_loss_and_lse(logits_bf16, tc, mc)
+        return loss_acc + chunk_loss, (logits_bf16, lse)
+
+    total_loss, (logits_chunks, lse_chunks) = jax.lax.scan(
+        _fwd_step,
+        jnp.asarray(0.0, dtype=jnp.float32),
+        (h_chunks, t_chunks, m_chunks),
+        unroll=1,
+    )
+    return total_loss / denom, logits_chunks, lse_chunks
+
+
+def _run_saved_logits_ce_bwd(
+    res: tuple[jax.Array, ...],
+    g_out: jax.Array,
+    weight_is_vd: bool,
+) -> tuple[jax.Array, jax.Array, None, None, None]:
+    h_chunks, lm_weight, logits_chunks, t_chunks, m_chunks, lse_chunks, denom = res
+    vocab_size = lm_weight.shape[0] if weight_is_vd else lm_weight.shape[1]
+    vocab_idx = jnp.arange(vocab_size, dtype=t_chunks.dtype)[None, :]
+    scale_factor = g_out / denom
+
+    def _bwd_step(
+        d_w_acc: jax.Array,
+        chunk_in: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
+    ) -> tuple[jax.Array, jax.Array]:
+        hc, logits_c, tc, mc, lse_c = chunk_in
+        d_logits = _ce_chunk_dlogits(logits_c, lse_c, tc, mc, vocab_idx, scale_factor, hc.dtype)
+        if weight_is_vd:
+            d_hc = (d_logits @ lm_weight).astype(hc.dtype)
+            d_w_acc = d_w_acc + jax.lax.dot_general(
+                d_logits, hc, (((0,), (0,)), ((), ()))
+            ).astype(d_w_acc.dtype)
+        else:
+            d_hc = (d_logits @ lm_weight.T).astype(hc.dtype)
+            d_w_acc = d_w_acc + (hc.T @ d_logits).astype(d_w_acc.dtype)
+        return d_w_acc, d_hc
+
+    d_lm_w, d_h_chunks = jax.lax.scan(
+        _bwd_step,
+        jnp.zeros_like(lm_weight),
+        (h_chunks, logits_chunks, t_chunks, m_chunks, lse_chunks),
+        unroll=1,
+    )
+    return d_h_chunks, d_lm_w, None, None, None
+
+
+@jax.custom_vjp
+def _saved_logits_ce(
+    h_chunks: jax.Array,
+    lm_head_weight: jax.Array,
+    t_chunks: jax.Array,
+    m_chunks: jax.Array,
+    denom: jax.Array,
+) -> jax.Array:
+    out, _, _ = _run_saved_logits_ce_fwd(h_chunks, lm_head_weight, t_chunks, m_chunks, denom, False)
+    return out
+
+
+def _saved_logits_ce_fwd(
+    h_chunks: jax.Array,
+    lm_head_weight: jax.Array,
+    t_chunks: jax.Array,
+    m_chunks: jax.Array,
+    denom: jax.Array,
+) -> tuple[jax.Array, tuple[jax.Array, ...]]:
+    out, logits_chunks, lse_chunks = _run_saved_logits_ce_fwd(
+        h_chunks, lm_head_weight, t_chunks, m_chunks, denom, False
+    )
+    return out, (h_chunks, lm_head_weight, logits_chunks, t_chunks, m_chunks, lse_chunks, denom)
+
+
+def _saved_logits_ce_bwd(
+    res: tuple[jax.Array, ...],
+    g_out: jax.Array,
+) -> tuple[jax.Array, jax.Array, None, None, None]:
+    return _run_saved_logits_ce_bwd(res, g_out, False)
+
+
+_saved_logits_ce.defvjp(_saved_logits_ce_fwd, _saved_logits_ce_bwd)
+
+
+@jax.custom_vjp
+def _saved_logits_ce_vd(
+    h_chunks: jax.Array,
+    lm_weight_vd: jax.Array,
+    t_chunks: jax.Array,
+    m_chunks: jax.Array,
+    denom: jax.Array,
+) -> jax.Array:
+    out, _, _ = _run_saved_logits_ce_fwd(h_chunks, lm_weight_vd, t_chunks, m_chunks, denom, True)
+    return out
+
+
+def _saved_logits_ce_vd_fwd(
+    h_chunks: jax.Array,
+    lm_weight_vd: jax.Array,
+    t_chunks: jax.Array,
+    m_chunks: jax.Array,
+    denom: jax.Array,
+) -> tuple[jax.Array, tuple[jax.Array, ...]]:
+    out, logits_chunks, lse_chunks = _run_saved_logits_ce_fwd(
+        h_chunks, lm_weight_vd, t_chunks, m_chunks, denom, True
+    )
+    return out, (h_chunks, lm_weight_vd, logits_chunks, t_chunks, m_chunks, lse_chunks, denom)
+
+
+def _saved_logits_ce_vd_bwd(
+    res: tuple[jax.Array, ...],
+    g_out: jax.Array,
+) -> tuple[jax.Array, jax.Array, None, None, None]:
+    return _run_saved_logits_ce_bwd(res, g_out, True)
+
+
+_saved_logits_ce_vd.defvjp(_saved_logits_ce_vd_fwd, _saved_logits_ce_vd_bwd)
+
+
 def chunked_cross_entropy_loss(
     hidden: jax.Array,
     lm_head_weight: jax.Array,
@@ -409,7 +543,9 @@ def chunked_cross_entropy_loss(
     """Memory-efficient chunked linear projection + softmax cross-entropy.
 
     Supports `[D, V]` (`weight_is_vd=False`) or layout-native tied `[V, D]` (`weight_is_vd=True`)
-    without transposing the full `[65536, 2048]` embedding table.
+    without transposing the full `[65536, 2048]` embedding table. When `chunk_size >= total_tokens`,
+    uses BF16-saved sub-chunking (`<=8192` tok/chunk) to skip backward logits matmul recompute
+    without allocating full FP32 `[N, V]` logits in HBM.
     """
     bsz, seq_len, d_model = hidden.shape
     total_tokens = bsz * seq_len
@@ -423,15 +559,17 @@ def chunked_cross_entropy_loss(
 
     denom = jnp.maximum(jnp.sum(m_flat), 1.0)
     if chunk_size >= total_tokens:
-        logits_bf16 = (
-            jax.lax.dot_general(h_flat, lm_head_weight, (((1,), (1,)), ((), ())))
-            if weight_is_vd
-            else (h_flat @ lm_head_weight)
-        )
-        token_nll = optax.softmax_cross_entropy_with_integer_labels(
-            logits_bf16.astype(jnp.float32), t_flat
-        )
-        return jnp.sum(token_nll * m_flat) / denom
+        sub_chunk = min(total_tokens, 8192)
+        if total_tokens % sub_chunk != 0:
+            sub_chunk = math.gcd(total_tokens, sub_chunk)
+            if sub_chunk == 1 and total_tokens <= 8192:
+                sub_chunk = total_tokens
+        num_chunks = total_tokens // sub_chunk
+        h_chunks = h_flat.reshape(num_chunks, sub_chunk, d_model)
+        t_chunks = t_flat.reshape(num_chunks, sub_chunk)
+        m_chunks = m_flat.reshape(num_chunks, sub_chunk)
+        saved_fn = _saved_logits_ce_vd if weight_is_vd else _saved_logits_ce
+        return saved_fn(h_chunks, lm_head_weight, t_chunks, m_chunks, denom)
 
     effective_chunk = min(chunk_size, total_tokens)
     if total_tokens % effective_chunk != 0:
