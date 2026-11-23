@@ -12,19 +12,19 @@ from .config import LoopMoEConfig
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(2,))
 def _rms_norm_weighted(x: jax.Array, weight: jax.Array, eps: float) -> jax.Array:
-    x_f32 = x.astype(jnp.float32)
-    inv_rms = jax.lax.rsqrt(jnp.mean(jnp.square(x_f32), axis=-1, keepdims=True) + eps)
-    x_hat = x_f32 * inv_rms
-    return (x_hat * weight.astype(jnp.float32)).astype(x.dtype)
+    inv_rms = jax.lax.rsqrt(
+        jnp.mean(jnp.square(x), axis=-1, keepdims=True, dtype=jnp.float32) + eps
+    ).astype(x.dtype)
+    return (x * inv_rms) * weight.astype(x.dtype)
 
 
 def _rms_norm_weighted_fwd(
     x: jax.Array, weight: jax.Array, eps: float
 ) -> tuple[jax.Array, tuple[jax.Array, jax.Array, jax.Array]]:
-    x_f32 = x.astype(jnp.float32)
-    inv_rms = jax.lax.rsqrt(jnp.mean(jnp.square(x_f32), axis=-1, keepdims=True) + eps)
-    x_hat = x_f32 * inv_rms
-    y = (x_hat * weight.astype(jnp.float32)).astype(x.dtype)
+    inv_rms = jax.lax.rsqrt(
+        jnp.mean(jnp.square(x), axis=-1, keepdims=True, dtype=jnp.float32) + eps
+    ).astype(x.dtype)
+    y = (x * inv_rms) * weight.astype(x.dtype)
     return y, (x, weight, inv_rms)
 
 
@@ -35,13 +35,12 @@ def _rms_norm_weighted_bwd(
 ) -> tuple[jax.Array, jax.Array]:
     del eps
     x, weight, inv_rms = res
-    x_hat = x.astype(jnp.float32) * inv_rms
-    dy_f32 = dy.astype(jnp.float32)
+    x_hat = x * inv_rms
     sum_axes = tuple(range(x.ndim - 1))
-    dw = jnp.sum(dy_f32 * x_hat, axis=sum_axes).astype(weight.dtype)
-    g = dy_f32 * weight.astype(jnp.float32)
-    dot_mean = jnp.mean(g * x_hat, axis=-1, keepdims=True)
-    dx = (inv_rms * (g - x_hat * dot_mean)).astype(x.dtype)
+    dw = jnp.sum(dy * x_hat, axis=sum_axes, dtype=jnp.float32).astype(weight.dtype)
+    g = dy * weight.astype(x.dtype)
+    dot_mean = jnp.mean(g * x_hat, axis=-1, keepdims=True, dtype=jnp.float32).astype(x.dtype)
+    dx = inv_rms * (g - x_hat * dot_mean)
     return dx, dw
 
 
@@ -50,17 +49,19 @@ _rms_norm_weighted.defvjp(_rms_norm_weighted_fwd, _rms_norm_weighted_bwd)
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(1,))
 def _rms_norm_unweighted(x: jax.Array, eps: float) -> jax.Array:
-    x_f32 = x.astype(jnp.float32)
-    inv_rms = jax.lax.rsqrt(jnp.mean(jnp.square(x_f32), axis=-1, keepdims=True) + eps)
-    return (x_f32 * inv_rms).astype(x.dtype)
+    inv_rms = jax.lax.rsqrt(
+        jnp.mean(jnp.square(x), axis=-1, keepdims=True, dtype=jnp.float32) + eps
+    ).astype(x.dtype)
+    return x * inv_rms
 
 
 def _rms_norm_unweighted_fwd(
     x: jax.Array, eps: float
 ) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
-    x_f32 = x.astype(jnp.float32)
-    inv_rms = jax.lax.rsqrt(jnp.mean(jnp.square(x_f32), axis=-1, keepdims=True) + eps)
-    y = (x_f32 * inv_rms).astype(x.dtype)
+    inv_rms = jax.lax.rsqrt(
+        jnp.mean(jnp.square(x), axis=-1, keepdims=True, dtype=jnp.float32) + eps
+    ).astype(x.dtype)
+    y = x * inv_rms
     return y, (x, inv_rms)
 
 
@@ -71,10 +72,9 @@ def _rms_norm_unweighted_bwd(
 ) -> tuple[jax.Array]:
     del eps
     x, inv_rms = res
-    x_hat = x.astype(jnp.float32) * inv_rms
-    dy_f32 = dy.astype(jnp.float32)
-    dot_mean = jnp.mean(dy_f32 * x_hat, axis=-1, keepdims=True)
-    dx = (inv_rms * (dy_f32 - x_hat * dot_mean)).astype(x.dtype)
+    x_hat = x * inv_rms
+    dot_mean = jnp.mean(dy * x_hat, axis=-1, keepdims=True, dtype=jnp.float32).astype(x.dtype)
+    dx = inv_rms * (dy - x_hat * dot_mean)
     return (dx,)
 
 
@@ -86,7 +86,7 @@ def rms_norm(
     weight: jax.Array | None = None,
     eps: float = 1e-6,
 ) -> jax.Array:
-    """Compute RMSNorm in float32 using memory-lean custom VJP (avoids saving FP32 residuals)."""
+    """Compute RMSNorm in native dtype with FP32 scalar variance reduction and lean custom VJP."""
     if weight is not None:
         return _rms_norm_weighted(x, weight, eps)
     return _rms_norm_unweighted(x, eps)
@@ -166,14 +166,14 @@ def collapse_streams(x_streams: jax.Array) -> jax.Array:
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(1,))
 def _streams_inv_rms(x_streams: jax.Array, eps: float) -> jax.Array:
-    """Compute [B, S, 1] inverse RMS across [n_streams, D] without [B, S, n_streams*D] reshape."""
+    """Compute [B, S, 1] inverse RMS in native dtype across [n_streams, D] without [B, S, n_streams*D] reshape."""
     n_streams = x_streams.shape[2]
-    sq_acc = jnp.mean(jnp.square(x_streams[:, :, 0, :].astype(jnp.float32)), axis=-1, keepdims=True)
+    sq_acc = jnp.mean(jnp.square(x_streams[:, :, 0, :]), axis=-1, keepdims=True, dtype=jnp.float32)
     for s in range(1, n_streams):
         sq_acc = sq_acc + jnp.mean(
-            jnp.square(x_streams[:, :, s, :].astype(jnp.float32)), axis=-1, keepdims=True
+            jnp.square(x_streams[:, :, s, :]), axis=-1, keepdims=True, dtype=jnp.float32
         )
-    return jax.lax.rsqrt(sq_acc * (1.0 / float(n_streams)) + eps)
+    return jax.lax.rsqrt(sq_acc * (1.0 / float(n_streams)) + eps).astype(x_streams.dtype)
 
 
 def _streams_inv_rms_fwd(
@@ -192,16 +192,14 @@ def _streams_inv_rms_bwd(
     x_streams, inv_rms = res
     n_streams = x_streams.shape[2]
     d_model = x_streams.shape[3]
-    scale = (
+    inv_rms_f32 = inv_rms.astype(jnp.float32)
+    scale_dt = (
         (-1.0 / float(n_streams * d_model))
         * d_inv_rms.astype(jnp.float32)
-        * (inv_rms * inv_rms * inv_rms)
-    )
+        * (inv_rms_f32 * inv_rms_f32 * inv_rms_f32)
+    ).astype(x_streams.dtype)
     dx_streams = jnp.stack(
-        [
-            (x_streams[:, :, s, :].astype(jnp.float32) * scale).astype(x_streams.dtype)
-            for s in range(n_streams)
-        ],
+        [x_streams[:, :, s, :] * scale_dt for s in range(n_streams)],
         axis=2,
     )
     return (dx_streams,)
@@ -216,7 +214,7 @@ def mhc_compute_gates(
     sinkhorn_iters: int = 20,
     eps: float = 1e-6,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Compute pre-aggregated input and mHC mixing matrices (H_pre, H_post, H_res) without 8192-dim layout copies."""
+    """Compute pre-aggregated input and mHC mixing matrices (H_pre, H_post, H_res) in native dtype."""
     with jax.named_scope("mhc_compute_gates"):
         bsz, seq_len, n_streams, d_model = x_streams.shape
         dt = x_streams.dtype
@@ -225,20 +223,24 @@ def mhc_compute_gates(
             n_streams, d_model, -1
         )
         streams = [x_streams[:, :, s, :] for s in range(n_streams)]
-        proj = (streams[0] @ w_eff[0]).astype(jnp.float32)
+        proj = streams[0] @ w_eff[0]
         for s in range(1, n_streams):
-            proj = proj + (streams[s] @ w_eff[s]).astype(jnp.float32)
+            proj = proj + (streams[s] @ w_eff[s])
         all_dyn = proj * inv_rms
 
         pre_dyn = all_dyn[..., :n_streams]
         post_dyn = all_dyn[..., n_streams : 2 * n_streams]
         res_dyn = all_dyn[..., 2 * n_streams :].reshape(bsz, seq_len, n_streams, n_streams)
 
-        h_pre = jax.nn.sigmoid(params["alpha_pre"] * pre_dyn + params["b_pre"])
-        h_pre = (h_pre / (jnp.sum(h_pre, axis=-1, keepdims=True) + eps)).astype(dt)
+        h_pre = jax.nn.sigmoid(
+            params["alpha_pre"].astype(dt) * pre_dyn + params["b_pre"].astype(dt)
+        )
+        h_pre = h_pre / (jnp.sum(h_pre, axis=-1, keepdims=True) + jnp.asarray(eps, dtype=dt))
 
-        h_post = (2.0 * jax.nn.sigmoid(params["alpha_post"] * post_dyn + params["b_post"])).astype(dt)
-        h_res_logits = params["alpha_res"] * res_dyn + params["b_res"]
+        h_post = jnp.asarray(2.0, dtype=dt) * jax.nn.sigmoid(
+            params["alpha_post"].astype(dt) * post_dyn + params["b_post"].astype(dt)
+        )
+        h_res_logits = params["alpha_res"].astype(dt) * res_dyn + params["b_res"].astype(dt)
         h_res = sinkhorn_knopp(h_res_logits, num_iters=sinkhorn_iters, eps=eps).astype(dt)
 
         h_in = h_pre[:, :, 0, None] * streams[0]

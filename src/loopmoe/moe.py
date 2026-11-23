@@ -107,13 +107,13 @@ def _grouped_matmul(
 
 
 def _gather_sum_topk(arr: jax.Array, inv_order: jax.Array, top_k: int) -> jax.Array:
-    """Stream K TPU-aligned [N, D] gathers into an FP32 accumulator (avoids K=5 non-8-aligned retile copies)."""
+    """Stream K TPU-aligned [N, D] gathers directly in native dtype (avoids FP32 casts & retile copies)."""
     num_tokens = inv_order.shape[0] // top_k
     inv_2d = inv_order.reshape(num_tokens, top_k)
-    acc = arr[inv_2d[:, 0]].astype(jnp.float32)
+    acc = arr[inv_2d[:, 0]]
     for k in range(1, top_k):
-        acc = acc + arr[inv_2d[:, k]].astype(jnp.float32)
-    return acc.astype(arr.dtype)
+        acc = acc + arr[inv_2d[:, k]]
+    return acc
 
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(3,))
@@ -223,17 +223,20 @@ def apply_moe(
     bsz, seq_len, d_model = x.shape
     num_tokens = bsz * seq_len
     x_flat = x.reshape(num_tokens, d_model)
+    dt = x_flat.dtype
 
     # 1. Sigmoid routing + Aux-Loss-Free bias (bias excluded from gradient flow)
     with jax.named_scope("moe_router"):
-        router_logits = (x_flat @ params["router_w"]).astype(jnp.float32)
+        router_logits = x_flat @ params["router_w"].astype(dt)
         scores = jax.nn.sigmoid(router_logits)
-        bias_t = jax.lax.stop_gradient(params["router_bias"][loop_idx])
+        bias_t = jax.lax.stop_gradient(params["router_bias"][loop_idx]).astype(dt)
         biased_scores = scores + bias_t[None, :]
 
         topk_biased, topk_idx = jax.lax.top_k(biased_scores, cfg.top_k)  # [N, K]
         topk_scores = topk_biased - bias_t[topk_idx]
-        topk_weights = topk_scores / (jnp.sum(topk_scores, axis=-1, keepdims=True) + 1e-20)
+        topk_weights = topk_scores / (
+            jnp.sum(topk_scores, axis=-1, keepdims=True) + jnp.asarray(1e-6, dtype=dt)
+        )
 
     # 2. Sort token-expert pairs once; reuse sorted_experts for zero-scatter counts and inv_order for combine/bwd
     with jax.named_scope("moe_sort_dispatch"):
@@ -255,14 +258,16 @@ def apply_moe(
         group_sizes = expert_counts.astype(jnp.int32)
 
     if cfg.seq_aux_loss_weight > 0.0:
-        scores_norm = scores / (jnp.sum(scores, axis=-1, keepdims=True) + 1e-20)
+        scores_norm = scores / (
+            jnp.sum(scores, axis=-1, keepdims=True) + jnp.asarray(1e-6, dtype=dt)
+        )
         scores_seq = scores_norm.reshape(bsz, seq_len, cfg.n_routed_experts)
         idx_seq = topk_idx.reshape(bsz, seq_len, cfg.top_k)
         seq_counts = jax.vmap(
             lambda idx: jnp.diff(jnp.searchsorted(jnp.sort(idx.reshape(-1)), edges, side="left"))
         )(idx_seq).astype(jnp.float32)
         ce = seq_counts * (float(cfg.n_routed_experts) / float(seq_len * cfg.top_k))  # [B, E]
-        pi = jnp.mean(scores_seq, axis=1)  # [B, E]
+        pi = jnp.mean(scores_seq, axis=1, dtype=jnp.float32)  # [B, E]
         seq_aux_loss = cfg.seq_aux_loss_weight * jnp.mean(jnp.sum(ce * pi, axis=-1))
     else:
         seq_aux_loss = jnp.asarray(0.0, dtype=jnp.float32)
@@ -272,8 +277,7 @@ def apply_moe(
             sorted_x, params["w_gate_up"], group_sizes, sorted_experts, use_tokamax=cfg.moe_use_tokamax
         )
         gate_act, up_act = jnp.split(gate_up, 2, axis=-1)
-    dt = x_flat.dtype
-    scale_w = (sorted_weights[:, None] * float(cfg.routed_scaling_factor)).astype(dt)
+    scale_w = sorted_weights[:, None] * jnp.asarray(cfg.routed_scaling_factor, dtype=dt)
     hidden = (jax.nn.silu(gate_act) * up_act) * scale_w
     with jax.named_scope("moe_gmm_down"):
         down_out = _grouped_matmul(
