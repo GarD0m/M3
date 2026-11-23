@@ -406,22 +406,25 @@ def _run_saved_logits_ce_fwd(
     denom: jax.Array,
     weight_is_vd: bool,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Compute scalar CE over sub-chunks while saving only BF16 logits and FP32 LSE."""
+    """Compute single-GEMM BF16 logits and scan LSE over sub-chunks (zero dynamic_update_slice)."""
+    num_chunks, sub_chunk, d_model = h_chunks.shape
+    h_flat = h_chunks.reshape(num_chunks * sub_chunk, d_model)
+    logits_all = (
+        jax.lax.dot_general(h_flat, lm_weight, (((1,), (1,)), ((), ())))
+        if weight_is_vd
+        else (h_flat @ lm_weight)
+    )
+    logits_chunks = logits_all.reshape(num_chunks, sub_chunk, logits_all.shape[-1])
 
-    def _fwd_step(loss_acc: jax.Array, chunk_in: tuple[jax.Array, jax.Array, jax.Array]):
-        hc, tc, mc = chunk_in
-        logits_bf16 = (
-            jax.lax.dot_general(hc, lm_weight, (((1,), (1,)), ((), ())))
-            if weight_is_vd
-            else (hc @ lm_weight)
-        )
-        chunk_loss, lse = _ce_chunk_loss_and_lse(logits_bf16, tc, mc)
-        return loss_acc + chunk_loss, (logits_bf16, lse)
+    def _lse_step(loss_acc: jax.Array, chunk_in: tuple[jax.Array, jax.Array, jax.Array]):
+        logits_c, tc, mc = chunk_in
+        chunk_loss, lse = _ce_chunk_loss_and_lse(logits_c, tc, mc)
+        return loss_acc + chunk_loss, lse
 
-    total_loss, (logits_chunks, lse_chunks) = jax.lax.scan(
-        _fwd_step,
+    total_loss, lse_chunks = jax.lax.scan(
+        _lse_step,
         jnp.asarray(0.0, dtype=jnp.float32),
-        (h_chunks, t_chunks, m_chunks),
+        (logits_chunks, t_chunks, m_chunks),
         unroll=1,
     )
     return total_loss / denom, logits_chunks, lse_chunks
@@ -544,8 +547,8 @@ def chunked_cross_entropy_loss(
 
     Supports `[D, V]` (`weight_is_vd=False`) or layout-native tied `[V, D]` (`weight_is_vd=True`)
     without transposing the full `[65536, 2048]` embedding table. When `chunk_size >= total_tokens`,
-    uses BF16-saved sub-chunking (`<=8192` tok/chunk) to skip backward logits matmul recompute
-    without allocating full FP32 `[N, V]` logits in HBM.
+    uses single-GEMM BF16-saved sub-chunking (`<=4096` tok/chunk) to skip backward logits matmul
+    recompute without allocating full FP32 `[N, V]` logits in HBM.
     """
     bsz, seq_len, d_model = hidden.shape
     total_tokens = bsz * seq_len
@@ -559,10 +562,10 @@ def chunked_cross_entropy_loss(
 
     denom = jnp.maximum(jnp.sum(m_flat), 1.0)
     if chunk_size >= total_tokens:
-        sub_chunk = min(total_tokens, 8192)
+        sub_chunk = min(total_tokens, 4096)
         if total_tokens % sub_chunk != 0:
             sub_chunk = math.gcd(total_tokens, sub_chunk)
-            if sub_chunk == 1 and total_tokens <= 8192:
+            if sub_chunk == 1 and total_tokens <= 4096:
                 sub_chunk = total_tokens
         num_chunks = total_tokens // sub_chunk
         h_chunks = h_flat.reshape(num_chunks, sub_chunk, d_model)
