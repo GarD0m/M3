@@ -210,6 +210,35 @@ def forward_logits(
     return logits, aux
 
 
+def _ce_chunk_loss_and_lse(
+    logits_bf16: jax.Array,
+    tc: jax.Array,
+    mc: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    lse = jax.scipy.special.logsumexp(logits_bf16.astype(jnp.float32), axis=-1)
+    z_t = (
+        jnp.take_along_axis(logits_bf16, tc[:, None], axis=-1)
+        .squeeze(-1)
+        .astype(jnp.float32)
+    )
+    return jnp.sum((lse - z_t) * mc), lse
+
+
+def _ce_chunk_dlogits(
+    logits_bf16: jax.Array,
+    lse_c: jax.Array,
+    tc: jax.Array,
+    mc: jax.Array,
+    vocab_idx: jax.Array,
+    scale_factor: jax.Array,
+    out_dtype: jnp.dtype,
+) -> jax.Array:
+    # Pure elementwise pipeline fuses exp -> where -> scale -> bf16 in VPU without FP32 [chunk, V] HBM spills
+    probs = jnp.exp(logits_bf16.astype(jnp.float32) - lse_c[:, None])
+    diff = jnp.where(vocab_idx == tc[:, None], probs - 1.0, probs)
+    return (diff * (mc * scale_factor)[:, None]).astype(out_dtype)
+
+
 def _run_scan_ce_fwd(
     h_chunks: jax.Array,
     lm_head_weight: jax.Array,
@@ -222,14 +251,8 @@ def _run_scan_ce_fwd(
     def _fwd_step(loss_acc: jax.Array, chunk_in: tuple[jax.Array, jax.Array, jax.Array]):
         hc, tc, mc = chunk_in
         logits_bf16 = hc @ lm_head_weight
-        lse = jax.scipy.special.logsumexp(logits_bf16.astype(jnp.float32), axis=-1)
-        z_t = (
-            jnp.take_along_axis(logits_bf16, tc[:, None], axis=-1)
-            .squeeze(-1)
-            .astype(jnp.float32)
-        )
-        loss_acc = loss_acc + jnp.sum((lse - z_t) * mc)
-        return loss_acc, lse
+        chunk_loss, lse = _ce_chunk_loss_and_lse(logits_bf16, tc, mc)
+        return loss_acc + chunk_loss, lse
 
     total_loss, lse_chunks = jax.lax.scan(
         _fwd_step,
@@ -277,10 +300,7 @@ def _scan_chunked_ce_bwd(
     ) -> tuple[jax.Array, jax.Array]:
         hc, tc, mc, lse_c = chunk_in
         logits_bf16 = hc @ lm_head_weight
-        # Pure elementwise pipeline fuses exp -> where -> scale -> bf16 in VPU without FP32 [chunk, V] HBM spills
-        probs = jnp.exp(logits_bf16.astype(jnp.float32) - lse_c[:, None])
-        diff = jnp.where(vocab_idx == tc[:, None], probs - 1.0, probs)
-        d_logits = (diff * (mc * scale_factor)[:, None]).astype(hc.dtype)
+        d_logits = _ce_chunk_dlogits(logits_bf16, lse_c, tc, mc, vocab_idx, scale_factor, hc.dtype)
         d_hc = (d_logits @ lm_head_weight.T).astype(hc.dtype)
         d_lm_acc = d_lm_acc + (hc.T @ d_logits).astype(d_lm_acc.dtype)
         return d_lm_acc, d_hc
@@ -297,16 +317,98 @@ def _scan_chunked_ce_bwd(
 _scan_chunked_ce.defvjp(_scan_chunked_ce_fwd, _scan_chunked_ce_bwd)
 
 
+def _run_scan_ce_fwd_vd(
+    h_chunks: jax.Array,
+    lm_weight_vd: jax.Array,
+    t_chunks: jax.Array,
+    m_chunks: jax.Array,
+    denom: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Layout-native [V, D] chunked CE forward avoiding [V, D] -> [D, V] transpose copy."""
+
+    def _fwd_step(loss_acc: jax.Array, chunk_in: tuple[jax.Array, jax.Array, jax.Array]):
+        hc, tc, mc = chunk_in
+        logits_bf16 = jax.lax.dot_general(hc, lm_weight_vd, (((1,), (1,)), ((), ())))
+        chunk_loss, lse = _ce_chunk_loss_and_lse(logits_bf16, tc, mc)
+        return loss_acc + chunk_loss, lse
+
+    total_loss, lse_chunks = jax.lax.scan(
+        _fwd_step,
+        jnp.asarray(0.0, dtype=jnp.float32),
+        (h_chunks, t_chunks, m_chunks),
+        unroll=1,
+    )
+    return total_loss / denom, lse_chunks
+
+
+@jax.custom_vjp
+def _scan_chunked_ce_vd(
+    h_chunks: jax.Array,
+    lm_weight_vd: jax.Array,
+    t_chunks: jax.Array,
+    m_chunks: jax.Array,
+    denom: jax.Array,
+) -> jax.Array:
+    out, _ = _run_scan_ce_fwd_vd(h_chunks, lm_weight_vd, t_chunks, m_chunks, denom)
+    return out
+
+
+def _scan_chunked_ce_vd_fwd(
+    h_chunks: jax.Array,
+    lm_weight_vd: jax.Array,
+    t_chunks: jax.Array,
+    m_chunks: jax.Array,
+    denom: jax.Array,
+) -> tuple[jax.Array, tuple[jax.Array, ...]]:
+    out, lse_chunks = _run_scan_ce_fwd_vd(h_chunks, lm_weight_vd, t_chunks, m_chunks, denom)
+    return out, (h_chunks, lm_weight_vd, t_chunks, m_chunks, lse_chunks, denom)
+
+
+def _scan_chunked_ce_vd_bwd(
+    res: tuple[jax.Array, ...],
+    g_out: jax.Array,
+) -> tuple[jax.Array, jax.Array, None, None, None]:
+    h_chunks, lm_weight_vd, t_chunks, m_chunks, lse_chunks, denom = res
+    vocab_size = lm_weight_vd.shape[0]
+    vocab_idx = jnp.arange(vocab_size, dtype=t_chunks.dtype)[None, :]
+    scale_factor = g_out / denom
+
+    def _bwd_step(
+        d_w_acc: jax.Array, chunk_in: tuple[jax.Array, jax.Array, jax.Array, jax.Array]
+    ) -> tuple[jax.Array, jax.Array]:
+        hc, tc, mc, lse_c = chunk_in
+        logits_bf16 = jax.lax.dot_general(hc, lm_weight_vd, (((1,), (1,)), ((), ())))
+        d_logits = _ce_chunk_dlogits(logits_bf16, lse_c, tc, mc, vocab_idx, scale_factor, hc.dtype)
+        d_hc = (d_logits @ lm_weight_vd).astype(hc.dtype)
+        d_w_acc = d_w_acc + jax.lax.dot_general(
+            d_logits, hc, (((0,), (0,)), ((), ()))
+        ).astype(d_w_acc.dtype)
+        return d_w_acc, d_hc
+
+    d_lm_w_vd, d_h_chunks = jax.lax.scan(
+        _bwd_step,
+        jnp.zeros_like(lm_weight_vd),
+        (h_chunks, t_chunks, m_chunks, lse_chunks),
+        unroll=1,
+    )
+    return d_h_chunks, d_lm_w_vd, None, None, None
+
+
+_scan_chunked_ce_vd.defvjp(_scan_chunked_ce_vd_fwd, _scan_chunked_ce_vd_bwd)
+
+
 def chunked_cross_entropy_loss(
     hidden: jax.Array,
     lm_head_weight: jax.Array,
     targets: jax.Array,
     chunk_size: int = 2048,
     loss_mask: jax.Array | None = None,
+    weight_is_vd: bool = False,
 ) -> jax.Array:
     """Memory-efficient chunked linear projection + softmax cross-entropy.
 
-    Avoids materializing full [B*S, vocab_size] FP32 logits in HBM (critical for 16K/32K on 32GB TPU v6e).
+    Supports `[D, V]` (`weight_is_vd=False`) or layout-native tied `[V, D]` (`weight_is_vd=True`)
+    without transposing the full `[65536, 2048]` embedding table.
     """
     bsz, seq_len, d_model = hidden.shape
     total_tokens = bsz * seq_len
@@ -320,8 +422,14 @@ def chunked_cross_entropy_loss(
 
     denom = jnp.maximum(jnp.sum(m_flat), 1.0)
     if chunk_size >= total_tokens:
-        logits = (h_flat @ lm_head_weight).astype(jnp.float32)
-        token_nll = optax.softmax_cross_entropy_with_integer_labels(logits, t_flat)
+        logits_bf16 = (
+            jax.lax.dot_general(h_flat, lm_head_weight, (((1,), (1,)), ((), ())))
+            if weight_is_vd
+            else (h_flat @ lm_head_weight)
+        )
+        token_nll = optax.softmax_cross_entropy_with_integer_labels(
+            logits_bf16.astype(jnp.float32), t_flat
+        )
         return jnp.sum(token_nll * m_flat) / denom
 
     effective_chunk = min(chunk_size, total_tokens)
@@ -334,7 +442,8 @@ def chunked_cross_entropy_loss(
     h_chunks = h_flat.reshape(num_chunks, effective_chunk, d_model)
     t_chunks = t_flat.reshape(num_chunks, effective_chunk)
     m_chunks = m_flat.reshape(num_chunks, effective_chunk)
-    return _scan_chunked_ce(h_chunks, lm_head_weight, t_chunks, m_chunks, denom)
+    scan_fn = _scan_chunked_ce_vd if weight_is_vd else _scan_chunked_ce
+    return scan_fn(h_chunks, lm_head_weight, t_chunks, m_chunks, denom)
 
 
 def forward_model(
@@ -346,7 +455,12 @@ def forward_model(
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     """Forward pass returning total loss (CE + tiny seq aux) and auxiliary telemetry."""
     hidden, aux = forward_hidden(params, input_ids, cfg)
-    lm_w = get_lm_head_weight(params, cfg)
+    if cfg.tie_word_embeddings:
+        lm_w = params["embed_tokens"]
+        weight_is_vd = True
+    else:
+        lm_w = params["lm_head"]
+        weight_is_vd = False
     with jax.named_scope("chunked_ce_loss"):
         ce_loss = chunked_cross_entropy_loss(
             hidden,
@@ -354,6 +468,7 @@ def forward_model(
             targets,
             chunk_size=cfg.chunk_ce_size,
             loss_mask=loss_mask,
+            weight_is_vd=weight_is_vd,
         )
     total_loss = ce_loss + aux["seq_aux_loss"]
     aux["ce_loss"] = ce_loss

@@ -22,7 +22,13 @@ from loopmoe.config import (
     count_analytic_params,
     is_prime,
 )
-from loopmoe.mhc import mhc_post_merge, rms_norm, sinkhorn_knopp
+from loopmoe.mhc import (
+    init_mhc_sublayer_params,
+    mhc_compute_gates,
+    mhc_post_merge,
+    rms_norm,
+    sinkhorn_knopp,
+)
 from loopmoe.mla import quantize_kv_fp4_e2m1
 from loopmoe.model import (
     chunked_cross_entropy_loss,
@@ -32,7 +38,7 @@ from loopmoe.model import (
     forward_model,
     init_model_params,
 )
-from loopmoe.moe import update_router_biases
+from loopmoe.moe import _moe_combine, _moe_dispatch, update_router_biases
 from loopmoe.optim import (
     OptimConfig,
     classify_param,
@@ -252,6 +258,7 @@ def test_chunked_cross_entropy_equivalence() -> None:
         return jnp.sum(nll * mask) / jnp.sum(mask)
 
     dense_loss, (dense_dh, dense_dw) = jax.value_and_grad(_dense_loss_fn, argnums=(0, 1))(hidden, lm_w)
+    lm_w_vd = lm_w.T
 
     for chunk_sz in (8, 16, 32):
         def _chunked_fn(h, w, csz=chunk_sz):
@@ -261,6 +268,16 @@ def test_chunked_cross_entropy_equivalence() -> None:
         np.testing.assert_allclose(float(chunked), float(dense_loss), atol=1e-4)
         np.testing.assert_allclose(np.asarray(ch_dh, dtype=np.float32), np.asarray(dense_dh, dtype=np.float32), atol=5e-3)
         np.testing.assert_allclose(np.asarray(ch_dw, dtype=np.float32), np.asarray(dense_dw, dtype=np.float32), atol=5e-3)
+
+        def _chunked_vd_fn(h, w_vd, csz=chunk_sz):
+            return chunked_cross_entropy_loss(
+                h, w_vd, targets, chunk_size=csz, loss_mask=mask, weight_is_vd=True
+            )
+
+        chunked_vd, (ch_vd_dh, ch_vd_dw) = jax.value_and_grad(_chunked_vd_fn, argnums=(0, 1))(hidden, lm_w_vd)
+        np.testing.assert_allclose(float(chunked_vd), float(dense_loss), atol=1e-4)
+        np.testing.assert_allclose(np.asarray(ch_vd_dh, dtype=np.float32), np.asarray(dense_dh, dtype=np.float32), atol=5e-3)
+        np.testing.assert_allclose(np.asarray(ch_vd_dw.T, dtype=np.float32), np.asarray(dense_dw, dtype=np.float32), atol=5e-3)
 
 
 def test_checkpoint_roundtrip_and_fp4_kv(tmp_path: Path) -> None:
@@ -402,3 +419,89 @@ def test_rms_norm_custom_vjp_and_mhc_merge_equivalence() -> None:
             )(xs_d, sub_d, hp_d, hr_d, lg)
             for gc, gr in zip(grads_c, grads_r, strict=True):
                 np.testing.assert_allclose(np.asarray(gc, dtype=np.float32), np.asarray(gr, dtype=np.float32), atol=tol, rtol=tol)
+
+
+def test_mhc_compute_gates_and_moe_dispatch_combine_equivalence() -> None:
+    def _ref_mhc_compute_gates(p, x_streams, sinkhorn_iters=10, eps=1e-6):
+        bsz, seq_len, n_streams, d_model = x_streams.shape
+        dt = x_streams.dtype
+        x_flat = x_streams.reshape(bsz, seq_len, n_streams * d_model)
+        x_norm = rms_norm(x_flat, p["norm_w"], eps=eps)
+        all_dyn = (x_norm @ p["phi_all"]).astype(jnp.float32)
+        pre_dyn = all_dyn[..., :n_streams]
+        post_dyn = all_dyn[..., n_streams : 2 * n_streams]
+        res_dyn = all_dyn[..., 2 * n_streams :].reshape(bsz, seq_len, n_streams, n_streams)
+        h_pre = jax.nn.sigmoid(p["alpha_pre"] * pre_dyn + p["b_pre"])
+        h_pre = (h_pre / (jnp.sum(h_pre, axis=-1, keepdims=True) + eps)).astype(dt)
+        h_post = (2.0 * jax.nn.sigmoid(p["alpha_post"] * post_dyn + p["b_post"])).astype(dt)
+        h_res = sinkhorn_knopp(p["alpha_res"] * res_dyn + p["b_res"], num_iters=sinkhorn_iters, eps=eps).astype(dt)
+        h_in = jnp.sum(h_pre[:, :, :, None] * x_streams, axis=2)
+        return h_in, h_pre, h_post, h_res
+
+    k1, k2, k3, k4 = jax.random.split(jax.random.PRNGKey(404), 4)
+    for dtype, tol in ((jnp.float32, 1e-5), (jnp.bfloat16, 2e-2)):
+        p_gates = init_mhc_sublayer_params(k1, d_model=32, n_streams=4, dtype=dtype)
+        # Non-trivial norm weights to ensure norm_w folding is exercised
+        p_gates["norm_w"] = (1.0 + 0.1 * jax.random.normal(k2, p_gates["norm_w"].shape, dtype=dtype)).astype(dtype)
+        xs = jax.random.normal(k3, (2, 6, 4, 32), dtype=dtype)
+        c_in = jax.random.normal(k4, (2, 6, 32), dtype=jnp.float32)
+        c_pre = jax.random.normal(k1, (2, 6, 4), dtype=jnp.float32)
+        c_post = jax.random.normal(k2, (2, 6, 4), dtype=jnp.float32)
+        c_res = jax.random.normal(k3, (2, 6, 4, 4), dtype=jnp.float32)
+
+        outs_fast = mhc_compute_gates(p_gates, xs, sinkhorn_iters=10, eps=1e-6)
+        outs_ref = _ref_mhc_compute_gates(p_gates, xs, sinkhorn_iters=10, eps=1e-6)
+        for a, b in zip(outs_fast, outs_ref, strict=True):
+            np.testing.assert_allclose(np.asarray(a, dtype=np.float32), np.asarray(b, dtype=np.float32), atol=tol, rtol=tol)
+
+        def _loss_gates(fn, p, x_in):
+            hi, hp, hpo, hr = fn(p, x_in, sinkhorn_iters=10, eps=1e-6)
+            return (
+                jnp.mean(hi.astype(jnp.float32) * c_in)
+                + jnp.mean(hp.astype(jnp.float32) * c_pre)
+                + jnp.mean(hpo.astype(jnp.float32) * c_post)
+                + jnp.mean(hr.astype(jnp.float32) * c_res)
+            )
+
+        g_fast = jax.grad(lambda p, x_in: _loss_gates(mhc_compute_gates, p, x_in), argnums=(0, 1))(p_gates, xs)
+        g_ref = jax.grad(lambda p, x_in: _loss_gates(_ref_mhc_compute_gates, p, x_in), argnums=(0, 1))(p_gates, xs)
+        for lf, lr in zip(jax.tree_util.tree_leaves(g_fast), jax.tree_util.tree_leaves(g_ref), strict=True):
+            np.testing.assert_allclose(np.asarray(lf, dtype=np.float32), np.asarray(lr, dtype=np.float32), atol=tol, rtol=tol)
+
+    # Verify _moe_dispatch, _moe_combine, and searchsorted expert counting equivalence
+    num_tokens, d_model, top_k, num_experts = 16, 32, 5, 12
+    # Construct router selections leaving some experts empty and hitting boundary E-1
+    logits_r = jax.random.normal(k1, (num_tokens, num_experts), dtype=jnp.float32)
+    _, topk_idx = jax.lax.top_k(logits_r, top_k)
+    topk_idx = topk_idx.at[0, 0].set(num_experts - 1)
+    flat_experts = topk_idx.reshape(-1)
+    sort_order = jnp.argsort(flat_experts)
+    sorted_experts = flat_experts[sort_order]
+    token_indices = sort_order // top_k
+    inv_order = jnp.empty_like(sort_order).at[sort_order].set(
+        jnp.arange(sort_order.shape[0], dtype=sort_order.dtype)
+    )
+    edges = jnp.arange(num_experts + 1, dtype=sorted_experts.dtype)
+    counts_ss = jnp.diff(jnp.searchsorted(sorted_experts, edges, side="left"))
+    counts_bc = jnp.bincount(flat_experts, length=num_experts)
+    np.testing.assert_array_equal(np.asarray(counts_ss), np.asarray(counts_bc))
+
+    cot_disp = jax.random.normal(k2, (num_tokens * top_k, d_model), dtype=jnp.float32)
+    cot_comb = jax.random.normal(k3, (num_tokens, d_model), dtype=jnp.float32)
+    for dtype, tol in ((jnp.float32, 1e-5), (jnp.bfloat16, 2e-2)):
+        x_flat = jax.random.normal(k4, (num_tokens, d_model), dtype=dtype)
+        down_out = jax.random.normal(k1, (num_tokens * top_k, d_model), dtype=dtype)
+
+        disp_fast = _moe_dispatch(x_flat, token_indices, inv_order, top_k)
+        disp_ref = x_flat[token_indices]
+        np.testing.assert_allclose(np.asarray(disp_fast, dtype=np.float32), np.asarray(disp_ref, dtype=np.float32), atol=tol)
+        gx_fast = jax.grad(lambda x_: jnp.mean(_moe_dispatch(x_, token_indices, inv_order, top_k).astype(jnp.float32) * cot_disp))(x_flat)
+        gx_ref = jax.grad(lambda x_: jnp.mean(x_[token_indices].astype(jnp.float32) * cot_disp))(x_flat)
+        np.testing.assert_allclose(np.asarray(gx_fast, dtype=np.float32), np.asarray(gx_ref, dtype=np.float32), atol=tol, rtol=tol)
+
+        comb_fast = _moe_combine(down_out, token_indices, inv_order, top_k)
+        comb_ref = jnp.zeros((num_tokens, d_model), dtype=dtype).at[token_indices].add(down_out)
+        np.testing.assert_allclose(np.asarray(comb_fast, dtype=np.float32), np.asarray(comb_ref, dtype=np.float32), atol=tol, rtol=tol)
+        gd_fast = jax.grad(lambda d_: jnp.mean(_moe_combine(d_, token_indices, inv_order, top_k).astype(jnp.float32) * cot_comb))(down_out)
+        gd_ref = jax.grad(lambda d_: jnp.mean(jnp.zeros((num_tokens, d_model), dtype=dtype).at[token_indices].add(d_).astype(jnp.float32) * cot_comb))(down_out)
+        np.testing.assert_allclose(np.asarray(gd_fast, dtype=np.float32), np.asarray(gd_ref, dtype=np.float32), atol=tol, rtol=tol)

@@ -1,0 +1,23 @@
+--find-links https://storage.googleapis.com/jax-releases/libtpu_releases.html
+
+# Core JAX / TPU runtime
+jax[tpu]==0.12.1; sys_platform == "linux"
+jax==0.12.1; sys_platform != "linux"
+flax==0.12.12
+optax==0.2.9
+tokamax==0.0.18
+numpy==2.5.5
+
+# Tokenizer & Hugging Face / Parquet data pipeline
+tokenizers==0.23.3
+datasets==5.2.0
+huggingface-hub==2.4.0
+pyarrow==26.0.1
+fsspec==2026.9.0
+tqdm==4.70.1
+
+# Profiling & Testing
+tensorboard==2.21.0
+tensorboard-plugin-profile==2.24.2
+xprof==2.24.2
+pytest==9.2.0

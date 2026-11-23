@@ -164,21 +164,72 @@ def collapse_streams(x_streams: jax.Array) -> jax.Array:
     return jnp.mean(x_streams, axis=2)
 
 
+@functools.partial(jax.custom_vjp, nondiff_argnums=(1,))
+def _streams_inv_rms(x_streams: jax.Array, eps: float) -> jax.Array:
+    """Compute [B, S, 1] inverse RMS across [n_streams, D] without [B, S, n_streams*D] reshape."""
+    n_streams = x_streams.shape[2]
+    sq_acc = jnp.mean(jnp.square(x_streams[:, :, 0, :].astype(jnp.float32)), axis=-1, keepdims=True)
+    for s in range(1, n_streams):
+        sq_acc = sq_acc + jnp.mean(
+            jnp.square(x_streams[:, :, s, :].astype(jnp.float32)), axis=-1, keepdims=True
+        )
+    return jax.lax.rsqrt(sq_acc * (1.0 / float(n_streams)) + eps)
+
+
+def _streams_inv_rms_fwd(
+    x_streams: jax.Array, eps: float
+) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
+    inv_rms = _streams_inv_rms(x_streams, eps)
+    return inv_rms, (x_streams, inv_rms)
+
+
+def _streams_inv_rms_bwd(
+    eps: float,
+    res: tuple[jax.Array, jax.Array],
+    d_inv_rms: jax.Array,
+) -> tuple[jax.Array]:
+    del eps
+    x_streams, inv_rms = res
+    n_streams = x_streams.shape[2]
+    d_model = x_streams.shape[3]
+    scale = (
+        (-1.0 / float(n_streams * d_model))
+        * d_inv_rms.astype(jnp.float32)
+        * (inv_rms * inv_rms * inv_rms)
+    )
+    dx_streams = jnp.stack(
+        [
+            (x_streams[:, :, s, :].astype(jnp.float32) * scale).astype(x_streams.dtype)
+            for s in range(n_streams)
+        ],
+        axis=2,
+    )
+    return (dx_streams,)
+
+
+_streams_inv_rms.defvjp(_streams_inv_rms_fwd, _streams_inv_rms_bwd)
+
+
 def mhc_compute_gates(
     params: dict[str, jax.Array],
     x_streams: jax.Array,
     sinkhorn_iters: int = 20,
     eps: float = 1e-6,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Compute pre-aggregated input and mHC mixing matrices (H_pre, H_post, H_res)."""
+    """Compute pre-aggregated input and mHC mixing matrices (H_pre, H_post, H_res) without 8192-dim layout copies."""
     with jax.named_scope("mhc_compute_gates"):
         bsz, seq_len, n_streams, d_model = x_streams.shape
         dt = x_streams.dtype
-        x_flat = x_streams.reshape(bsz, seq_len, n_streams * d_model)
-        x_norm = rms_norm(x_flat, params["norm_w"], eps=eps)
+        inv_rms = _streams_inv_rms(x_streams, eps)
+        w_eff = (params["norm_w"].astype(dt)[:, None] * params["phi_all"].astype(dt)).reshape(
+            n_streams, d_model, -1
+        )
+        streams = [x_streams[:, :, s, :] for s in range(n_streams)]
+        proj = (streams[0] @ w_eff[0]).astype(jnp.float32)
+        for s in range(1, n_streams):
+            proj = proj + (streams[s] @ w_eff[s]).astype(jnp.float32)
+        all_dyn = proj * inv_rms
 
-        # Single fused projection reads x_norm once instead of 3 times
-        all_dyn = (x_norm @ params["phi_all"]).astype(jnp.float32)
         pre_dyn = all_dyn[..., :n_streams]
         post_dyn = all_dyn[..., n_streams : 2 * n_streams]
         res_dyn = all_dyn[..., 2 * n_streams :].reshape(bsz, seq_len, n_streams, n_streams)
@@ -190,9 +241,9 @@ def mhc_compute_gates(
         h_res_logits = params["alpha_res"] * res_dyn + params["b_res"]
         h_res = sinkhorn_knopp(h_res_logits, num_iters=sinkhorn_iters, eps=eps).astype(dt)
 
-        h_in = h_pre[:, :, 0, None] * x_streams[:, :, 0, :]
+        h_in = h_pre[:, :, 0, None] * streams[0]
         for i in range(1, n_streams):
-            h_in = h_in + h_pre[:, :, i, None] * x_streams[:, :, i, :]
+            h_in = h_in + h_pre[:, :, i, None] * streams[i]
         return h_in, h_pre, h_post, h_res
 
 

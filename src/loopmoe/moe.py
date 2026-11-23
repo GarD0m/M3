@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import inspect
 
 import jax
@@ -95,6 +96,91 @@ def _grouped_matmul(
     return jnp.einsum("mk,mkn->mn", lhs, gathered_w)
 
 
+@functools.partial(jax.custom_vjp, nondiff_argnums=(3,))
+def _moe_dispatch(
+    x_flat: jax.Array,
+    token_indices: jax.Array,
+    inv_order: jax.Array,
+    top_k: int,
+) -> jax.Array:
+    """Gather token embeddings into expert-sorted order; backward uses conflict-free inv_order reduce."""
+    del inv_order, top_k
+    return x_flat[token_indices]
+
+
+def _moe_dispatch_fwd(
+    x_flat: jax.Array,
+    token_indices: jax.Array,
+    inv_order: jax.Array,
+    top_k: int,
+) -> tuple[jax.Array, tuple[jax.Array]]:
+    del top_k
+    return x_flat[token_indices], (inv_order,)
+
+
+def _moe_dispatch_bwd(
+    top_k: int,
+    res: tuple[jax.Array],
+    d_sorted_x: jax.Array,
+) -> tuple[jax.Array, None, None]:
+    (inv_order,) = res
+    num_tokens = inv_order.shape[0] // top_k
+    d_x = jnp.sum(
+        d_sorted_x[inv_order].reshape(num_tokens, top_k, d_sorted_x.shape[-1]),
+        axis=1,
+        dtype=jnp.float32,
+    ).astype(d_sorted_x.dtype)
+    return (d_x, None, None)
+
+
+_moe_dispatch.defvjp(_moe_dispatch_fwd, _moe_dispatch_bwd)
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(3,))
+def _moe_combine(
+    down_out: jax.Array,
+    token_indices: jax.Array,
+    inv_order: jax.Array,
+    top_k: int,
+) -> jax.Array:
+    """Combine expert-sorted outputs per token via conflict-free inv_order gather+sum (zero scatter-add)."""
+    del token_indices
+    num_tokens = inv_order.shape[0] // top_k
+    return jnp.sum(
+        down_out[inv_order].reshape(num_tokens, top_k, down_out.shape[-1]),
+        axis=1,
+        dtype=jnp.float32,
+    ).astype(down_out.dtype)
+
+
+def _moe_combine_fwd(
+    down_out: jax.Array,
+    token_indices: jax.Array,
+    inv_order: jax.Array,
+    top_k: int,
+) -> tuple[jax.Array, tuple[jax.Array]]:
+    num_tokens = inv_order.shape[0] // top_k
+    out = jnp.sum(
+        down_out[inv_order].reshape(num_tokens, top_k, down_out.shape[-1]),
+        axis=1,
+        dtype=jnp.float32,
+    ).astype(down_out.dtype)
+    return out, (token_indices,)
+
+
+def _moe_combine_bwd(
+    top_k: int,
+    res: tuple[jax.Array],
+    d_routed_out: jax.Array,
+) -> tuple[jax.Array, None, None]:
+    del top_k
+    (token_indices,) = res
+    return (d_routed_out[token_indices], None, None)
+
+
+_moe_combine.defvjp(_moe_combine_fwd, _moe_combine_bwd)
+
+
 def apply_moe(
     params: dict[str, jax.Array],
     x: jax.Array,
@@ -119,39 +205,40 @@ def apply_moe(
         bias_t = jax.lax.stop_gradient(params["router_bias"][loop_idx])
         biased_scores = scores + bias_t[None, :]
 
-        _, topk_idx = jax.lax.top_k(biased_scores, cfg.top_k)  # [N, K]
-        topk_scores = jnp.take_along_axis(scores, topk_idx, axis=-1)
+        topk_biased, topk_idx = jax.lax.top_k(biased_scores, cfg.top_k)  # [N, K]
+        topk_scores = topk_biased - bias_t[topk_idx]
         topk_weights = topk_scores / (jnp.sum(topk_scores, axis=-1, keepdims=True) + 1e-20)
 
-        # 2. Sequence-wise balance loss (optional tiny regularizer) & token load counts
-        expert_counts = jnp.bincount(topk_idx.reshape(-1), length=cfg.n_routed_experts).astype(
-            jnp.float32
-        )
-
-        if cfg.seq_aux_loss_weight > 0.0:
-            scores_norm = scores / (jnp.sum(scores, axis=-1, keepdims=True) + 1e-20)
-            scores_seq = scores_norm.reshape(bsz, seq_len, cfg.n_routed_experts)
-            idx_seq = topk_idx.reshape(bsz, seq_len, cfg.top_k)
-            # vmap bincount avoids materializing a huge [B, S, K, E] FP32 one_hot tensor
-            seq_counts = jax.vmap(
-                lambda idx: jnp.bincount(idx.reshape(-1), length=cfg.n_routed_experts)
-            )(idx_seq).astype(jnp.float32)
-            ce = seq_counts * (float(cfg.n_routed_experts) / float(seq_len * cfg.top_k))  # [B, E]
-            pi = jnp.mean(scores_seq, axis=1)  # [B, E]
-            seq_aux_loss = cfg.seq_aux_loss_weight * jnp.mean(jnp.sum(ce * pi, axis=-1))
-        else:
-            seq_aux_loss = jnp.asarray(0.0, dtype=jnp.float32)
-
-    # 3. Sort token-expert pairs by expert index for dropless ragged_dot
+    # 2. Sort token-expert pairs once; reuse sorted_experts for zero-scatter counts and inv_order for combine/bwd
     with jax.named_scope("moe_sort_dispatch"):
         flat_experts = topk_idx.reshape(-1)
         sort_order = jnp.argsort(flat_experts)
         sorted_experts = flat_experts[sort_order]
         token_indices = sort_order // cfg.top_k
-        sorted_weights = topk_weights.reshape(-1)[sort_order]
+        inv_order = jnp.empty_like(sort_order).at[sort_order].set(
+            jnp.arange(sort_order.shape[0], dtype=sort_order.dtype)
+        )
+        edges = jnp.arange(cfg.n_routed_experts + 1, dtype=sorted_experts.dtype)
+        expert_counts = jnp.diff(jnp.searchsorted(sorted_experts, edges, side="left")).astype(
+            jnp.float32
+        )
 
-        sorted_x = x_flat[token_indices]  # [N*K, D]
+        sorted_weights = topk_weights.reshape(-1)[sort_order]
+        sorted_x = _moe_dispatch(x_flat, token_indices, inv_order, cfg.top_k)  # [N*K, D]
         group_sizes = expert_counts.astype(jnp.int32)
+
+    if cfg.seq_aux_loss_weight > 0.0:
+        scores_norm = scores / (jnp.sum(scores, axis=-1, keepdims=True) + 1e-20)
+        scores_seq = scores_norm.reshape(bsz, seq_len, cfg.n_routed_experts)
+        idx_seq = topk_idx.reshape(bsz, seq_len, cfg.top_k)
+        seq_counts = jax.vmap(
+            lambda idx: jnp.diff(jnp.searchsorted(jnp.sort(idx.reshape(-1)), edges, side="left"))
+        )(idx_seq).astype(jnp.float32)
+        ce = seq_counts * (float(cfg.n_routed_experts) / float(seq_len * cfg.top_k))  # [B, E]
+        pi = jnp.mean(scores_seq, axis=1)  # [B, E]
+        seq_aux_loss = cfg.seq_aux_loss_weight * jnp.mean(jnp.sum(ce * pi, axis=-1))
+    else:
+        seq_aux_loss = jnp.asarray(0.0, dtype=jnp.float32)
 
     with jax.named_scope("moe_gmm_gate_up"):
         gate_up = _grouped_matmul(
@@ -167,7 +254,7 @@ def apply_moe(
         )
 
     with jax.named_scope("moe_scatter_combine"):
-        routed_out = jnp.zeros((num_tokens, d_model), dtype=dt).at[token_indices].add(down_out)
+        routed_out = _moe_combine(down_out, token_indices, inv_order, cfg.top_k)
 
     # 4. Shared expert path (native BF16)
     with jax.named_scope("moe_shared_expert"):

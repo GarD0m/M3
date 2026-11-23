@@ -135,9 +135,7 @@ def make_train_step(
             x_mb, y_mb = microbatch
             with jax.named_scope("fwd_bwd_microbatch"):
                 (loss, aux), grads = grad_fn(params, x_mb, y_mb)
-            g_acc = jax.tree_util.tree_map(
-                lambda a, g: a + g * jnp.asarray(inv_g, dtype=g.dtype), g_acc, grads
-            )
+            g_acc = jax.tree_util.tree_map(lambda a, g: a + g, g_acc, grads)
             return (
                 g_acc,
                 loss_acc + loss * inv_g,
@@ -147,9 +145,12 @@ def make_train_step(
             ), None
 
         with jax.named_scope("grad_accum_scan"):
-            (grads_mean, loss_mean, ce_mean, gate_mean, counts_mean), _ = jax.lax.scan(
+            (grads_sum, loss_mean, ce_mean, gate_mean, counts_mean), _ = jax.lax.scan(
                 accum_body, init_carry, (batch_xs, batch_ys)
             )
+        grads_mean = jax.tree_util.tree_map(
+            lambda g: g * jnp.asarray(inv_g, dtype=g.dtype), grads_sum
+        )
 
         with jax.named_scope("optimizer_muon_adamw"):
             updates, new_opt_state = optimizer.update(grads_mean, opt_state, params)
