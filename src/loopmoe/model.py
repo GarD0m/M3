@@ -211,14 +211,21 @@ def _run_scan_ce_fwd(
 
     def _fwd_step(loss_acc: jax.Array, chunk_in: tuple[jax.Array, jax.Array, jax.Array]):
         hc, tc, mc = chunk_in
-        logits = (hc @ lm_head_weight).astype(jnp.float32)
-        lse = jax.scipy.special.logsumexp(logits, axis=-1)
-        z_t = jnp.take_along_axis(logits, tc[:, None], axis=-1).squeeze(-1)
+        logits_bf16 = hc @ lm_head_weight
+        lse = jax.scipy.special.logsumexp(logits_bf16.astype(jnp.float32), axis=-1)
+        z_t = (
+            jnp.take_along_axis(logits_bf16, tc[:, None], axis=-1)
+            .squeeze(-1)
+            .astype(jnp.float32)
+        )
         loss_acc = loss_acc + jnp.sum((lse - z_t) * mc)
         return loss_acc, lse
 
     total_loss, lse_chunks = jax.lax.scan(
-        _fwd_step, jnp.asarray(0.0, dtype=jnp.float32), (h_chunks, t_chunks, m_chunks)
+        _fwd_step,
+        jnp.asarray(0.0, dtype=jnp.float32),
+        (h_chunks, t_chunks, m_chunks),
+        unroll=1,
     )
     return total_loss / denom, lse_chunks
 
@@ -251,18 +258,19 @@ def _scan_chunked_ce_bwd(
     g_out: jax.Array,
 ) -> tuple[jax.Array, jax.Array, None, None, None]:
     h_chunks, lm_head_weight, t_chunks, m_chunks, lse_chunks, denom = res
-    chunk_len = h_chunks.shape[1]
-    row_idx = jnp.arange(chunk_len)
+    vocab_size = lm_head_weight.shape[1]
+    vocab_idx = jnp.arange(vocab_size, dtype=t_chunks.dtype)[None, :]
     scale_factor = g_out / denom
 
     def _bwd_step(
         d_lm_acc: jax.Array, chunk_in: tuple[jax.Array, jax.Array, jax.Array, jax.Array]
     ) -> tuple[jax.Array, jax.Array]:
         hc, tc, mc, lse_c = chunk_in
-        logits = (hc @ lm_head_weight).astype(jnp.float32)
-        probs = jnp.exp(logits - lse_c[:, None])
-        probs = probs.at[row_idx, tc].add(-1.0)
-        d_logits = (probs * (mc * scale_factor)[:, None]).astype(hc.dtype)
+        logits_bf16 = hc @ lm_head_weight
+        # Pure elementwise pipeline fuses exp -> where -> scale -> bf16 in VPU without FP32 [chunk, V] HBM spills
+        probs = jnp.exp(logits_bf16.astype(jnp.float32) - lse_c[:, None])
+        diff = jnp.where(vocab_idx == tc[:, None], probs - 1.0, probs)
+        d_logits = (diff * (mc * scale_factor)[:, None]).astype(hc.dtype)
         d_hc = (d_logits @ lm_head_weight.T).astype(hc.dtype)
         d_lm_acc = d_lm_acc + (hc.T @ d_logits).astype(d_lm_acc.dtype)
         return d_lm_acc, d_hc
@@ -271,6 +279,7 @@ def _scan_chunked_ce_bwd(
         _bwd_step,
         jnp.zeros_like(lm_head_weight),
         (h_chunks, t_chunks, m_chunks, lse_chunks),
+        unroll=1,
     )
     return d_h_chunks, d_lm_w, None, None, None
 
