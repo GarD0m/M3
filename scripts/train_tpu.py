@@ -204,7 +204,12 @@ def parse_args() -> argparse.Namespace:
         help="Number of recent local checkpoints to retain (<=0 keeps all).",
     )
     parser.add_argument("--shard-dir", type=str, default="artifacts/shards")
-    parser.add_argument("--tokenizer", type=str, default="artifacts/tokenizer_64k/tokenizer.json")
+    parser.add_argument("--tokenizer", type=str, default=None)
+    parser.add_argument(
+        "--english-only",
+        action="store_true",
+        help="Use Ultra-FineWeb EN only (0%% ZH) and default to artifacts/tokenizer_64k_en/tokenizer.json.",
+    )
     parser.add_argument("--data-mode", choices=["shards", "stream", "synthetic"], default="stream")
 
     # Stage & optimization overrides
@@ -256,6 +261,12 @@ def main() -> None:
         base_cfg = LoopMoEConfig(**{**base_cfg.to_dict(), **cfg_overrides})
     print(summarize_model(base_cfg))
 
+    if args.tokenizer is None:
+        args.tokenizer = (
+            "artifacts/tokenizer_64k_en/tokenizer.json"
+            if args.english_only
+            else "artifacts/tokenizer_64k/tokenizer.json"
+        )
     tokenizer = _load_tokenizer(args)
     rng_key = jax.random.PRNGKey(args.seed)
     params: dict[str, Any] | None = None
@@ -308,6 +319,8 @@ def main() -> None:
 
         if args.seq_len_override is not None:
             stage = StageConfig(**{**stage.__dict__, "seq_len": args.seq_len_override})
+        if args.english_only:
+            stage = stage.with_english_only()
 
         start_step = resumed_step if stage.stage_id == resumed_stage else 0
         total_steps = args.max_steps_per_stage or stage.total_steps
@@ -355,7 +368,8 @@ def main() -> None:
 
         print(
             f"\n=== Stage {stage.stage_id}: {stage.name} | seq={stage.seq_len} loops={stage.num_loops} "
-            f"micro={micro_bs}x{stage.seq_len} accum={grad_accum} steps={start_step}..{total_steps} ==="
+            f"micro={micro_bs}x{stage.seq_len} accum={grad_accum} steps={start_step}..{total_steps} "
+            f"mix=EN:{stage.web_en_ratio:.2f}/ZH:{stage.web_zh_ratio:.2f}/Code:{stage.code_ratio:.2f}/Math:{stage.math_ratio:.2f} ==="
         )
 
         try:

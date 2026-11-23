@@ -18,7 +18,12 @@ from loopmoe.data import iter_mixed_stage_texts, pack_documents_to_shards
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Pack OpenBMB UltraData stages into uint16 HF shards.")
-    parser.add_argument("--tokenizer", type=str, default="artifacts/tokenizer_64k/tokenizer.json")
+    parser.add_argument("--tokenizer", type=str, default=None)
+    parser.add_argument(
+        "--english-only",
+        action="store_true",
+        help="Use Ultra-FineWeb EN only (0%% ZH) and default to artifacts/tokenizer_64k_en/tokenizer.json.",
+    )
     parser.add_argument("--out-dir", type=str, default="artifacts/shards")
     parser.add_argument(
         "--stages",
@@ -38,13 +43,20 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    tokenizer = Tokenizer.from_file(args.tokenizer)
+    tokenizer_path = args.tokenizer or (
+        "artifacts/tokenizer_64k_en/tokenizer.json"
+        if args.english_only
+        else "artifacts/tokenizer_64k/tokenizer.json"
+    )
+    tokenizer = Tokenizer.from_file(tokenizer_path)
     stage_map = {s.stage_id: s for s in DEFAULT_CURRICULUM}
 
     for sid in args.stages:
         if sid not in stage_map:
             raise ValueError(f"Unknown stage id: {sid}")
         stage = stage_map[sid]
+        if args.english_only:
+            stage = stage.with_english_only()
         target = args.max_tokens_override or stage.target_tokens
         print(
             f"\n=== Preparing {stage.name} (seq_len={stage.seq_len}, target={target:,} tokens) ===\n"

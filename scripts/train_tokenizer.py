@@ -64,8 +64,9 @@ def iter_tokenizer_corpus(
     hf_token: str | None = None,
     seed: int = 42,
     local_dir: str | None = None,
+    english_only: bool = False,
 ) -> Iterator[str]:
-    """Stream balanced bilingual EN/ZH + Code + Math documents up to `target_bytes`."""
+    """Stream balanced web + Code + Math documents up to `target_bytes`."""
     if local_dir:
         paths = sorted(Path(local_dir).rglob("*"))
         total_bytes = 0
@@ -78,13 +79,21 @@ def iter_tokenizer_corpus(
                     return
         return
 
-    # Balanced L3 tokenizer training mix: 34% EN, 28% ZH, 20% Code, 18% Math
-    sources = [
-        (SOURCE_REGISTRY[("web_en", "L3")], 0.34),
-        (SOURCE_REGISTRY[("web_zh", "L3")], 0.28),
-        (SOURCE_REGISTRY[("code", "L3")], 0.20),
-        (SOURCE_REGISTRY[("math", "L3")], 0.18),
-    ]
+    if english_only:
+        # English-only L3 tokenizer mix: 62% EN, 20% Code, 18% Math
+        sources = [
+            (SOURCE_REGISTRY[("web_en", "L3")], 0.62),
+            (SOURCE_REGISTRY[("code", "L3")], 0.20),
+            (SOURCE_REGISTRY[("math", "L3")], 0.18),
+        ]
+    else:
+        # Balanced L3 tokenizer training mix: 34% EN, 28% ZH, 20% Code, 18% Math
+        sources = [
+            (SOURCE_REGISTRY[("web_en", "L3")], 0.34),
+            (SOURCE_REGISTRY[("web_zh", "L3")], 0.28),
+            (SOURCE_REGISTRY[("code", "L3")], 0.20),
+            (SOURCE_REGISTRY[("math", "L3")], 0.18),
+        ]
     streams = [
         iter_source_texts(src, hf_token=hf_token, seed=seed + i * 37, min_chars=64)
         for i, (src, _) in enumerate(sources)
@@ -182,7 +191,12 @@ def parse_args() -> argparse.Namespace:
         default=2.0,
         help="Total UTF-8 corpus size in GB streamed from OpenBMB UltraData (default: 2.0 GB).",
     )
-    parser.add_argument("--output-dir", type=str, default="artifacts/tokenizer_64k")
+    parser.add_argument("--output-dir", type=str, default=None)
+    parser.add_argument(
+        "--english-only",
+        action="store_true",
+        help="Drop Ultra-FineWeb ZH and train an English-only (EN + Code + Math) L3 tokenizer.",
+    )
     parser.add_argument("--local-corpus", type=str, default=None, help="Optional local folder of txt/md/py files.")
     parser.add_argument("--hf-repo-id", type=str, default=None, help="Optional HF Hub repo to upload tokenizer.")
     parser.add_argument("--hf-token", type=str, default=os.environ.get("HF_TOKEN"))
@@ -192,7 +206,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    out_dir = Path(args.output_dir)
+    out_dir = (
+        Path(args.output_dir)
+        if args.output_dir
+        else Path("artifacts/tokenizer_64k_en" if args.english_only else "artifacts/tokenizer_64k")
+    )
     target_bytes = int(args.target_gb * (1024**3))
 
     tokenizer, trainer = build_bpe_tokenizer(vocab_size=args.vocab_size)
@@ -201,11 +219,13 @@ def main() -> None:
         hf_token=args.hf_token,
         seed=args.seed,
         local_dir=args.local_corpus,
+        english_only=args.english_only,
     )
 
+    mode_label = "english-only" if args.english_only else "bilingual"
     print(
-        f"Training Byte-level BPE tokenizer (V={args.vocab_size}, special={len(SPECIAL_TOKENS)}) "
-        f"on target={args.target_gb:.2f} GB..."
+        f"Training {mode_label} Byte-level BPE tokenizer (V={args.vocab_size}, special={len(SPECIAL_TOKENS)}) "
+        f"on target={args.target_gb:.2f} GB -> {out_dir}..."
     )
     tokenizer.train_from_iterator(corpus_iter, trainer=trainer)
 

@@ -299,6 +299,16 @@ class StageConfig:
     def total_steps(self) -> int:
         return math.ceil(self.target_tokens / self.global_batch_tokens)
 
+    def with_english_only(self) -> StageConfig:
+        """Merge Ultra-FineWeb ZH ratio into EN (0% ZH), keeping Code and Math unchanged."""
+        return StageConfig(
+            **{
+                **asdict(self),
+                "web_en_ratio": round(self.web_en_ratio + self.web_zh_ratio, 6),
+                "web_zh_ratio": 0.0,
+            }
+        )
+
 
 # Test branch: uniform 4K seq_len, 40% EN / 40% ZH / 10% Code / 10% Math (L3 tiers)
 DEFAULT_CURRICULUM: tuple[StageConfig, ...] = (
