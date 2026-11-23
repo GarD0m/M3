@@ -478,6 +478,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--remat-sublayers", action="store_true", default=None)
     parser.add_argument("--no-remat-sublayers", action="store_false", dest="remat_sublayers")
     parser.add_argument(
+        "--remat-moe",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Checkpoint only the MoE sublayer (saves ~3 GB HBM at microbatch>=8 without recomputing MLA/mHC).",
+    )
+    parser.add_argument(
         "--autotune",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -516,18 +522,24 @@ def main() -> None:
 
     base_cfg = LoopMoEConfig.tiny() if args.tiny else LoopMoEConfig()
     remat_sub = False if args.remat_sublayers is None else args.remat_sublayers
+    remat_moe = (
+        (args.tpu_preset == "v5e-1" and micro_bs >= 8 and not args.tiny)
+        if args.remat_moe is None
+        else args.remat_moe
+    )
     base_cfg = LoopMoEConfig(
         **{
             **base_cfg.to_dict(),
             "chunk_ce_size": chunk_ce,
             "remat_sublayers": remat_sub,
+            "remat_moe": remat_moe,
             "use_csa2_indexer": bool(args.use_csa2_long),
         }
     )
     print(summarize_model(base_cfg))
     print(
         f"Execution config: microbatch={micro_bs} (seq={seq_lens[0]} -> {micro_bs * seq_lens[0]} tok), "
-        f"grad_accum={grad_accum}, chunk_ce={chunk_ce}, remat_sublayers={remat_sub}, autotune={args.autotune}"
+        f"grad_accum={grad_accum}, chunk_ce={chunk_ce}, remat_sublayers={remat_sub}, remat_moe={remat_moe}, autotune={args.autotune}"
     )
 
     points: list[tuple[int, int]] = [(s, r) for r in args.loops for s in seq_lens]

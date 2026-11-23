@@ -270,6 +270,12 @@ def parse_args() -> argparse.Namespace:
         help="Hardware preset adjusting peak TFLOPS, chunk CE size, sublayer remat, and default microbatch.",
     )
     parser.add_argument("--remat-sublayers", action="store_true", help="Enable sublayer remat inside loop.")
+    parser.add_argument(
+        "--remat-moe",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Checkpoint only the MoE sublayer (saves ~3 GB HBM at microbatch>=8 without recomputing MLA/mHC).",
+    )
     parser.add_argument("--chunk-ce-size", type=int, default=None, help="Chunk size for chunked cross-entropy.")
     parser.add_argument(
         "--autotune",
@@ -302,6 +308,14 @@ def main() -> None:
         cfg_overrides["chunk_ce_size"] = int(spec["default_chunk_ce_size"])
     if args.remat_sublayers:
         cfg_overrides["remat_sublayers"] = True
+    eff_mb = args.microbatch or (2 if args.tiny else int(spec["default_microbatch"]))
+    remat_moe = (
+        (args.tpu_preset == "v5e-1" and eff_mb >= 8 and not args.tiny)
+        if args.remat_moe is None
+        else args.remat_moe
+    )
+    if remat_moe:
+        cfg_overrides["remat_moe"] = True
     if args.chunk_ce_size is not None:
         cfg_overrides["chunk_ce_size"] = args.chunk_ce_size
     if cfg_overrides:

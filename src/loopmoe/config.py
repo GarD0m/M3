@@ -78,7 +78,7 @@ class LoopMoEConfig:
     tie_word_embeddings: bool = True
     dtype_name: str = "bfloat16"
     rms_norm_eps: float = 1e-6
-    chunk_ce_size: int = 8192
+    chunk_ce_size: int = 4096
 
     # RoPE / YaRN long-context scaling
     rope_theta: float = 10_000.0
@@ -135,6 +135,7 @@ class LoopMoEConfig:
     # TPU execution
     remat_per_loop: bool = True
     remat_sublayers: bool = False
+    remat_moe: bool = False
 
     @property
     def num_engram_tables(self) -> int:
@@ -221,6 +222,7 @@ class LoopMoEConfig:
             iter_adaln_bottleneck=16,
             remat_per_loop=False,
             remat_sublayers=False,
+            remat_moe=False,
         )
 
     @classmethod
@@ -228,10 +230,11 @@ class LoopMoEConfig:
         """Full 1B preset tuned for TPU v5e-1 (16 GB HBM, 197 TFLOPS, 128x128 MXU)."""
         return cls(
             num_loops=num_loops,
-            chunk_ce_size=8192,
+            chunk_ce_size=4096,
             use_csa2_indexer=use_csa2_indexer,
             remat_per_loop=True,
             remat_sublayers=False,
+            remat_moe=True,
         )
 
 
@@ -244,7 +247,7 @@ TPU_SPECS: dict[str, dict[str, float]] = {
         "ridge_flops_per_byte": (197.0 * 1e12) / (819.0 * 1e9),
         "default_microbatch": 8.0,
         "default_grad_accum": 8.0,
-        "default_chunk_ce_size": 8192.0,
+        "default_chunk_ce_size": 4096.0,
     },
     "v6e-1": {
         "peak_tflops_bf16": 918.0,

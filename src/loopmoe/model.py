@@ -138,7 +138,11 @@ def _single_loop_step(
                     next_xs = xs + am * moe_out[:, :, None, :]
                 return next_xs, ec, aux_l
 
-        moe_fn = jax.checkpoint(_moe_sublayer) if cfg.remat_sublayers else _moe_sublayer
+        moe_fn = (
+            jax.checkpoint(_moe_sublayer)
+            if (cfg.remat_sublayers or cfg.remat_moe)
+            else _moe_sublayer
+        )
         x_streams, expert_counts, seq_aux_loss = moe_fn(
             params, x_streams, shift_m, scale_m, gate_m, alpha_moe, loop_idx
         )
