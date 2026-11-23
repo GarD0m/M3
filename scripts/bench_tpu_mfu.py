@@ -197,7 +197,8 @@ def run_module_breakdown(
 
     def _moe_shared_only(p, h):
         xf = h.reshape(-1, cfg.d_model)
-        return (jax.nn.silu(xf @ p["shared_w_gate"]) * (xf @ p["shared_w_up"])) @ p["shared_w_down"]
+        g, u = jnp.split(xf @ p["shared_w_gate_up"], 2, axis=-1)
+        return (jax.nn.silu(g) * u) @ p["shared_w_down"]
 
     timings_ms["moe_sort_dispatch_only"] = round(_bench_op(_moe_sort_only, (params["moe"], h_2d), warmup, iters), 3)
     timings_ms["moe_shared_only"] = round(_bench_op(_moe_shared_only, (params["moe"], h_2d), warmup, iters), 3)

@@ -119,11 +119,11 @@ class LoopMoEConfig:
     csa2_topk: int = 2048
 
     # DeepSeek fine-grained MoE + LoopMoE Capacity Balancing
-    n_routed_experts: int = 416
-    d_ff_expert: int = 256
+    n_routed_experts: int = 256
+    d_ff_expert: int = 512
     n_shared_experts: int = 1
     d_ff_shared: int = 512
-    top_k: int = 12
+    top_k: int = 7
     routed_scaling_factor: float = 2.5
     router_bias_update_rate: float = 1e-3
     seq_aux_loss_weight: float = 1e-4

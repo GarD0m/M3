@@ -69,14 +69,14 @@ def classify_param(path_str: str, arr: Any) -> str:
     leaf = path_str.split("/")[-1]
 
     # 3D MoE expert tensors (E, in, out) -> per-expert vmap Muon
-    if path_str.startswith("moe/") and leaf in ("w_gate", "w_up", "w_down") and arr.ndim == 3:
+    if path_str.startswith("moe/") and leaf in ("w_gate_up", "w_gate", "w_up", "w_down") and arr.ndim == 3:
         return "muon"
 
     # 2D hidden linear matrices -> standard 2D Muon
     if arr.ndim == 2:
         if path_str.startswith("mla/"):
             return "muon"
-        if path_str.startswith("moe/") and leaf in ("shared_w_gate", "shared_w_up", "shared_w_down"):
+        if path_str.startswith("moe/") and leaf in ("shared_w_gate_up", "shared_w_gate", "shared_w_up", "shared_w_down"):
             return "muon"
         if path_str.startswith("engram/") and leaf in ("w_k", "w_v"):
             return "muon"

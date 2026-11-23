@@ -46,8 +46,8 @@ from train_tokenizer import benchmark_tokenizer, build_bpe_tokenizer, save_hf_to
 def test_full_1b_analytic_params_and_tiny_exact_match() -> None:
     cfg = LoopMoEConfig()
     stats = count_analytic_params(cfg)
-    assert 0.95e9 <= stats["total"] <= 1.05e9, f"Expected ~1B params, got {stats['total']}"
-    assert 0.20 <= stats["engram_sparse_ratio"] <= 0.25, stats["engram_sparse_ratio"]
+    assert 1.10e9 <= stats["total"] <= 1.20e9, f"Expected ~1.15B params, got {stats['total']}"
+    assert 0.18 <= stats["engram_sparse_ratio"] <= 0.25, stats["engram_sparse_ratio"]
     assert all(is_prime(p) for p in cfg.engram_table_sizes)
     assert len(set(cfg.engram_table_sizes)) == len(cfg.engram_table_sizes)
 
@@ -117,7 +117,7 @@ def test_forward_and_backward_r1_r8_and_csa2() -> None:
             assert jnp.all(jnp.isfinite(leaf))
         assert float(jnp.max(jnp.abs(grads["moe"]["router_bias"]))) == 0.0
         assert float(jnp.linalg.norm(grads["mla"]["w_dq"])) > 0.0
-        assert float(jnp.linalg.norm(grads["moe"]["w_gate"])) > 0.0
+        assert float(jnp.linalg.norm(grads["moe"]["w_gate_up"])) > 0.0
         assert float(jnp.linalg.norm(grads["engram"]["tables"])) > 0.0
 
 
@@ -207,7 +207,7 @@ def test_muon_adamw_optimizer_per_expert_and_no_decay() -> None:
     optimizer = create_muon_adamw_optimizer(opt_cfg)
     opt_state = optimizer.init(params)
 
-    assert classify_param("moe/w_gate", params["moe"]["w_gate"]) == "muon"
+    assert classify_param("moe/w_gate_up", params["moe"]["w_gate_up"]) == "muon"
     assert classify_param("mla/w_dq", params["mla"]["w_dq"]) == "muon"
     assert classify_param("embed_tokens", params["embed_tokens"]) == "adam_decay"
     assert classify_param("iter_adaln/loop_alpha", params["iter_adaln"]["loop_alpha"]) == "adam_no_decay"
@@ -226,7 +226,7 @@ def test_muon_adamw_optimizer_per_expert_and_no_decay() -> None:
     updates, new_params, new_opt_state, aux = one_step(params, opt_state)
 
     assert float(jnp.max(jnp.abs(updates["moe"]["router_bias"]))) == 0.0
-    assert float(jnp.linalg.norm(updates["moe"]["w_gate"])) > 0.0
+    assert float(jnp.linalg.norm(updates["moe"]["w_gate_up"])) > 0.0
     assert float(jnp.linalg.norm(updates["mla"]["w_dq"])) > 0.0
     assert float(jnp.linalg.norm(updates["embed_tokens"])) > 0.0
     assert new_opt_state is not None

@@ -16,7 +16,7 @@ def init_moe_params(
     dtype: jnp.dtype = jnp.bfloat16,
 ) -> dict[str, jax.Array]:
     """Initialize routed experts (3D tensors for per-expert Muon), shared expert, and router."""
-    keys = jax.random.split(key, 8)
+    keys = jax.random.split(key, 5)
     d = cfg.d_model
     e = cfg.n_routed_experts
     df = cfg.d_ff_expert
@@ -25,12 +25,13 @@ def init_moe_params(
     return {
         "router_w": jax.random.normal(keys[0], (d, e), dtype=dtype) * (1.0 / jnp.sqrt(float(d))),
         "router_bias": jnp.zeros((cfg.max_loops, e), dtype=jnp.float32),
-        "w_gate": jax.random.normal(keys[1], (e, d, df), dtype=dtype) * (1.0 / jnp.sqrt(float(d))),
-        "w_up": jax.random.normal(keys[2], (e, d, df), dtype=dtype) * (1.0 / jnp.sqrt(float(d))),
-        "w_down": jax.random.normal(keys[3], (e, df, d), dtype=dtype) * (1.0 / jnp.sqrt(float(df))),
-        "shared_w_gate": jax.random.normal(keys[4], (d, ds), dtype=dtype) * (1.0 / jnp.sqrt(float(d))),
-        "shared_w_up": jax.random.normal(keys[5], (d, ds), dtype=dtype) * (1.0 / jnp.sqrt(float(d))),
-        "shared_w_down": jax.random.normal(keys[6], (ds, d), dtype=dtype) * (1.0 / jnp.sqrt(float(ds))),
+        "w_gate_up": jax.random.normal(keys[1], (e, d, 2 * df), dtype=dtype)
+        * (1.0 / jnp.sqrt(float(d))),
+        "w_down": jax.random.normal(keys[2], (e, df, d), dtype=dtype) * (1.0 / jnp.sqrt(float(df))),
+        "shared_w_gate_up": jax.random.normal(keys[3], (d, 2 * ds), dtype=dtype)
+        * (1.0 / jnp.sqrt(float(d))),
+        "shared_w_down": jax.random.normal(keys[4], (ds, d), dtype=dtype)
+        * (1.0 / jnp.sqrt(float(ds))),
     }
 
 
@@ -132,14 +133,11 @@ def apply_moe(
         sorted_x = x_flat[token_indices]  # [N*K, D]
         group_sizes = expert_counts.astype(jnp.int32)
 
-    with jax.named_scope("moe_gmm_gate"):
-        gate_act = _grouped_matmul(
-            sorted_x, params["w_gate"], group_sizes, sorted_experts, use_tokamax=cfg.moe_use_tokamax
+    with jax.named_scope("moe_gmm_gate_up"):
+        gate_up = _grouped_matmul(
+            sorted_x, params["w_gate_up"], group_sizes, sorted_experts, use_tokamax=cfg.moe_use_tokamax
         )
-    with jax.named_scope("moe_gmm_up"):
-        up_act = _grouped_matmul(
-            sorted_x, params["w_up"], group_sizes, sorted_experts, use_tokamax=cfg.moe_use_tokamax
-        )
+        gate_act, up_act = jnp.split(gate_up, 2, axis=-1)
     hidden = jax.nn.silu(gate_act) * up_act
     with jax.named_scope("moe_gmm_down"):
         down_out = _grouped_matmul(
@@ -154,9 +152,9 @@ def apply_moe(
 
     # 4. Shared expert path (native BF16)
     with jax.named_scope("moe_shared_expert"):
-        shared_gate = jax.nn.silu(x_flat @ params["shared_w_gate"])
-        shared_up = x_flat @ params["shared_w_up"]
-        shared_out = (shared_gate * shared_up) @ params["shared_w_down"]
+        shared_gate_up = x_flat @ params["shared_w_gate_up"]
+        shared_gate, shared_up = jnp.split(shared_gate_up, 2, axis=-1)
+        shared_out = (jax.nn.silu(shared_gate) * shared_up) @ params["shared_w_down"]
 
     total_out = (routed_out + shared_out).reshape(bsz, seq_len, d_model)
     return total_out, expert_counts, seq_aux_loss
