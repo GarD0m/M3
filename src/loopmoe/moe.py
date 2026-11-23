@@ -132,10 +132,11 @@ def apply_moe(
             scores_norm = scores / (jnp.sum(scores, axis=-1, keepdims=True) + 1e-20)
             scores_seq = scores_norm.reshape(bsz, seq_len, cfg.n_routed_experts)
             idx_seq = topk_idx.reshape(bsz, seq_len, cfg.top_k)
-            one_hot = jax.nn.one_hot(idx_seq, cfg.n_routed_experts, dtype=jnp.float32)
-            ce = jnp.mean(jnp.sum(one_hot, axis=2), axis=1) * (
-                float(cfg.n_routed_experts) / float(cfg.top_k)
-            )  # [B, E]
+            # vmap bincount avoids materializing a huge [B, S, K, E] FP32 one_hot tensor
+            seq_counts = jax.vmap(
+                lambda idx: jnp.bincount(idx.reshape(-1), length=cfg.n_routed_experts)
+            )(idx_seq).astype(jnp.float32)
+            ce = seq_counts * (float(cfg.n_routed_experts) / float(seq_len * cfg.top_k))  # [B, E]
             pi = jnp.mean(scores_seq, axis=1)  # [B, E]
             seq_aux_loss = cfg.seq_aux_loss_weight * jnp.mean(jnp.sum(ce * pi, axis=-1))
         else:

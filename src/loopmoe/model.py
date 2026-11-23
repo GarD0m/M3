@@ -7,6 +7,7 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+import optax
 
 from .config import LoopMoEConfig, count_analytic_params
 from .engram import apply_engram_step, init_engram_params, prefetch_engram_embeddings
@@ -223,8 +224,7 @@ def chunked_cross_entropy_loss(
     denom = jnp.maximum(jnp.sum(m_flat), 1.0)
     if chunk_size >= total_tokens:
         logits = (h_flat @ lm_head_weight).astype(jnp.float32)
-        log_probs = jax.nn.log_softmax(logits, axis=-1)
-        token_nll = -jnp.take_along_axis(log_probs, t_flat[:, None], axis=-1).squeeze(-1)
+        token_nll = optax.softmax_cross_entropy_with_integer_labels(logits, t_flat)
         return jnp.sum(token_nll * m_flat) / denom
 
     effective_chunk = min(chunk_size, total_tokens)
@@ -241,8 +241,7 @@ def chunked_cross_entropy_loss(
     def _chunk_loss(chunk_in: tuple[jax.Array, jax.Array, jax.Array]) -> jax.Array:
         hc, tc, mc = chunk_in
         logits = (hc @ lm_head_weight).astype(jnp.float32)
-        log_probs = jax.nn.log_softmax(logits, axis=-1)
-        token_nll = -jnp.take_along_axis(log_probs, tc[:, None], axis=-1).squeeze(-1)
+        token_nll = optax.softmax_cross_entropy_with_integer_labels(logits, tc)
         return jnp.sum(token_nll * mc)
 
     remat_chunk_loss = jax.checkpoint(_chunk_loss)
