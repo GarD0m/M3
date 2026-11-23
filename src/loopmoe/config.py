@@ -78,7 +78,7 @@ class LoopMoEConfig:
     tie_word_embeddings: bool = True
     dtype_name: str = "bfloat16"
     rms_norm_eps: float = 1e-6
-    chunk_ce_size: int = 2048
+    chunk_ce_size: int = 4096
 
     # RoPE / YaRN long-context scaling
     rope_theta: float = 10_000.0
@@ -228,10 +228,10 @@ class LoopMoEConfig:
         """Full 1B preset tuned for TPU v5e-1 (16 GB HBM, 197 TFLOPS, 128x128 MXU)."""
         return cls(
             num_loops=num_loops,
-            chunk_ce_size=1024,
+            chunk_ce_size=4096,
             use_csa2_indexer=use_csa2_indexer,
             remat_per_loop=True,
-            remat_sublayers=True,
+            remat_sublayers=False,
         )
 
 
@@ -242,8 +242,9 @@ TPU_SPECS: dict[str, dict[str, float]] = {
         "hbm_capacity_gb": 16.0,
         "mxu_size": 128.0,
         "ridge_flops_per_byte": (197.0 * 1e12) / (819.0 * 1e9),
-        "default_microbatch_tokens": 8192.0,
-        "default_chunk_ce_size": 1024.0,
+        "default_microbatch": 4.0,
+        "default_grad_accum": 16.0,
+        "default_chunk_ce_size": 4096.0,
     },
     "v6e-1": {
         "peak_tflops_bf16": 918.0,
@@ -251,8 +252,9 @@ TPU_SPECS: dict[str, dict[str, float]] = {
         "hbm_capacity_gb": 32.0,
         "mxu_size": 256.0,
         "ridge_flops_per_byte": (918.0 * 1e12) / (1600.0 * 1e9),
-        "default_microbatch_tokens": 32768.0,
-        "default_chunk_ce_size": 2048.0,
+        "default_microbatch": 8.0,
+        "default_grad_accum": 8.0,
+        "default_chunk_ce_size": 4096.0,
     },
 }
 
@@ -267,7 +269,7 @@ class StageConfig:
     target_tokens: int
     num_loops: int
     global_batch_tokens: int = 262_144
-    microbatch_tokens: int = 32_768
+    microbatch: int = 4
     warmup_steps: int = 100
     web_en_ratio: float = 0.40
     web_zh_ratio: float = 0.40
@@ -280,12 +282,12 @@ class StageConfig:
     checkpoint_every_steps: int = 500
 
     @property
+    def microbatch_tokens(self) -> int:
+        return self.microbatch * self.seq_len
+
+    @property
     def micro_batch_size(self) -> int:
-        if self.microbatch_tokens % self.seq_len != 0:
-            raise ValueError(
-                f"microbatch_tokens ({self.microbatch_tokens}) must be divisible by seq_len ({self.seq_len})"
-            )
-        return self.microbatch_tokens // self.seq_len
+        return self.microbatch
 
     @property
     def grad_accum_steps(self) -> int:

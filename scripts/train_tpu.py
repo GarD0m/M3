@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import Future
+import contextlib
+import gc
 import os
 from pathlib import Path
 import sys
@@ -56,6 +58,45 @@ class SyntheticBatchPrefetcher:
 
     def close(self) -> None:
         return None
+
+
+def maybe_tokamax_autotune(
+    cfg: LoopMoEConfig,
+    params: dict[str, Any],
+    x_mb: jax.Array,
+    y_mb: jax.Array,
+    enabled: bool = True,
+) -> Any:
+    """Run Tokamax kernel autotuning on TPU to resolve cache misses and select optimal Pallas tiles."""
+    if not enabled or jax.default_backend() != "tpu":
+        return contextlib.nullcontext()
+    try:
+        import tokamax  # type: ignore
+
+        autotune_fn = getattr(tokamax, "autotune", None)
+        if autotune_fn is None:
+            return contextlib.nullcontext()
+
+        fwd_bwd = jax.jit(
+            jax.value_and_grad(lambda p, x, y: forward_model(p, x, y, cfg), has_aux=True)
+        )
+        t0 = time.perf_counter()
+        res = autotune_fn(fwd_bwd, params, x_mb, y_mb)
+        dt = time.perf_counter() - t0
+        del fwd_bwd
+        gc.collect()
+        n_tuned = (
+            len(res)
+            if hasattr(res, "__len__")
+            else len(getattr(res, "data", {}))
+            if hasattr(res, "data")
+            else "?"
+        )
+        print(f"[Tokamax Autotune] Tuned {n_tuned} kernel configs in {dt:.1f}s")
+        return res
+    except Exception as exc:
+        print(f"[Tokamax Autotune] Skipped ({type(exc).__name__}: {exc}); using default heuristics.")
+        return contextlib.nullcontext()
 
 
 def make_train_step(
@@ -216,7 +257,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-stage", type=int, default=1)
     parser.add_argument("--end-stage", type=int, default=7)
     parser.add_argument("--max-steps-per-stage", type=int, default=None, help="Optional cap for smoke testing.")
-    parser.add_argument("--microbatch-tokens", type=int, default=None, help="Override microbatch tokens.")
+    parser.add_argument("--microbatch", type=int, default=None, help="Microbatch size in sequences (default: 4 on v5e-1, 8 on v6e-1).")
+    parser.add_argument("--grad-accum", type=int, default=None, help="Override gradient accumulation steps (default: 16 on v5e-1, 8 on v6e-1).")
     parser.add_argument("--global-batch-tokens", type=int, default=None, help="Override global batch tokens.")
     parser.add_argument("--seq-len-override", type=int, default=None, help="Optional seq_len override for debugging.")
     parser.add_argument("--muon-lr", type=float, default=0.015)
@@ -229,6 +271,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--remat-sublayers", action="store_true", help="Enable sublayer remat inside loop.")
     parser.add_argument("--chunk-ce-size", type=int, default=None, help="Chunk size for chunked cross-entropy.")
+    parser.add_argument(
+        "--autotune",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run Tokamax autotuning on TPU to resolve cache misses and optimize Pallas tiles.",
+    )
     parser.add_argument("--profile-dir", type=str, default=None, help="Optional JAX profiler trace output directory.")
     parser.add_argument("--profile-start-step", type=int, default=2, help="Step index to start profiling trace.")
     parser.add_argument("--profile-steps", type=int, default=3, help="Number of steps to trace in profiler.")
@@ -251,7 +299,6 @@ def main() -> None:
     if args.use_csa2_long:
         cfg_overrides["use_csa2_indexer"] = True
     if args.tpu_preset == "v5e-1" and not args.tiny:
-        cfg_overrides["remat_sublayers"] = True
         cfg_overrides["chunk_ce_size"] = int(spec["default_chunk_ce_size"])
     if args.remat_sublayers:
         cfg_overrides["remat_sublayers"] = True
@@ -328,12 +375,15 @@ def main() -> None:
             continue
 
         global_tok = args.global_batch_tokens or stage.global_batch_tokens
-        default_micro = int(spec["default_microbatch_tokens"]) if (args.tpu_preset == "v5e-1" and not args.tiny) else stage.microbatch_tokens
-        micro_tok = args.microbatch_tokens or default_micro
-        if micro_tok % stage.seq_len != 0:
-            micro_tok = stage.seq_len
-        grad_accum = max(1, global_tok // micro_tok)
-        micro_bs = micro_tok // stage.seq_len
+        default_micro = 2 if args.tiny else int(spec["default_microbatch"])
+        micro_bs = args.microbatch or default_micro
+        micro_tok = micro_bs * stage.seq_len
+        if args.grad_accum is not None:
+            grad_accum = args.grad_accum
+        elif args.global_batch_tokens is not None or args.microbatch is not None:
+            grad_accum = max(1, global_tok // micro_tok)
+        else:
+            grad_accum = 1 if args.tiny else int(spec["default_grad_accum"])
 
         stage_model_cfg = base_cfg.with_stage(
             seq_len=stage.seq_len,
@@ -366,6 +416,13 @@ def main() -> None:
         step_flops = estimate_step_flops(stage_model_cfg, micro_bs, stage.seq_len) * grad_accum
         loader = _build_loader(stage, args, stage_model_cfg, tokenizer, micro_tok)
 
+        dummy_x = jnp.zeros((micro_bs, stage.seq_len), dtype=jnp.int32)
+        dummy_y = jnp.zeros((micro_bs, stage.seq_len), dtype=jnp.int32)
+        autotune_ctx = maybe_tokamax_autotune(
+            stage_model_cfg, params, dummy_x, dummy_y, enabled=args.autotune
+        )
+        del dummy_x, dummy_y
+
         print(
             f"\n=== Stage {stage.stage_id}: {stage.name} | seq={stage.seq_len} loops={stage.num_loops} "
             f"micro={micro_bs}x{stage.seq_len} accum={grad_accum} steps={start_step}..{total_steps} "
@@ -373,72 +430,73 @@ def main() -> None:
         )
 
         try:
-            t_log = time.perf_counter()
-            profiling_active = False
-            prof_end_step = args.profile_start_step + args.profile_steps
-            for step in range(start_step, total_steps):
-                if args.profile_dir and not profiling_active and step == args.profile_start_step:
-                    Path(args.profile_dir).mkdir(parents=True, exist_ok=True)
-                    jax.profiler.start_trace(args.profile_dir)
-                    profiling_active = True
+            with autotune_ctx:
+                t_log = time.perf_counter()
+                profiling_active = False
+                prof_end_step = args.profile_start_step + args.profile_steps
+                for step in range(start_step, total_steps):
+                    if args.profile_dir and not profiling_active and step == args.profile_start_step:
+                        Path(args.profile_dir).mkdir(parents=True, exist_ok=True)
+                        jax.profiler.start_trace(args.profile_dir)
+                        profiling_active = True
 
-                xs_list = []
-                ys_list = []
-                for _ in range(grad_accum):
-                    x_np, y_np = loader.next_batch()
-                    xs_list.append(x_np)
-                    ys_list.append(y_np)
+                    xs_list = []
+                    ys_list = []
+                    for _ in range(grad_accum):
+                        x_np, y_np = loader.next_batch()
+                        xs_list.append(x_np)
+                        ys_list.append(y_np)
 
-                batch_xs = jnp.asarray(np.stack(xs_list, axis=0))
-                batch_ys = jnp.asarray(np.stack(ys_list, axis=0))
+                    batch_xs = jnp.asarray(np.stack(xs_list, axis=0))
+                    batch_ys = jnp.asarray(np.stack(ys_list, axis=0))
 
-                with jax.profiler.StepTraceAnnotation("train_step", step_num=step):
-                    params, opt_state, metrics = train_step(params, opt_state, batch_xs, batch_ys)
-                    if profiling_active:
+                    with jax.profiler.StepTraceAnnotation("train_step", step_num=step):
+                        params, opt_state, metrics = train_step(params, opt_state, batch_xs, batch_ys)
+                        if profiling_active:
+                            jax.block_until_ready(metrics["loss"])
+
+                    if profiling_active and (step + 1) >= prof_end_step:
+                        jax.profiler.stop_trace()
+                        profiling_active = False
+                        print(f"[Profiler] Saved trace to {args.profile_dir}")
+
+                    # Synchronize on log/ckpt boundaries for accurate MFU timing
+                    tokens_seen += grad_accum * micro_tok
+
+                    if (step + 1) % args.log_every == 0 or step == start_step:
                         jax.block_until_ready(metrics["loss"])
+                        dt = max(time.perf_counter() - t_log, 1e-6)
+                        steps_elapsed = 1 if step == start_step else args.log_every
+                        sec_per_step = dt / steps_elapsed
+                        tok_per_sec = (grad_accum * micro_tok) / sec_per_step
+                        mfu = 100.0 * (step_flops / sec_per_step) / (peak_tflops * 1e12)
+                        tag = " (compile)" if step == start_step else ""
+                        print(
+                            f"[S{stage.stage_id} step {step + 1}/{total_steps}]{tag} "
+                            f"loss={float(metrics['loss']):.4f} ce={float(metrics['ce_loss']):.4f} "
+                            f"eng_g={float(metrics['engram_gate']):.3f} exp_cv={float(metrics['expert_cv']):.3f} "
+                            f"| {tok_per_sec:,.0f} tok/s | MFU={mfu:.1f}% | total_tok={tokens_seen/1e9:.3f}B"
+                        )
+                        t_log = time.perf_counter()
 
-                if profiling_active and (step + 1) >= prof_end_step:
-                    jax.profiler.stop_trace()
-                    profiling_active = False
-                    print(f"[Profiler] Saved trace to {args.profile_dir}")
-
-                # Synchronize on log/ckpt boundaries for accurate MFU timing
-                tokens_seen += grad_accum * micro_tok
-
-                if (step + 1) % args.log_every == 0 or step == start_step:
-                    jax.block_until_ready(metrics["loss"])
-                    dt = max(time.perf_counter() - t_log, 1e-6)
-                    steps_elapsed = 1 if step == start_step else args.log_every
-                    sec_per_step = dt / steps_elapsed
-                    tok_per_sec = (grad_accum * micro_tok) / sec_per_step
-                    mfu = 100.0 * (step_flops / sec_per_step) / (peak_tflops * 1e12)
-                    tag = " (compile)" if step == start_step else ""
-                    print(
-                        f"[S{stage.stage_id} step {step + 1}/{total_steps}]{tag} "
-                        f"loss={float(metrics['loss']):.4f} ce={float(metrics['ce_loss']):.4f} "
-                        f"eng_g={float(metrics['engram_gate']):.3f} exp_cv={float(metrics['expert_cv']):.3f} "
-                        f"| {tok_per_sec:,.0f} tok/s | MFU={mfu:.1f}% | total_tok={tokens_seen/1e9:.3f}B"
-                    )
-                    t_log = time.perf_counter()
-
-                if (step + 1) % stage.checkpoint_every_steps == 0 or (step + 1) == total_steps:
-                    if pending_upload is not None:
-                        pending_upload.result()
-                    ckpt_dir, pending_upload = save_checkpoint(
-                        ckpt_root=args.ckpt_dir,
-                        stage_id=stage.stage_id,
-                        step=step + 1,
-                        tokens_seen=tokens_seen,
-                        params=params,
-                        opt_state=opt_state,
-                        cfg=stage_model_cfg,
-                        optim_cfg=optim_cfg,
-                        hf_repo_id=args.hf_model_repo,
-                        hf_token=args.hf_token,
-                        keep_last_k=args.keep_last_k,
-                        async_upload=True,
-                    )
-                    print(f"[Checkpoint] Saved {ckpt_dir}")
+                    if (step + 1) % stage.checkpoint_every_steps == 0 or (step + 1) == total_steps:
+                        if pending_upload is not None:
+                            pending_upload.result()
+                        ckpt_dir, pending_upload = save_checkpoint(
+                            ckpt_root=args.ckpt_dir,
+                            stage_id=stage.stage_id,
+                            step=step + 1,
+                            tokens_seen=tokens_seen,
+                            params=params,
+                            opt_state=opt_state,
+                            cfg=stage_model_cfg,
+                            optim_cfg=optim_cfg,
+                            hf_repo_id=args.hf_model_repo,
+                            hf_token=args.hf_token,
+                            keep_last_k=args.keep_last_k,
+                            async_upload=True,
+                        )
+                        print(f"[Checkpoint] Saved {ckpt_dir}")
         finally:
             if profiling_active:
                 jax.profiler.stop_trace()
