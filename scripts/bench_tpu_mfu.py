@@ -477,8 +477,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--autotune",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Run Tokamax autotuning on TPU to resolve cache misses and optimize Pallas tiles.",
+        default=False,
+        help="Opt-in slow Tokamax autotuning sweep on TPU (explicit tile configs are already set in moe.py/mla.py).",
     )
     parser.add_argument("--warmup-steps", type=int, default=2)
     parser.add_argument("--bench-steps", type=int, default=5)

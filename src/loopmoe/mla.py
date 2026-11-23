@@ -214,6 +214,40 @@ def _run_causal_attention(
         k_pad = _pad_last_dim_to_multiple(k, target_dim) if d_qk != target_dim else k
         v_pad = _pad_last_dim_to_multiple(v, target_dim) if d_v != target_dim else v
 
+        if seq_len >= 128 and seq_len % 128 == 0:
+            try:
+                from jax.experimental.pallas.ops.tpu.splash_attention import QKVLayout  # type: ignore
+                from tokamax._src.ops.attention import pallas_mosaic_tpu as _tpu_attn  # type: ignore
+                from tokamax._src.ops.attention import pallas_mosaic_tpu_vjp as _tpu_attn_vjp  # type: ignore
+
+                blk = (min(512, seq_len) // 128) * 128
+                blk_c = min(256, blk)
+                vjp_op = _tpu_attn_vjp.PallasMosaicTpuFlashAttentionVjp(
+                    config=_tpu_attn_vjp.Config(
+                        block_q_dkv=blk,
+                        block_kv_dkv=blk,
+                        block_kv_dkv_compute=blk_c,
+                        use_base2_exp=True,
+                    )
+                )
+                attn_op = _tpu_attn.PallasMosaicTpuFlashAttention(
+                    config=_tpu_attn.Config(
+                        block_q=blk,
+                        block_kv=blk,
+                        block_kv_compute=blk_c,
+                        q_layout=QKVLayout.HEAD_DIM_MINOR,
+                        k_layout=QKVLayout.HEAD_DIM_MINOR,
+                        v_layout=QKVLayout.HEAD_DIM_MINOR,
+                        use_experimental_scheduler=False,
+                        use_base2_exp=True,
+                    ),
+                    vjp=vjp_op,
+                )
+                out = attn_op(q_pad, k_pad, v_pad, is_causal=True, logits_scale=softmax_scale)
+                return out[..., :d_v]
+            except Exception:
+                pass
+
         try:
             import tokamax  # type: ignore
 

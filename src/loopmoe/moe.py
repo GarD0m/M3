@@ -51,6 +51,25 @@ def _grouped_matmul(
 
     if on_tpu and use_tokamax:
         try:
+            from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2 as _tpu_rd  # type: ignore
+
+            k_dim = int(rhs.shape[1])
+            n_dim = int(rhs.shape[2])
+            fwd_cfg = _tpu_rd.Config(
+                tile_m=256,
+                tile_k=min(k_dim, 2048),
+                tile_n=min(n_dim, 1024),
+            )
+            op = _tpu_rd.PallasMosaicTpuV2RaggedDot(
+                config=fwd_cfg,
+                dlhs_config=_tpu_rd.Config(),
+                drhs_config=_tpu_rd.Config(),
+            )
+            return op(lhs, rhs, group_sizes=group_sizes)
+        except Exception:
+            pass
+
+        try:
             import tokamax  # type: ignore
 
             fn = getattr(tokamax, "ragged_dot", None)

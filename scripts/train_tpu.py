@@ -274,8 +274,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--autotune",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Run Tokamax autotuning on TPU to resolve cache misses and optimize Pallas tiles.",
+        default=False,
+        help="Opt-in slow Tokamax autotuning sweep on TPU (explicit tile configs are already set in moe.py/mla.py).",
     )
     parser.add_argument("--profile-dir", type=str, default=None, help="Optional JAX profiler trace output directory.")
     parser.add_argument("--profile-start-step", type=int, default=2, help="Step index to start profiling trace.")
