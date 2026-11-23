@@ -58,6 +58,15 @@ def test_full_1b_analytic_params_and_tiny_exact_match() -> None:
         s.web_tier == "L3" and s.code_tier == "L3" and s.math_tier == "L3"
         for s in DEFAULT_CURRICULUM
     )
+    assert all(
+        s.seq_len == 4096
+        and s.web_en_ratio == 0.40
+        and s.web_zh_ratio == 0.40
+        and s.code_ratio == 0.10
+        and s.math_ratio == 0.10
+        and abs((s.web_en_ratio + s.web_zh_ratio + s.code_ratio + s.math_ratio) - 1.0) < 1e-9
+        for s in DEFAULT_CURRICULUM
+    )
 
     # Verify analytic count matches actual initialized pytree leaf count to the exact parameter
     tiny_cfg = LoopMoEConfig.tiny()

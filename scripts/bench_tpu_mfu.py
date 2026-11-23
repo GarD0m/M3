@@ -456,7 +456,7 @@ def main() -> None:
     ridge_fpb = spec["ridge_flops_per_byte"]
     micro_tok = args.microbatch_tokens or (64 if args.tiny else int(spec["default_microbatch_tokens"]))
     chunk_ce = args.chunk_ce_size or (16 if args.tiny else int(spec["default_chunk_ce_size"]))
-    seq_lens = args.seq_lens or ([32] if args.tiny else ([1024, 2048, 4096, 8192, 16384] if args.tpu_preset == "v5e-1" else [1024, 2048, 4096, 8192, 16384, 32768]))
+    seq_lens = args.seq_lens or ([32] if args.tiny else [4096])
 
     kernels = _probe_tpu_kernels()
     print(f"Preset: {args.tpu_preset} (peak={peak_tflops:.0f} TF, BW={spec['hbm_bw_gbps']:.0f} GB/s, HBM={spec['hbm_capacity_gb']:.0f} GB, ridge={ridge_fpb:.1f} F/B)")
