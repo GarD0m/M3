@@ -21,9 +21,9 @@ import numpy as np
 import optax
 
 from loopmoe.config import TPU_SPECS, LoopMoEConfig, estimate_step_flops
-from loopmoe.engram import apply_engram_step, prefetch_engram_embeddings
+from loopmoe.engram import apply_engram_step, precompute_engram_kv, prefetch_engram_embeddings
 from loopmoe.iter_adaln import compute_iter_adaln_modulations
-from loopmoe.mhc import collapse_streams, mhc_compute_gates, mhc_post_merge
+from loopmoe.mhc import mhc_compute_gates, mhc_post_merge
 from loopmoe.mla import apply_mla
 from loopmoe.model import (
     chunked_cross_entropy_loss,
@@ -147,6 +147,7 @@ def run_module_breakdown(
         dtype=dt,
     )
     engram_e = prefetch_engram_embeddings(params["engram"], x_ids, cfg) if cfg.use_engram else None
+    engram_kv = precompute_engram_kv(params["engram"], engram_e, cfg) if (cfg.use_engram and engram_e is not None) else None
     lm_w = get_lm_head_weight(params, cfg)
 
     timings_ms: dict[str, float] = {}
@@ -158,14 +159,14 @@ def run_module_breakdown(
                 3,
             )
             timings_ms["engram_step"] = round(
-                _bench_op(lambda p, h, e: apply_engram_step(p, h, e, cfg), (params["engram"], h_2d, engram_e), warmup, iters),
+                _bench_op(lambda p, h, kv: apply_engram_step(p, h, kv, cfg), (params["engram"], h_2d, engram_kv), warmup, iters),
                 3,
             )
 
         timings_ms["iter_adaln"] = round(
             _bench_op(
-                lambda p, xs: compute_iter_adaln_modulations(p, collapse_streams(xs), 0),
-                (params["iter_adaln"], x_streams),
+                lambda p: compute_iter_adaln_modulations(p, 0, dtype=dt),
+                (params["iter_adaln"],),
                 warmup,
                 iters,
             ),
@@ -192,7 +193,8 @@ def run_module_breakdown(
         # Isolate MoE dispatch sort/gather overhead vs shared expert
         def _moe_sort_only(p, h):
             x_flat = h.reshape(-1, cfg.d_model)
-            scores = jax.nn.sigmoid((x_flat @ p["router_w"]).astype(jnp.float32))
+            rw = p["router_w"][0] if p["router_w"].ndim == 3 else p["router_w"]
+            scores = jax.nn.sigmoid((x_flat @ rw).astype(jnp.float32))
             _, topk_idx = jax.lax.top_k(scores + p["router_bias"][0][None, :], cfg.top_k)
             flat_e = topk_idx.reshape(-1)
             order = jnp.argsort(flat_e)
@@ -206,10 +208,18 @@ def run_module_breakdown(
         timings_ms["moe_sort_dispatch_only"] = round(_bench_op(_moe_sort_only, (params["moe"], h_2d), warmup, iters), 3)
         timings_ms["moe_shared_only"] = round(_bench_op(_moe_shared_only, (params["moe"], h_2d), warmup, iters), 3)
 
+        if cfg.tie_word_embeddings:
+            ce_w = params["embed_tokens"]
+            ce_is_vd = True
+        else:
+            ce_w = lm_w
+            ce_is_vd = False
         timings_ms["chunked_ce_loss"] = round(
             _bench_op(
-                lambda h, w, t: chunked_cross_entropy_loss(h, w, t, chunk_size=cfg.chunk_ce_size),
-                (h_2d, lm_w, y_ids),
+                lambda h, w, t: chunked_cross_entropy_loss(
+                    h, w, t, chunk_size=cfg.chunk_ce_size, weight_is_vd=ce_is_vd
+                ),
+                (h_2d, ce_w, y_ids),
                 warmup,
                 iters,
             ),
@@ -217,7 +227,7 @@ def run_module_breakdown(
         )
 
         # Free activation scratch before full fwd+bwd and donated optimizer step to fit 16 GB HBM
-        del x_streams, h_2d, engram_e, lm_w
+        del x_streams, h_2d, engram_e, engram_kv, lm_w, ce_w
         gc.collect()
 
         timings_ms["full_fwd"] = round(
@@ -298,7 +308,7 @@ def _run_single_point(
     train_step = make_train_step(cfg, opt, grad_accum)
 
     rng = np.random.default_rng(seed)
-    x_np = rng.integers(64, cfg.vocab_size, size=(grad_accum, micro_bs, seq_len), dtype=np.int32)
+    x_np = rng.integers(64, cfg.vocab_size, size=(grad_accum, micro_bs, seq_len), dtype=np.uint16)
     y_np = np.roll(x_np, -1, axis=-1)
     bx = jnp.asarray(x_np)
     by = jnp.asarray(y_np)
@@ -522,11 +532,7 @@ def main() -> None:
 
     base_cfg = LoopMoEConfig.tiny() if args.tiny else LoopMoEConfig()
     remat_sub = False if args.remat_sublayers is None else args.remat_sublayers
-    remat_moe = (
-        (args.tpu_preset == "v5e-1" and micro_bs >= 8 and not args.tiny)
-        if args.remat_moe is None
-        else args.remat_moe
-    )
+    remat_moe = False if args.remat_moe is None else args.remat_moe
     base_cfg = LoopMoEConfig(
         **{
             **base_cfg.to_dict(),

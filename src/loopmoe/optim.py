@@ -3,12 +3,27 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable, NamedTuple, Sequence
 
 import jax
 import jax.numpy as jnp
 import optax
 from optax.contrib import MuonDimensionNumbers, muon as optax_muon
+from optax.contrib._muon import (
+    _compute_muon_reshape,
+    _is_weight_dim_nums,
+    scale_by_shape,
+)
+
+# Cubic5 schedule (Hua Huang, "How Much Orthogonalization Does Muon Need?", l_0=7e-3):
+# X_{t+1} = a_t X_t + b_t (X_t X_t^T) X_t -> 2 dominant matmuls/step (10 total vs 15 for 5-step quintic).
+CUBIC5_NS_COEFFS: tuple[tuple[float, float], ...] = (
+    (3.3656576, -3.3420992),
+    (2.5744352, -1.4957376),
+    (2.5368962, -1.4312570),
+    (2.4418906, -1.2764040),
+    (2.2230472, -0.9630650),
+)
 
 
 @dataclass(frozen=True)
@@ -19,7 +34,8 @@ class OptimConfig:
     adam_lr: float = 1.5e-3
     warmup_steps: int = 1000
     muon_momentum: float = 0.95
-    muon_ns_steps: int = 4
+    muon_ns_mode: str = "cubic5"
+    muon_ns_steps: int = 5
     muon_weight_decay: float = 0.01
     muon_consistent_rms: float = 0.2
     adam_b1: float = 0.9
@@ -68,14 +84,20 @@ def classify_param(path_str: str, arr: Any) -> str:
 
     leaf = path_str.split("/")[-1]
 
-    # 3D MoE expert tensors (E, in, out) -> per-expert vmap Muon
-    if path_str.startswith("moe/") and leaf in ("w_gate_up", "w_gate", "w_up", "w_down") and arr.ndim == 3:
+    # Scalar gates, mHC biases, and norm weights (including 2D per-loop MLA norms) -> AdamW without decay
+    if leaf in ("loop_alpha", "b_res", "b_pre", "b_post") or leaf.endswith("_norm_w") or leaf == "norm_w":
+        return "adam_no_decay"
+
+    # 3D (or split 4D) MoE expert tensors -> per-expert vmap Muon
+    if path_str.startswith("moe/") and leaf in ("w_gate_up", "w_gate", "w_up", "w_down") and arr.ndim in (3, 4):
+        return "muon"
+
+    # MLA projection matrices (2D tied or 3D per-loop untied) -> Muon
+    if path_str.startswith("mla/") and arr.ndim in (2, 3):
         return "muon"
 
     # 2D hidden linear matrices -> standard 2D Muon
     if arr.ndim == 2:
-        if path_str.startswith("mla/"):
-            return "muon"
         if path_str.startswith("moe/") and leaf in ("shared_w_gate_up", "shared_w_gate", "shared_w_up", "shared_w_down"):
             return "muon"
         if path_str.startswith("engram/") and leaf in ("w_kv", "w_k", "w_v"):
@@ -83,11 +105,11 @@ def classify_param(path_str: str, arr: Any) -> str:
         if path_str.startswith("iter_adaln/") and leaf in ("w_h", "w_t", "w_out"):
             return "muon"
 
-    # Scalar gates, mHC biases, and 1D norms/biases -> AdamW without weight decay
-    if leaf in ("loop_alpha", "b_res", "b_pre", "b_post") or arr.ndim < 2:
+    # Scalar/1D tensors -> AdamW without weight decay
+    if arr.ndim < 2:
         return "adam_no_decay"
 
-    # Embeddings, Engram lookup tables, router weights, mHC dynamic matrices -> AdamW with decay
+    # Embeddings, Engram lookup tables, router weights (2D/3D), mHC dynamic matrices -> AdamW with decay
     return "adam_decay"
 
 
@@ -100,7 +122,7 @@ def make_param_labels(params: Any) -> Any:
 
 
 def _muon_dim_numbers_fn(params: Any) -> Any:
-    """Specify per-expert (1, 2) axes for 3D MoE experts and (0, 1) for 2D matrices."""
+    """Specify per-expert (1, 3) for split 4D w_gate_up, (1, 2) for 3D MoE experts, and (0, 1) for 2D."""
     def _spec(path: tuple[Any, ...], arr: Any):
         if not hasattr(arr, "ndim"):
             return None
@@ -108,6 +130,8 @@ def _muon_dim_numbers_fn(params: Any) -> Any:
         label = classify_param(p, arr)
         if label != "muon":
             return None
+        if arr.ndim == 4:
+            return MuonDimensionNumbers(reduction_axis=1, output_axis=3)
         if arr.ndim == 3:
             return MuonDimensionNumbers(reduction_axis=1, output_axis=2)
         return MuonDimensionNumbers(reduction_axis=0, output_axis=1)
@@ -115,26 +139,177 @@ def _muon_dim_numbers_fn(params: Any) -> Any:
     return jax.tree_util.tree_map_with_path(_spec, params)
 
 
+def _split_gate_up_tree(tree: Any) -> Any:
+    """Zero-copy reshape moe/w_gate_up (E, D, 2*df) -> (E, D, 2, df) so NS orthogonalizes gate & up separately."""
+    if not isinstance(tree, dict) or "moe" not in tree or not isinstance(tree["moe"], dict):
+        return tree
+    moe = tree["moe"]
+    w_gu = moe.get("w_gate_up")
+    if not hasattr(w_gu, "ndim") or w_gu.ndim != 3:
+        return tree
+    e, d, two_df = w_gu.shape
+    return {**tree, "moe": {**moe, "w_gate_up": w_gu.reshape(e, d, 2, two_df // 2)}}
+
+
+def _merge_gate_up_tree(tree: Any) -> Any:
+    """Zero-copy reshape moe/w_gate_up (E, D, 2, df) -> (E, D, 2*df)."""
+    if not isinstance(tree, dict) or "moe" not in tree or not isinstance(tree["moe"], dict):
+        return tree
+    moe = tree["moe"]
+    w_gu = moe.get("w_gate_up")
+    if not hasattr(w_gu, "ndim") or w_gu.ndim != 4:
+        return tree
+    e, d, two, df = w_gu.shape
+    return {**tree, "moe": {**moe, "w_gate_up": w_gu.reshape(e, d, two * df)}}
+
+
+def _wrap_split_gate_up_muon(tx: optax.GradientTransformation) -> optax.GradientTransformation:
+    """Wrap Muon to orthogonalize fused gate/up weights independently without touching forward layout."""
+
+    def init_fn(params: Any) -> optax.OptState:
+        return tx.init(_split_gate_up_tree(params))
+
+    def update_fn(updates: Any, state: optax.OptState, params: Any | None = None):
+        split_params = None if params is None else _split_gate_up_tree(params)
+        new_updates, new_state = tx.update(_split_gate_up_tree(updates), state, split_params)
+        return _merge_gate_up_tree(new_updates), new_state
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
+class CubicMuonState(NamedTuple):
+    """Optimizer state for Cubic5 Muon."""
+
+    count: jax.Array
+    mu: Any
+
+
+def orthogonalize_via_cubic_ns(
+    x: jax.Array,
+    coeffs: Sequence[tuple[float, float]] = CUBIC5_NS_COEFFS,
+    eps: float = 1e-7,
+    dimension_numbers: MuonDimensionNumbers | None = None,
+) -> jax.Array:
+    """Unrolled cubic Newton-Schulz orthogonalization (2 matmuls/step, zero A@A or while-loop copies)."""
+    if x.ndim == 2 and dimension_numbers is None:
+        dimension_numbers = MuonDimensionNumbers(reduction_axis=0, output_axis=1)
+    if dimension_numbers is None:
+        raise ValueError(f"dimension_numbers required for tensor of shape {x.shape}")
+
+    def _orth(mat: jax.Array) -> jax.Array:
+        dt = mat.dtype
+        transposed = False
+        if mat.shape[0] > mat.shape[1]:
+            mat = mat.T
+            transposed = True
+        norm = jnp.sqrt(jnp.sum(jnp.square(mat), dtype=jnp.float32)) + jnp.asarray(eps, dtype=jnp.float32)
+        mat = (mat.astype(jnp.float32) / norm).astype(dt)
+        for a_val, b_val in coeffs:
+            gram = mat @ mat.T
+            mat = jnp.asarray(a_val, dtype=dt) * mat + jnp.asarray(b_val, dtype=dt) * (gram @ mat)
+        if transposed:
+            mat = mat.T
+        return mat
+
+    reshape_fn, inverse_fn = _compute_muon_reshape(x, dimension_numbers)
+    return inverse_fn(jax.vmap(_orth)(reshape_fn(x)))
+
+
+def scale_by_cubic_muon(
+    coeffs: Sequence[tuple[float, float]] = CUBIC5_NS_COEFFS,
+    beta: float = 0.95,
+    eps: float = 1e-7,
+    mu_dtype: jnp.dtype | None = jnp.bfloat16,
+    nesterov: bool = True,
+    weight_dimension_numbers: Callable[[Any], Any] | MuonDimensionNumbers | None = None,
+) -> optax.GradientTransformation:
+    """Momentum + Nesterov + Cubic5 Newton-Schulz orthogonalization."""
+    mu_dtype_can = optax._src.utils.canonicalize_dtype(mu_dtype)
+
+    def init_fn(params: Any) -> CubicMuonState:
+        return CubicMuonState(
+            count=jnp.zeros([], dtype=jnp.int32),
+            mu=optax.tree.zeros_like(params, dtype=mu_dtype_can),
+        )
+
+    def update_fn(updates: Any, state: CubicMuonState, params: Any | None = None):
+        del params
+        resolved_dim_nums = (
+            weight_dimension_numbers(updates)
+            if callable(weight_dimension_numbers)
+            else weight_dimension_numbers
+        )
+        mu = optax.tree.update_moment(updates, state.mu, beta, 1)
+        count_inc = optax.tree.safe_increment(state.count) if hasattr(optax.tree, "safe_increment") else (state.count + jnp.asarray(1, dtype=jnp.int32))
+        if nesterov:
+            mu_hat = jax.tree_util.tree_map(
+                lambda m, g: beta * m + (1.0 - beta) * g,
+                optax.tree.bias_correction(mu, beta, count_inc + jnp.asarray(1, dtype=jnp.int32)),
+                optax.tree.bias_correction(updates, beta, count_inc),
+            )
+        else:
+            mu_hat = optax.tree.bias_correction(mu, beta, count_inc)
+
+        is_leaf = lambda v: v is None or _is_weight_dim_nums(v)
+        ortho_updates = jax.tree_util.tree_map(
+            lambda arr, dn: arr if dn is None else orthogonalize_via_cubic_ns(
+                arr, coeffs=coeffs, eps=eps, dimension_numbers=dn
+            ),
+            mu_hat,
+            resolved_dim_nums,
+            is_leaf=is_leaf,
+        )
+        mu_cast = optax.tree.cast(mu, mu_dtype_can)
+        return ortho_updates, CubicMuonState(count=count_inc, mu=mu_cast)
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
 def create_muon_adamw_optimizer(
     optim_cfg: OptimConfig,
     params_template: Any | None = None,
 ) -> optax.GradientTransformation:
-    """Build clipped Muon + BF16-moment AdamW optimizer with Warmup-Stable (no-decay) LR."""
+    """Build clipped Muon (Cubic5 default or Quintic) + BF16-moment AdamW optimizer."""
     del params_template  # labels & dim numbers resolve dynamically inside optax.partition
     muon_lr = make_warmup_stable_schedule(optim_cfg.muon_lr, optim_cfg.warmup_steps)
     adam_lr = make_warmup_stable_schedule(optim_cfg.adam_lr, optim_cfg.warmup_steps)
 
-    muon_tx = optax_muon(
-        learning_rate=muon_lr,
-        ns_steps=optim_cfg.muon_ns_steps,
-        beta=optim_cfg.muon_momentum,
-        eps=optim_cfg.eps,
-        weight_decay=optim_cfg.muon_weight_decay,
-        mu_dtype=jnp.bfloat16,
-        nesterov=True,
-        muon_weight_dimension_numbers=_muon_dim_numbers_fn,
-        consistent_rms=optim_cfg.muon_consistent_rms,
-    )
+    if optim_cfg.muon_ns_mode == "cubic5":
+        coeffs = CUBIC5_NS_COEFFS[: max(1, min(optim_cfg.muon_ns_steps, len(CUBIC5_NS_COEFFS)))]
+        muon_tx = _wrap_split_gate_up_muon(
+            optax.chain(
+                scale_by_cubic_muon(
+                    coeffs=coeffs,
+                    beta=optim_cfg.muon_momentum,
+                    eps=optim_cfg.eps,
+                    mu_dtype=jnp.bfloat16,
+                    nesterov=True,
+                    weight_dimension_numbers=_muon_dim_numbers_fn,
+                ),
+                scale_by_shape(
+                    weight_dimension_numbers=_muon_dim_numbers_fn,
+                    consistent_rms=optim_cfg.muon_consistent_rms,
+                ),
+                optax.add_decayed_weights(optim_cfg.muon_weight_decay),
+                optax.scale_by_learning_rate(muon_lr),
+            )
+        )
+    elif optim_cfg.muon_ns_mode == "quintic":
+        muon_tx = _wrap_split_gate_up_muon(
+            optax_muon(
+                learning_rate=muon_lr,
+                ns_steps=optim_cfg.muon_ns_steps,
+                beta=optim_cfg.muon_momentum,
+                eps=optim_cfg.eps,
+                weight_decay=optim_cfg.muon_weight_decay,
+                mu_dtype=jnp.bfloat16,
+                nesterov=True,
+                muon_weight_dimension_numbers=_muon_dim_numbers_fn,
+                consistent_rms=optim_cfg.muon_consistent_rms,
+            )
+        )
+    else:
+        raise ValueError(f"Unsupported muon_ns_mode: {optim_cfg.muon_ns_mode!r}")
 
     adam_decay_tx = optax.adamw(
         learning_rate=adam_lr,
@@ -176,15 +351,24 @@ def per_expert_newton_schulz(
     tensor_3d: jax.Array,
     ns_steps: int = 5,
     eps: float = 1e-7,
+    mode: str = "cubic5",
 ) -> jax.Array:
     """Explicit helper applying 2D Newton-Schulz orthogonalization independently per expert via vmap."""
     dim_nums = MuonDimensionNumbers(reduction_axis=1, output_axis=2)
-    coeffs = jnp.asarray((3.4445, -4.775, 2.0315), dtype=tensor_3d.dtype)
+    if mode == "cubic5":
+        coeffs = CUBIC5_NS_COEFFS[: max(1, min(ns_steps, len(CUBIC5_NS_COEFFS)))]
+        return orthogonalize_via_cubic_ns(
+            tensor_3d,
+            coeffs=coeffs,
+            eps=eps,
+            dimension_numbers=dim_nums,
+        )
+    coeffs_q = jnp.asarray((3.4445, -4.775, 2.0315), dtype=tensor_3d.dtype)
     from optax.contrib._muon import orthogonalize_via_newton_schulz
 
     return orthogonalize_via_newton_schulz(
         tensor_3d,
-        ns_coeffs=coeffs,
+        ns_coeffs=coeffs_q,
         ns_steps=ns_steps,
         eps=eps,
         dimension_numbers=dim_nums,

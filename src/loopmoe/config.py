@@ -70,7 +70,7 @@ class LoopMoEConfig:
     """Configuration for 1B 1-Layer DeepSeek-V4.1-Flash LoopMoE."""
 
     # Core backbone
-    vocab_size: int = 65_536
+    vocab_size: int = 32_768
     d_model: int = 2048
     num_layers: int = 1
     max_loops: int = 8
@@ -78,7 +78,7 @@ class LoopMoEConfig:
     tie_word_embeddings: bool = True
     dtype_name: str = "bfloat16"
     rms_norm_eps: float = 1e-6
-    chunk_ce_size: int = 4096
+    chunk_ce_size: int = 16_384
 
     # RoPE / YaRN long-context scaling
     rope_theta: float = 10_000.0
@@ -89,21 +89,22 @@ class LoopMoEConfig:
     yarn_beta_slow: float = 1.0
     yarn_mscale: float = 1.0
 
-    # DeepSeek-V4.1-Flash Single-Pass mHC
+    # DeepSeek-V4.1-Flash Single-Pass mHC (2-stream closed-form Birkhoff)
     use_mhc: bool = True
-    mhc_streams: int = 4
+    mhc_streams: int = 2
     mhc_sinkhorn_iters: int = 10
     mhc_alpha_init: float = 0.01
 
-    # DeepSeek-V4.1-Flash Engram Conditional Memory (~22.5% of sparse capacity)
+    # DeepSeek-V4.1-Flash Engram Conditional Memory (~20.5% of sparse capacity)
     use_engram: bool = True
     engram_orders: tuple[int, ...] = (2, 3)
-    engram_hash_heads: int = 4
-    engram_head_dim: int = 128
-    engram_total_slots: int = 1_600_000
+    engram_hash_heads: int = 2
+    engram_head_dim: int = 256
+    engram_total_slots: int = 800_000
     engram_conv_kernel: int = 4
     engram_conv_dilation: int = 3
     engram_seed: int = 20260112
+    engram_pre_loop_only: bool = True
 
     # MLA + optional CSA2 Lightning Indexer
     n_heads: int = 16
@@ -112,6 +113,7 @@ class LoopMoEConfig:
     d_qk_nope: int = 96
     d_qk_rope: int = 32
     d_v: int = 128
+    untie_mla_per_loop: bool = True
     attn_use_tokamax: bool = True
     use_csa2_indexer: bool = False
     csa2_num_heads: int = 4
@@ -119,18 +121,21 @@ class LoopMoEConfig:
     csa2_topk: int = 2048
 
     # DeepSeek fine-grained MoE + LoopMoE Capacity Balancing
-    n_routed_experts: int = 256
-    d_ff_expert: int = 512
+    n_routed_experts: int = 128
+    d_ff_expert: int = 1024
     n_shared_experts: int = 1
-    d_ff_shared: int = 512
+    d_ff_shared: int = 1024
     top_k: int = 5
     routed_scaling_factor: float = 2.5
     router_bias_update_rate: float = 1e-3
-    seq_aux_loss_weight: float = 1e-4
+    seq_aux_loss_weight: float = 0.0
+    untie_router_per_loop: bool = True
+    use_post_moe_rmsnorm: bool = True
     moe_use_tokamax: bool = True
 
-    # LoopMoE IterAdaLN
+    # LoopMoE IterAdaLN & LOOM embedding re-injection
     iter_adaln_bottleneck: int = 128
+    embed_reinject_lambda: float = 0.5
 
     # TPU execution
     remat_per_loop: bool = True
@@ -194,7 +199,7 @@ class LoopMoEConfig:
             chunk_ce_size=16,
             base_seq_len=32,
             max_seq_len=128,
-            mhc_streams=4,
+            mhc_streams=2,
             mhc_sinkhorn_iters=10,
             engram_orders=(2, 3),
             engram_hash_heads=2,
@@ -202,12 +207,14 @@ class LoopMoEConfig:
             engram_total_slots=400,
             engram_conv_kernel=4,
             engram_conv_dilation=1,
+            engram_pre_loop_only=True,
             n_heads=4,
             d_q_lora=32,
             d_kv_lora=24,
             d_qk_nope=8,
             d_qk_rope=8,
             d_v=8,
+            untie_mla_per_loop=True,
             attn_use_tokamax=False,
             use_csa2_indexer=use_csa2_indexer,
             csa2_num_heads=2,
@@ -218,8 +225,12 @@ class LoopMoEConfig:
             n_shared_experts=1,
             d_ff_shared=32,
             top_k=2,
+            seq_aux_loss_weight=0.0,
+            untie_router_per_loop=True,
+            use_post_moe_rmsnorm=True,
             moe_use_tokamax=False,
             iter_adaln_bottleneck=16,
+            embed_reinject_lambda=0.5,
             remat_per_loop=False,
             remat_sublayers=False,
             remat_moe=False,
@@ -230,11 +241,11 @@ class LoopMoEConfig:
         """Full 1B preset tuned for TPU v5e-1 (16 GB HBM, 197 TFLOPS, 128x128 MXU)."""
         return cls(
             num_loops=num_loops,
-            chunk_ce_size=4096,
+            chunk_ce_size=8192,
             use_csa2_indexer=use_csa2_indexer,
             remat_per_loop=True,
             remat_sublayers=False,
-            remat_moe=True,
+            remat_moe=False,
         )
 
 
@@ -247,7 +258,7 @@ TPU_SPECS: dict[str, dict[str, float]] = {
         "ridge_flops_per_byte": (197.0 * 1e12) / (819.0 * 1e9),
         "default_microbatch": 8.0,
         "default_grad_accum": 8.0,
-        "default_chunk_ce_size": 4096.0,
+        "default_chunk_ce_size": 8192.0,
     },
     "v6e-1": {
         "peak_tflops_bf16": 918.0,
@@ -436,7 +447,9 @@ def count_analytic_params(cfg: LoopMoEConfig) -> dict[str, float | int]:
     # Single-Pass mHC (attn + moe sublayers) + stream expander/gate
     if cfg.use_mhc:
         s = cfg.mhc_streams
-        mhc_per_sublayer = (s * d) + (s * d) * (2 * s + s * s) + (2 * s + s * s) + 3
+        res_dim = 1 if s == 2 else s * s
+        out_dim = 2 * s + res_dim
+        mhc_per_sublayer = (s * d) + (s * d) * out_dim + out_dim + 3
         mhc = 2 * mhc_per_sublayer + s
     else:
         mhc = 0
@@ -452,19 +465,19 @@ def count_analytic_params(cfg: LoopMoEConfig) -> dict[str, float | int]:
         engram_tables = 0
         engram = 0
 
-    # IterAdaLN
+    # Pure Per-Loop IterAdaLN (no per-token w_h projection)
     b = cfg.iter_adaln_bottleneck
     iter_adaln = (
         cfg.max_loops * d
-        + (d * b) * 2
+        + (d * b)
         + b * (6 * d)
         + 6 * d
         + cfg.max_loops * 3  # per-loop residual scalars (engram, attn, moe)
         + 2 * d  # base pre-sublayer RMSNorms
     )
 
-    # MLA
-    mla = (
+    # MLA (optionally untied across max_loops with zero extra active FLOPs)
+    mla_single = (
         d * cfg.d_q_lora
         + cfg.d_q_lora
         + cfg.d_q_lora * (cfg.n_heads * cfg.d_qk_head)
@@ -474,25 +487,29 @@ def count_analytic_params(cfg: LoopMoEConfig) -> dict[str, float | int]:
         + (cfg.n_heads * cfg.d_v) * d
     )
     if cfg.use_csa2_indexer:
-        mla += (
+        mla_single += (
             cfg.d_q_lora * (cfg.csa2_num_heads * cfg.csa2_head_dim)
             + d * cfg.csa2_head_dim
             + cfg.csa2_head_dim
             + d * cfg.csa2_num_heads
         )
+    mla = mla_single * (cfg.max_loops if cfg.untie_mla_per_loop else 1)
 
     # MoE
     moe_routed = cfg.n_routed_experts * (3 * d * cfg.d_ff_expert)
     moe_shared = cfg.n_shared_experts * (3 * d * cfg.d_ff_shared)
-    moe_router = d * cfg.n_routed_experts
+    moe_router = (cfg.max_loops if cfg.untie_router_per_loop else 1) * d * cfg.n_routed_experts
     moe_bias = cfg.max_loops * cfg.n_routed_experts
-    moe = moe_routed + moe_shared + moe_router + moe_bias
+    moe_post_norm = d if cfg.use_post_moe_rmsnorm else 0
+    moe = moe_routed + moe_shared + moe_router + moe_bias + moe_post_norm
 
     total = emb + lm_head + final_norm + mhc + engram + iter_adaln + mla + moe
     active_ffn = cfg.top_k * (3 * d * cfg.d_ff_expert) + moe_shared
     active_engram_dense = (engram - engram_tables) if cfg.use_engram else 0
-    active_per_loop_non_emb = mla + active_ffn + iter_adaln + mhc + active_engram_dense
-    active_total = emb + lm_head + cfg.num_loops * active_per_loop_non_emb
+    active_engram_per_loop = 0 if cfg.engram_pre_loop_only else active_engram_dense
+    active_per_loop_non_emb = mla_single + active_ffn + mhc + active_engram_per_loop
+    active_engram_once = active_engram_dense if cfg.engram_pre_loop_only else 0
+    active_total = emb + lm_head + active_engram_once + cfg.num_loops * active_per_loop_non_emb
 
     sparse_total = engram + moe
     engram_sparse_ratio = (engram / sparse_total) if sparse_total > 0 else 0.0
@@ -504,17 +521,20 @@ def count_analytic_params(cfg: LoopMoEConfig) -> dict[str, float | int]:
         "mhc": mhc,
         "engram_tables": engram_tables,
         "engram_total": engram,
+        "active_engram_dense": active_engram_dense,
         "iter_adaln": iter_adaln,
         "mla": mla,
+        "mla_per_loop": mla_single,
         "moe_routed": moe_routed,
         "moe_shared": moe_shared,
         "moe_router": moe_router + moe_bias,
+        "moe_post_norm": moe_post_norm,
         "moe_total": moe,
         "total": total,
         "active_ffn_per_loop": active_ffn,
         "active_per_loop_non_emb": active_per_loop_non_emb,
         "active_total_per_token": active_total,
-        "attn_to_ffn_active_ratio": active_ffn / max(1, mla),
+        "attn_to_ffn_active_ratio": active_ffn / max(1, mla_single),
         "engram_sparse_ratio": engram_sparse_ratio,
     }
 
@@ -526,10 +546,14 @@ def estimate_step_flops(cfg: LoopMoEConfig, batch_size: int, seq_len: int) -> fl
     """
     stats = count_analytic_params(cfg)
     tokens = batch_size * seq_len
+    engram_dense_runs = (
+        1 if (cfg.use_engram and cfg.engram_pre_loop_only) else (cfg.num_loops if cfg.use_engram else 0)
+    )
     # Dense matmul FLOPs (embedding lookup is sparse; LM head projection IS a full matmul)
     active_matmul_params = (
         cfg.vocab_size * cfg.d_model  # LM head
-        + cfg.num_loops * int(stats["active_per_loop_non_emb"])
+        + engram_dense_runs * int(stats["active_engram_dense"])
+        + cfg.num_loops * (int(stats["mla_per_loop"]) + int(stats["active_ffn_per_loop"]) + int(stats["mhc"]))
     )
     linear_flops = 6.0 * float(active_matmul_params) * float(tokens)
     # Causal attention FLOPs (~6 * B * H * S^2 * (d_qk + d_v) / 2 * loops for fwd+bwd)

@@ -1,4 +1,4 @@
-"""1B 1-Layer DeepSeek-V4.1-Flash LoopMoE model, chunked cross-entropy, and R=1->8 expansion."""
+"""1B 1-Layer DeepSeek-V4.1-Flash LoopMoE model, chunked cross-entropy, and R=1->N expansion."""
 
 from __future__ import annotations
 
@@ -10,7 +10,12 @@ import jax.numpy as jnp
 import optax
 
 from .config import LoopMoEConfig, count_analytic_params
-from .engram import apply_engram_step, init_engram_params, prefetch_engram_embeddings
+from .engram import (
+    apply_engram_step,
+    init_engram_params,
+    precompute_engram_kv,
+    prefetch_engram_embeddings,
+)
 from .iter_adaln import (
     apply_adaln,
     compute_iter_adaln_modulations,
@@ -63,11 +68,12 @@ def count_tree_params(tree: Any) -> int:
 def _single_loop_step(
     params: dict[str, Any],
     x_streams: jax.Array,
-    engram_e: jax.Array | None,
+    x_embed: jax.Array,
+    engram_kv: tuple[jax.Array, jax.Array] | None,
     loop_idx: jax.Array | int,
     cfg: LoopMoEConfig,
-) -> tuple[jax.Array, tuple[jax.Array, jax.Array, jax.Array]]:
-    """Execute one recurrent iteration of Engram + IterAdaLN + Single-Pass mHC(MLA) + Single-Pass mHC(MoE)."""
+) -> tuple[jax.Array, tuple[jax.Array, jax.Array, jax.Array, jax.Array]]:
+    """Execute one recurrent iteration of LOOM embedding re-injection + IterAdaLN + mHC(MLA) + mHC(MoE)."""
     with jax.named_scope("loop_step"):
         alphas = params["iter_adaln"]["loop_alpha"][loop_idx]  # [3]
         dt = x_streams.dtype
@@ -75,12 +81,23 @@ def _single_loop_step(
         alpha_attn = alphas[1].astype(dt)
         alpha_moe = alphas[2].astype(dt)
 
-        # 1. Context-aware Engram conditional memory refinement
-        if cfg.use_engram:
-            def _engram_sublayer(p, xs, ee, ae):
+        if cfg.embed_reinject_lambda > 0.0:
+            # LOOM embedding re-injection for t >= 1 (1-indexed t >= 2), gated by alpha_engram so
+            # R=1 -> R=N expansion preserves exact step-0 logits when loop_alpha[1:, 0] == 0.
+            g_t = jnp.asarray(cfg.embed_reinject_lambda, dtype=dt) / jnp.asarray(loop_idx + 1, dtype=dt)
+            eff_g = jnp.where(
+                jnp.asarray(loop_idx, dtype=jnp.int32) > 0,
+                g_t * alpha_engram,
+                jnp.asarray(0.0, dtype=dt),
+            )
+            x_streams = (jnp.asarray(1.0, dtype=dt) - eff_g) * x_streams + eff_g * x_embed[:, :, None, :]
+
+        # 1. Context-aware Engram conditional memory refinement (skipped inside loop when pre-loop-only)
+        if cfg.use_engram and not cfg.engram_pre_loop_only:
+            def _engram_sublayer(p, xs, ekv, ae):
                 with jax.named_scope("engram_step"):
                     h_summary = collapse_streams(xs)
-                    engram_delta, gate_mean = apply_engram_step(p["engram"], h_summary, ee, cfg)
+                    engram_delta, gate_mean = apply_engram_step(p["engram"], h_summary, ekv, cfg)
                     return xs + ae * engram_delta[:, :, None, :], gate_mean
 
             engram_fn = (
@@ -88,19 +105,18 @@ def _single_loop_step(
                 if (cfg.remat_sublayers or cfg.remat_moe)
                 else _engram_sublayer
             )
-            x_streams, engram_gate_mean = engram_fn(params, x_streams, engram_e, alpha_engram)
+            x_streams, engram_gate_mean = engram_fn(params, x_streams, engram_kv, alpha_engram)
         else:
             engram_gate_mean = jnp.asarray(0.0, dtype=jnp.float32)
 
-        # 2. LoopMoE IterAdaLN modulation jointly conditioned on h_t and loop_idx
+        # 2. Pure Per-Loop IterAdaLN modulation conditioned on loop_idx (zero [B, S, 12288] HBM)
         with jax.named_scope("iter_adaln"):
-            h_mod = collapse_streams(x_streams)
             shift_a, scale_a, gate_a, shift_m, scale_m, gate_m = compute_iter_adaln_modulations(
-                params["iter_adaln"], h_mod, loop_idx
+                params["iter_adaln"], loop_idx, dtype=dt
             )
 
         # 3. MLA sublayer inside Single-Pass mHC
-        def _attn_sublayer(p, xs, sa, sca, ga, aa):
+        def _attn_sublayer(p, xs, sa, sca, ga, aa, lidx):
             with jax.named_scope("mhc_attn_sublayer"):
                 if cfg.use_mhc:
                     h_in_a, _, h_post_a, h_res_a = mhc_compute_gates(
@@ -112,7 +128,7 @@ def _single_loop_step(
                 h_in_a_norm = apply_adaln(
                     h_in_a, p["iter_adaln"]["norm_attn_w"], sca, sa, cfg.rms_norm_eps
                 )
-                attn_out, _ = apply_mla(p["mla"], h_in_a_norm, cfg)
+                attn_out, _ = apply_mla(p["mla"], h_in_a_norm, cfg, loop_idx=lidx)
                 attn_out = attn_out * ga.astype(dt)
 
                 if cfg.use_mhc:
@@ -120,7 +136,7 @@ def _single_loop_step(
                 return xs + aa * attn_out[:, :, None, :]
 
         attn_fn = jax.checkpoint(_attn_sublayer) if cfg.remat_sublayers else _attn_sublayer
-        x_streams = attn_fn(params, x_streams, shift_a, scale_a, gate_a, alpha_attn)
+        x_streams = attn_fn(params, x_streams, shift_a, scale_a, gate_a, alpha_attn, loop_idx)
 
         # 4. DeepSeek MoE sublayer inside Single-Pass mHC
         def _moe_sublayer(p, xs, sm, scm, gm, am, lidx):
@@ -136,25 +152,25 @@ def _single_loop_step(
                     h_in_m, p["iter_adaln"]["norm_moe_w"], scm, sm, cfg.rms_norm_eps
                 )
                 if cfg.remat_moe and not cfg.remat_sublayers:
-                    moe_out, ec, aux_l = jax.checkpoint(
+                    moe_out, ec, aux_l, mmr = jax.checkpoint(
                         lambda pm, h_in, li: apply_moe(pm, h_in, li, cfg)
                     )(p["moe"], h_in_m_norm, lidx)
                 else:
-                    moe_out, ec, aux_l = apply_moe(p["moe"], h_in_m_norm, lidx, cfg)
+                    moe_out, ec, aux_l, mmr = apply_moe(p["moe"], h_in_m_norm, lidx, cfg)
                 moe_out = moe_out * gm.astype(dt)
 
                 if cfg.use_mhc:
                     next_xs = mhc_post_merge(xs, moe_out, h_post_m, h_res_m, loop_gate=am)
                 else:
                     next_xs = xs + am * moe_out[:, :, None, :]
-                return next_xs, ec, aux_l
+                return next_xs, ec, aux_l, mmr
 
         moe_fn = jax.checkpoint(_moe_sublayer) if cfg.remat_sublayers else _moe_sublayer
-        x_streams, expert_counts, seq_aux_loss = moe_fn(
+        x_streams, expert_counts, seq_aux_loss, router_mmr = moe_fn(
             params, x_streams, shift_m, scale_m, gate_m, alpha_moe, loop_idx
         )
 
-        return x_streams, (expert_counts, seq_aux_loss, engram_gate_mean)
+        return x_streams, (expert_counts, seq_aux_loss, engram_gate_mean, router_mmr)
 
 
 def forward_hidden(
@@ -162,33 +178,46 @@ def forward_hidden(
     input_ids: jax.Array,
     cfg: LoopMoEConfig,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
-    """Run embedding + single pre-loop Engram gather + R-loop LoopMoE block + final RMSNorm."""
+    """Run embedding + single pre-loop Engram gather/proj + R-loop LoopMoE block + final RMSNorm."""
     x = params["embed_tokens"][input_ids]  # [B, S, D]
-    with jax.named_scope("engram_prefetch"):
-        engram_e = (
-            prefetch_engram_embeddings(params["engram"], input_ids, cfg) if cfg.use_engram else None
-        )
+    pre_gate_mean = jnp.asarray(0.0, dtype=jnp.float32)
+    engram_kv: tuple[jax.Array, jax.Array] | None = None
+    if cfg.use_engram:
+        with jax.named_scope("engram_prefetch"):
+            engram_e = prefetch_engram_embeddings(params["engram"], input_ids, cfg)
+            assert engram_e is not None
+            engram_kv = precompute_engram_kv(params["engram"], engram_e, cfg)
+        if cfg.engram_pre_loop_only:
+            with jax.named_scope("engram_step"):
+                engram_delta, pre_gate_mean = apply_engram_step(params["engram"], x, engram_kv, cfg)
+                alpha_engram_0 = params["iter_adaln"]["loop_alpha"][0, 0].astype(x.dtype)
+                x = x + alpha_engram_0 * engram_delta
+            engram_kv = None
 
+    x_embed = x
     stream_init = params["mhc"]["stream_init"] if cfg.use_mhc else None
     x_streams = expand_streams(x, stream_init)
 
     def scan_body(carry: jax.Array, loop_idx: jax.Array):
-        return _single_loop_step(params, carry, engram_e, loop_idx, cfg)
+        return _single_loop_step(params, carry, x_embed, engram_kv, loop_idx, cfg)
 
     use_loop_remat = cfg.remat_per_loop and (cfg.num_loops > 1)
     step_fn = jax.checkpoint(scan_body) if use_loop_remat else scan_body
     loop_indices = jnp.arange(cfg.num_loops, dtype=jnp.int32)
-    x_streams, (expert_counts, seq_aux_losses, gate_means) = jax.lax.scan(
+    x_streams, (expert_counts, seq_aux_losses, gate_means, router_mmrs) = jax.lax.scan(
         step_fn, x_streams, loop_indices
     )
     seq_aux_loss = jnp.mean(seq_aux_losses)
-    engram_gate_mean = jnp.mean(gate_means)
+    engram_gate_mean = (
+        pre_gate_mean if (cfg.use_engram and cfg.engram_pre_loop_only) else jnp.mean(gate_means)
+    )
 
     hidden = rms_norm(collapse_streams(x_streams), params["final_norm_w"], eps=cfg.rms_norm_eps)
     aux = {
         "expert_counts": expert_counts,  # [num_loops, E]
         "seq_aux_loss": seq_aux_loss,
         "engram_gate_mean": engram_gate_mean,
+        "router_mmr": jnp.mean(router_mmrs),
     }
     return hidden, aux
 
@@ -535,20 +564,133 @@ def _saved_logits_ce_vd_bwd(
 _saved_logits_ce_vd.defvjp(_saved_logits_ce_vd_fwd, _saved_logits_ce_vd_bwd)
 
 
+def _run_fused_ce_fwd_bwd(
+    h_chunks: jax.Array,
+    lm_weight: jax.Array,
+    t_chunks: jax.Array,
+    m_chunks: jax.Array,
+    denom: jax.Array,
+    weight_is_vd: bool,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Single-pass chunked CE computing loss and unit-scale gradients without retaining logits."""
+    vocab_size = lm_weight.shape[0] if weight_is_vd else lm_weight.shape[1]
+    vocab_idx = jnp.arange(vocab_size, dtype=t_chunks.dtype)[None, :]
+    inv_denom = jnp.asarray(1.0, dtype=jnp.float32) / denom
+
+    def _step(
+        carry: tuple[jax.Array, jax.Array],
+        chunk_in: tuple[jax.Array, jax.Array, jax.Array],
+    ) -> tuple[tuple[jax.Array, jax.Array], jax.Array]:
+        loss_acc, d_w_acc = carry
+        hc, tc, mc = chunk_in
+        logits_bf16 = (
+            jax.lax.dot_general(hc, lm_weight, (((1,), (1,)), ((), ())))
+            if weight_is_vd
+            else (hc @ lm_weight)
+        )
+        chunk_loss, lse = _ce_chunk_loss_and_lse(logits_bf16, tc, mc)
+        d_logits = _ce_chunk_dlogits(logits_bf16, lse, tc, mc, vocab_idx, inv_denom, hc.dtype)
+        if weight_is_vd:
+            d_hc = (d_logits @ lm_weight).astype(hc.dtype)
+            d_w_acc = d_w_acc + jax.lax.dot_general(
+                d_logits, hc, (((0,), (0,)), ((), ()))
+            ).astype(d_w_acc.dtype)
+        else:
+            d_hc = (d_logits @ lm_weight.T).astype(hc.dtype)
+            d_w_acc = d_w_acc + (hc.T @ d_logits).astype(d_w_acc.dtype)
+        return (loss_acc + chunk_loss, d_w_acc), d_hc
+
+    (total_loss, d_lm_w), d_h_chunks = jax.lax.scan(
+        _step,
+        (jnp.asarray(0.0, dtype=jnp.float32), jnp.zeros_like(lm_weight)),
+        (h_chunks, t_chunks, m_chunks),
+        unroll=1,
+    )
+    return total_loss / denom, d_h_chunks, d_lm_w
+
+
+@jax.custom_vjp
+def _fused_chunked_ce(
+    h_chunks: jax.Array,
+    lm_head_weight: jax.Array,
+    t_chunks: jax.Array,
+    m_chunks: jax.Array,
+    denom: jax.Array,
+) -> jax.Array:
+    out, _ = _run_scan_ce_fwd(h_chunks, lm_head_weight, t_chunks, m_chunks, denom)
+    return out
+
+
+def _fused_chunked_ce_fwd(
+    h_chunks: jax.Array,
+    lm_head_weight: jax.Array,
+    t_chunks: jax.Array,
+    m_chunks: jax.Array,
+    denom: jax.Array,
+) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
+    out, d_h_chunks, d_lm_w = _run_fused_ce_fwd_bwd(
+        h_chunks, lm_head_weight, t_chunks, m_chunks, denom, False
+    )
+    return out, (d_h_chunks, d_lm_w)
+
+
+def _fused_chunked_ce_bwd(
+    res: tuple[jax.Array, jax.Array],
+    g_out: jax.Array,
+) -> tuple[jax.Array, jax.Array, None, None, None]:
+    d_h_chunks, d_lm_w = res
+    return (
+        d_h_chunks * g_out.astype(d_h_chunks.dtype),
+        d_lm_w * g_out.astype(d_lm_w.dtype),
+        None,
+        None,
+        None,
+    )
+
+
+_fused_chunked_ce.defvjp(_fused_chunked_ce_fwd, _fused_chunked_ce_bwd)
+
+
+@jax.custom_vjp
+def _fused_chunked_ce_vd(
+    h_chunks: jax.Array,
+    lm_weight_vd: jax.Array,
+    t_chunks: jax.Array,
+    m_chunks: jax.Array,
+    denom: jax.Array,
+) -> jax.Array:
+    out, _ = _run_scan_ce_fwd_vd(h_chunks, lm_weight_vd, t_chunks, m_chunks, denom)
+    return out
+
+
+def _fused_chunked_ce_vd_fwd(
+    h_chunks: jax.Array,
+    lm_weight_vd: jax.Array,
+    t_chunks: jax.Array,
+    m_chunks: jax.Array,
+    denom: jax.Array,
+) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
+    out, d_h_chunks, d_lm_w = _run_fused_ce_fwd_bwd(
+        h_chunks, lm_weight_vd, t_chunks, m_chunks, denom, True
+    )
+    return out, (d_h_chunks, d_lm_w)
+
+
+_fused_chunked_ce_vd.defvjp(_fused_chunked_ce_vd_fwd, _fused_chunked_ce_bwd)
+
+
 def chunked_cross_entropy_loss(
     hidden: jax.Array,
     lm_head_weight: jax.Array,
     targets: jax.Array,
-    chunk_size: int = 2048,
+    chunk_size: int = 16_384,
     loss_mask: jax.Array | None = None,
     weight_is_vd: bool = False,
 ) -> jax.Array:
-    """Memory-efficient chunked linear projection + softmax cross-entropy.
+    """Single-pass fused chunked linear projection + softmax cross-entropy.
 
     Supports `[D, V]` (`weight_is_vd=False`) or layout-native tied `[V, D]` (`weight_is_vd=True`)
-    without transposing the full `[65536, 2048]` embedding table. When `chunk_size >= total_tokens`,
-    uses single-GEMM BF16-saved sub-chunking (`<=4096` tok/chunk) to skip backward logits matmul
-    recompute without allocating full FP32 `[N, V]` logits in HBM.
+    without transposing the embedding table or retaining `[N, V]` logits across the backward graph.
     """
     bsz, seq_len, d_model = hidden.shape
     total_tokens = bsz * seq_len
@@ -561,22 +703,9 @@ def chunked_cross_entropy_loss(
     )
 
     denom = jnp.maximum(jnp.sum(m_flat), 1.0)
-    if chunk_size >= total_tokens:
-        sub_chunk = min(total_tokens, 4096)
-        if total_tokens % sub_chunk != 0:
-            sub_chunk = math.gcd(total_tokens, sub_chunk)
-            if sub_chunk == 1 and total_tokens <= 4096:
-                sub_chunk = total_tokens
-        num_chunks = total_tokens // sub_chunk
-        h_chunks = h_flat.reshape(num_chunks, sub_chunk, d_model)
-        t_chunks = t_flat.reshape(num_chunks, sub_chunk)
-        m_chunks = m_flat.reshape(num_chunks, sub_chunk)
-        saved_fn = _saved_logits_ce_vd if weight_is_vd else _saved_logits_ce
-        return saved_fn(h_chunks, lm_head_weight, t_chunks, m_chunks, denom)
-
     effective_chunk = min(chunk_size, total_tokens)
     if total_tokens % effective_chunk != 0:
-        effective_chunk = math.gcd(total_tokens, chunk_size)
+        effective_chunk = math.gcd(total_tokens, effective_chunk)
         if effective_chunk == 1 and total_tokens <= 4096:
             effective_chunk = total_tokens
 
@@ -584,8 +713,8 @@ def chunked_cross_entropy_loss(
     h_chunks = h_flat.reshape(num_chunks, effective_chunk, d_model)
     t_chunks = t_flat.reshape(num_chunks, effective_chunk)
     m_chunks = m_flat.reshape(num_chunks, effective_chunk)
-    scan_fn = _scan_chunked_ce_vd if weight_is_vd else _scan_chunked_ce
-    return scan_fn(h_chunks, lm_head_weight, t_chunks, m_chunks, denom)
+    fused_fn = _fused_chunked_ce_vd if weight_is_vd else _fused_chunked_ce
+    return fused_fn(h_chunks, lm_head_weight, t_chunks, m_chunks, denom)
 
 
 def forward_model(
@@ -617,33 +746,52 @@ def forward_model(
     return total_loss, aux
 
 
-def expand_checkpoint_1_to_8_loops(
+def expand_checkpoint_1_to_n_loops(
     params: dict[str, Any],
     key: jax.Array,
     noise_std: float = 1e-3,
 ) -> dict[str, Any]:
-    """Expand a Phase-1 (R=1) trained checkpoint to Phase-2 (R=8) preserving step-0 logits."""
+    """Expand a Phase-1 (R=1) trained checkpoint to Phase-2 (R=N) preserving step-0 logits."""
     new_params = jax.tree_util.tree_map(lambda x: x, params)
     adaln = dict(new_params["iter_adaln"])
+    k_emb, k_router = jax.random.split(key, 2)
 
     loop_emb = adaln["loop_emb"]
     max_loops = loop_emb.shape[0]
     base_emb = loop_emb[0:1]
-    noise = jax.random.normal(key, (max_loops - 1, loop_emb.shape[1]), dtype=loop_emb.dtype) * noise_std
+    noise = jax.random.normal(k_emb, (max_loops - 1, loop_emb.shape[1]), dtype=loop_emb.dtype) * noise_std
     expanded_emb = jnp.concatenate([base_emb, jnp.repeat(base_emb, max_loops - 1, axis=0) + noise], axis=0)
     adaln["loop_emb"] = expanded_emb
 
-    # Force t=0 active (preserving Phase 1 value) and t=1..7 exact zero for step-0 identity
+    # Force t=0 active (preserving Phase 1 value) and t=1..max_loops-1 exact zero for step-0 identity
     loop_alpha = jnp.zeros_like(adaln["loop_alpha"]).at[0].set(adaln["loop_alpha"][0])
     adaln["loop_alpha"] = loop_alpha
     new_params["iter_adaln"] = adaln
 
-    # Broadcast learned Phase-1 router bias to all loop steps as warm start
+    # Warm-start untied per-loop MLA parameters from trained loop 0
+    if new_params["mla"]["w_dq"].ndim == 3:
+        new_params["mla"] = jax.tree_util.tree_map(
+            lambda a: jnp.repeat(a[0:1], a.shape[0], axis=0), new_params["mla"]
+        )
+
+    # Broadcast learned Phase-1 router bias and warm-start untied per-loop routers
     moe = dict(new_params["moe"])
     base_bias = moe["router_bias"][0:1]
     moe["router_bias"] = jnp.repeat(base_bias, max_loops, axis=0)
+    if moe["router_w"].ndim == 3:
+        base_rw = moe["router_w"][0:1]
+        rw_noise = (
+            jax.random.normal(k_router, (max_loops - 1, *base_rw.shape[1:]), dtype=base_rw.dtype)
+            * noise_std
+        )
+        moe["router_w"] = jnp.concatenate(
+            [base_rw, jnp.repeat(base_rw, max_loops - 1, axis=0) + rw_noise], axis=0
+        )
     new_params["moe"] = moe
     return new_params
+
+
+expand_checkpoint_1_to_8_loops = expand_checkpoint_1_to_n_loops
 
 
 def summarize_model(cfg: LoopMoEConfig) -> str:

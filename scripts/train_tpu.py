@@ -52,7 +52,7 @@ class SyntheticBatchPrefetcher:
         self.rng = np.random.default_rng(seed)
 
     def next_batch(self) -> tuple[np.ndarray, np.ndarray]:
-        x = self.rng.integers(64, self.vocab_size, size=(self.micro_bs, self.seq_len), dtype=np.int32)
+        x = self.rng.integers(64, self.vocab_size, size=(self.micro_bs, self.seq_len), dtype=np.uint16)
         y = np.roll(x, -1, axis=1)
         return x, y
 
@@ -81,7 +81,7 @@ def maybe_tokamax_autotune(
             jax.value_and_grad(lambda p, x, y: forward_model(p, x, y, cfg), has_aux=True)
         )
         t0 = time.perf_counter()
-        res = autotune_fn(fwd_bwd, params, x_mb, y_mb)
+        res = autotune_fn(fwd_bwd, params, x_mb.astype(jnp.int32), y_mb.astype(jnp.int32))
         dt = time.perf_counter() - t0
         del fwd_bwd
         gc.collect()
@@ -125,14 +125,17 @@ def make_train_step(
             jnp.asarray(0.0, dtype=jnp.float32),
             jnp.asarray(0.0, dtype=jnp.float32),
             jnp.asarray(0.0, dtype=jnp.float32),
+            jnp.asarray(0.0, dtype=jnp.float32),
             init_counts,
         )
 
         inv_g = 1.0 / float(grad_accum_steps)
 
         def accum_body(carry, microbatch):
-            g_acc, loss_acc, ce_acc, gate_acc, cnt_acc = carry
+            g_acc, loss_acc, ce_acc, gate_acc, mmr_acc, cnt_acc = carry
             x_mb, y_mb = microbatch
+            x_mb = x_mb.astype(jnp.int32)
+            y_mb = y_mb.astype(jnp.int32)
             with jax.named_scope("fwd_bwd_microbatch"):
                 (loss, aux), grads = grad_fn(params, x_mb, y_mb)
             g_acc = jax.tree_util.tree_map(lambda a, g: a + g, g_acc, grads)
@@ -141,11 +144,12 @@ def make_train_step(
                 loss_acc + loss * inv_g,
                 ce_acc + aux["ce_loss"] * inv_g,
                 gate_acc + aux["engram_gate_mean"] * inv_g,
+                mmr_acc + aux["router_mmr"] * inv_g,
                 cnt_acc + aux["expert_counts"] * inv_g,
             ), None
 
         with jax.named_scope("grad_accum_scan"):
-            (grads_sum, loss_mean, ce_mean, gate_mean, counts_mean), _ = jax.lax.scan(
+            (grads_sum, loss_mean, ce_mean, gate_mean, mmr_mean, counts_mean), _ = jax.lax.scan(
                 accum_body, init_carry, (batch_xs, batch_ys)
             )
         grads_mean = jax.tree_util.tree_map(
@@ -173,6 +177,7 @@ def make_train_step(
             "loss": loss_mean,
             "ce_loss": ce_mean,
             "engram_gate": gate_mean,
+            "router_mmr": mmr_mean,
             "expert_cv": expert_cv,
             "loop_alpha_1": jnp.mean(jnp.abs(new_params["iter_adaln"]["loop_alpha"][1:]))
             if model_cfg.num_loops > 1
@@ -221,6 +226,7 @@ def _build_loader(
             tokenizer=tokenizer,
             hf_token=args.hf_token,
             seed=args.seed,
+            queue_size=32,
             microbatch_tokens=microbatch_tokens,
         )
     return ShardBatchPrefetcher(
@@ -229,6 +235,7 @@ def _build_loader(
         hf_dataset_repo=args.hf_dataset_repo,
         hf_token=args.hf_token,
         seed=args.seed,
+        queue_size=32,
         microbatch_tokens=microbatch_tokens,
     )
 
@@ -309,12 +316,7 @@ def main() -> None:
         cfg_overrides["chunk_ce_size"] = int(spec["default_chunk_ce_size"])
     if args.remat_sublayers:
         cfg_overrides["remat_sublayers"] = True
-    eff_mb = args.microbatch or (2 if args.tiny else int(spec["default_microbatch"]))
-    remat_moe = (
-        (args.tpu_preset == "v5e-1" and eff_mb >= 8 and not args.tiny)
-        if args.remat_moe is None
-        else args.remat_moe
-    )
+    remat_moe = False if args.remat_moe is None else args.remat_moe
     if remat_moe:
         cfg_overrides["remat_moe"] = True
     if args.chunk_ce_size is not None:
@@ -490,6 +492,7 @@ def main() -> None:
                             f"[S{stage.stage_id} step {step + 1}/{total_steps}]{tag} "
                             f"loss={float(metrics['loss']):.4f} ce={float(metrics['ce_loss']):.4f} "
                             f"eng_g={float(metrics['engram_gate']):.3f} exp_cv={float(metrics['expert_cv']):.3f} "
+                            f"mmr={float(metrics['router_mmr']):.2f} "
                             f"| {tok_per_sec:,.0f} tok/s | MFU={mfu:.1f}% | total_tok={tokens_seen/1e9:.3f}B"
                         )
                         t_log = time.perf_counter()
@@ -510,8 +513,9 @@ def main() -> None:
                             hf_token=args.hf_token,
                             keep_last_k=args.keep_last_k,
                             async_upload=True,
+                            async_write=True,
                         )
-                        print(f"[Checkpoint] Saved {ckpt_dir}")
+                        print(f"[Checkpoint] Queued async save {ckpt_dir}")
         finally:
             if profiling_active:
                 jax.profiler.stop_trace()

@@ -20,8 +20,10 @@ from loopmoe.config import (
     SPECIAL_TOKEN_IDS,
     LoopMoEConfig,
     count_analytic_params,
+    estimate_step_flops,
     is_prime,
 )
+from loopmoe.engram import _causal_depthwise_conv1d
 from loopmoe.mhc import (
     init_mhc_sublayer_params,
     mhc_compute_gates,
@@ -31,6 +33,8 @@ from loopmoe.mhc import (
 )
 from loopmoe.mla import quantize_kv_fp4_e2m1
 from loopmoe.model import (
+    _fused_chunked_ce,
+    _fused_chunked_ce_vd,
     _saved_logits_ce,
     _saved_logits_ce_vd,
     chunked_cross_entropy_loss,
@@ -40,7 +44,13 @@ from loopmoe.model import (
     forward_model,
     init_model_params,
 )
-from loopmoe.moe import _moe_combine, _moe_dispatch, _permute_1d, update_router_biases
+from loopmoe.moe import (
+    _moe_combine,
+    _moe_dispatch,
+    _permute_1d,
+    _sorted_weights_from_sort,
+    update_router_biases,
+)
 from loopmoe.optim import (
     OptimConfig,
     classify_param,
@@ -54,10 +64,25 @@ from train_tokenizer import benchmark_tokenizer, build_bpe_tokenizer, save_hf_to
 def test_full_1b_analytic_params_and_tiny_exact_match() -> None:
     cfg = LoopMoEConfig()
     stats = count_analytic_params(cfg)
-    assert 1.10e9 <= stats["total"] <= 1.20e9, f"Expected ~1.15B params, got {stats['total']}"
+    assert 1.10e9 <= stats["total"] <= 1.25e9, f"Expected ~1.17B params, got {stats['total']}"
     assert 0.20 <= stats["engram_sparse_ratio"] <= 0.25, stats["engram_sparse_ratio"]
     assert all(is_prime(p) for p in cfg.engram_table_sizes)
     assert len(set(cfg.engram_table_sizes)) == len(cfg.engram_table_sizes)
+    assert cfg.vocab_size == 32_768
+    assert cfg.mhc_streams == 2
+    assert cfg.n_routed_experts == 128
+    assert cfg.d_ff_expert == 1024
+    assert cfg.d_ff_shared == 1024
+    assert cfg.top_k == 5
+    assert cfg.seq_aux_loss_weight == 0.0
+    assert cfg.engram_pre_loop_only is True
+    assert cfg.untie_mla_per_loop is True
+    assert cfg.untie_router_per_loop is True
+    assert cfg.use_post_moe_rmsnorm is True
+    assert cfg.embed_reinject_lambda == 0.5
+
+    tied_cfg = LoopMoEConfig(untie_mla_per_loop=False)
+    assert estimate_step_flops(cfg, 2, 4096) == estimate_step_flops(tied_cfg, 2, 4096)
 
     # Verify curriculum token sum == 21B (20B R=1 + 1B R=8) and all stages use L3
     assert sum(s.target_tokens for s in DEFAULT_CURRICULUM if s.num_loops == 1) == 20_000_000_000
@@ -83,10 +108,27 @@ def test_full_1b_analytic_params_and_tiny_exact_match() -> None:
         assert en_s.code_ratio == 0.10
         assert en_s.math_ratio == 0.10
 
-    # Verify analytic count matches actual initialized pytree leaf count to the exact parameter
+    # Verify analytic count matches actual initialized pytree leaf count across mHC, Engram & untied modes
     tiny_cfg = LoopMoEConfig.tiny()
     tiny_params = init_model_params(jax.random.PRNGKey(0), tiny_cfg)
     assert count_analytic_params(tiny_cfg)["total"] == count_tree_params(tiny_params)
+
+    tiny_4s = LoopMoEConfig(**{**tiny_cfg.to_dict(), "mhc_streams": 4, "engram_pre_loop_only": False})
+    assert count_analytic_params(tiny_4s)["total"] == count_tree_params(
+        init_model_params(jax.random.PRNGKey(1), tiny_4s)
+    )
+
+    tiny_tied = LoopMoEConfig(
+        **{
+            **tiny_cfg.to_dict(),
+            "untie_mla_per_loop": False,
+            "untie_router_per_loop": False,
+            "use_post_moe_rmsnorm": False,
+        }
+    )
+    assert count_analytic_params(tiny_tied)["total"] == count_tree_params(
+        init_model_params(jax.random.PRNGKey(2), tiny_tied)
+    )
 
 
 def test_forward_and_backward_r1_r8_and_csa2() -> None:
@@ -117,6 +159,7 @@ def test_forward_and_backward_r1_r8_and_csa2() -> None:
 
         (loss, aux), grads = jax.jit(jax.value_and_grad(loss_fn, has_aux=True))(params)
         assert jnp.isfinite(loss)
+        assert jnp.isfinite(aux["router_mmr"]) and float(aux["router_mmr"]) >= 1.0
         assert aux["expert_counts"].shape == (num_loops, cfg.n_routed_experts)
         assert float(jnp.sum(aux["expert_counts"][0])) == float(2 * 32 * cfg.top_k)
 
@@ -126,6 +169,8 @@ def test_forward_and_backward_r1_r8_and_csa2() -> None:
         assert float(jnp.max(jnp.abs(grads["moe"]["router_bias"]))) == 0.0
         assert float(jnp.linalg.norm(grads["mla"]["w_dq"])) > 0.0
         assert float(jnp.linalg.norm(grads["moe"]["w_gate_up"])) > 0.0
+        assert float(jnp.linalg.norm(grads["moe"]["post_norm_w"])) > 0.0
+        assert float(jnp.linalg.norm(grads["moe"]["router_w"])) > 0.0
         assert float(jnp.linalg.norm(grads["engram"]["tables"])) > 0.0
 
 
@@ -151,7 +196,7 @@ def test_r1_to_r8_smooth_expansion_preserves_logits_and_learns() -> None:
     # Simulate trained non-trivial mHC/IterAdaLN/router_bias weights in Phase 1
     mhc_attn = dict(params_r1["mhc"]["attn"])
     mhc_attn["alpha_res"] = jnp.asarray(0.5, dtype=jnp.float32)
-    mhc_attn["b_res"] = jax.random.normal(jax.random.PRNGKey(100), (4, 4), dtype=jnp.float32)
+    mhc_attn["b_res"] = jax.random.normal(jax.random.PRNGKey(100), mhc_attn["b_res"].shape, dtype=jnp.float32)
     params_r1["mhc"] = {**params_r1["mhc"], "attn": mhc_attn}
     params_r1["moe"] = {
         **params_r1["moe"],
@@ -163,6 +208,11 @@ def test_r1_to_r8_smooth_expansion_preserves_logits_and_learns() -> None:
 
     logits_r1, _ = jax.jit(lambda p: forward_logits(p, x, cfg_r1))(params_r1)
     params_r8 = expand_checkpoint_1_to_8_loops(params_r1, jax.random.PRNGKey(103))
+    assert params_r8["mla"]["w_dq"].shape[0] == 8
+    np.testing.assert_allclose(
+        np.asarray(params_r8["mla"]["w_dq"][0], dtype=np.float32),
+        np.asarray(params_r8["mla"]["w_dq"][7], dtype=np.float32),
+    )
     logits_r8, _ = jax.jit(lambda p: forward_logits(p, x, cfg_r8))(params_r8)
 
     # In bfloat16, unrolled R=1 scan vs R=8 while-loop differs by at most 1 BF16 ULP (~0.0039)
@@ -180,10 +230,11 @@ def test_r1_to_r8_smooth_expansion_preserves_logits_and_learns() -> None:
     l8_f32, _ = jax.jit(lambda p: forward_logits(p, x, cfg_r8_f32))(p8_f32)
     assert float(jnp.max(jnp.abs(l1_f32 - l8_f32))) < 1e-5
 
-    # Verify newly added loop gates t=1..7 immediately receive non-zero gradient
+    # Verify newly added loop gates t=1..7 immediately receive non-zero gradient (including re-injection gate 0)
     _, grads = jax.jit(jax.value_and_grad(lambda p: forward_model(p, x, y, cfg_r8)[0]))(params_r8)
     alpha_grads_new = grads["iter_adaln"]["loop_alpha"][1:]
     assert float(jnp.max(jnp.abs(alpha_grads_new))) > 0.0
+    assert float(jnp.max(jnp.abs(alpha_grads_new[:, 0]))) > 0.0
 
 
 def test_muon_adamw_optimizer_per_expert_and_no_decay() -> None:
@@ -196,48 +247,58 @@ def test_muon_adamw_optimizer_per_expert_and_no_decay() -> None:
     np.testing.assert_allclose(float(sched(50_000)), 0.015, rtol=1e-6)
     np.testing.assert_allclose(float(sched(1_000_000)), 0.015, rtol=1e-6)
 
-    # 2. Per-expert 3D vmap Newton-Schulz orthogonalization check
+    # 2. Per-expert 3D vmap Newton-Schulz orthogonalization check (Cubic5 default + Quintic)
     g_3d = jax.random.normal(jax.random.PRNGKey(5), (4, 16, 32), dtype=jnp.float32)
-    ortho_3d = per_expert_newton_schulz(g_3d, ns_steps=5)
-    assert ortho_3d.shape == g_3d.shape
-    for e in range(4):
-        gram = ortho_3d[e] @ ortho_3d[e].T
-        # Off-diagonal entries should be much smaller than diagonal after NS orthogonalization
-        diag = jnp.diag(gram)
-        off_diag = gram - jnp.diag(diag)
-        assert float(jnp.mean(jnp.abs(off_diag))) < 0.25 * float(jnp.mean(diag))
+    for mode in ("cubic5", "quintic"):
+        ortho_3d = per_expert_newton_schulz(g_3d, ns_steps=5, mode=mode)
+        assert ortho_3d.shape == g_3d.shape
+        for e in range(4):
+            gram = ortho_3d[e] @ ortho_3d[e].T
+            # Off-diagonal entries should be much smaller than diagonal after NS orthogonalization
+            diag = jnp.diag(gram)
+            off_diag = gram - jnp.diag(diag)
+            assert float(jnp.mean(jnp.abs(off_diag))) < 0.25 * float(jnp.mean(diag))
+            if mode == "cubic5":
+                sv = np.linalg.svd(np.asarray(ortho_3d[e]), compute_uv=False)
+                assert float(sv.min()) >= 0.70 and float(sv.max()) <= 1.35, f"Cubic5 SV out of band: {sv}"
 
-    # 3. Full optimizer init + update + router_bias protection
+    # 3. Full optimizer init + update + router_bias protection (Cubic5 default + Quintic fallback)
     cfg = LoopMoEConfig.tiny(num_loops=8)
     params = init_model_params(jax.random.PRNGKey(6), cfg)
     params = expand_checkpoint_1_to_8_loops(params, jax.random.PRNGKey(7))
-    opt_cfg = OptimConfig(warmup_steps=10)
-    optimizer = create_muon_adamw_optimizer(opt_cfg)
-    opt_state = optimizer.init(params)
+    x = jax.random.randint(jax.random.PRNGKey(8), (2, 16), 0, 512, dtype=jnp.int32)
+    y = jax.random.randint(jax.random.PRNGKey(9), (2, 16), 0, 512, dtype=jnp.int32)
 
     assert classify_param("moe/w_gate_up", params["moe"]["w_gate_up"]) == "muon"
     assert classify_param("mla/w_dq", params["mla"]["w_dq"]) == "muon"
+    assert classify_param("mla/q_norm_w", params["mla"]["q_norm_w"]) == "adam_no_decay"
+    assert classify_param("mla/kv_norm_w", params["mla"]["kv_norm_w"]) == "adam_no_decay"
+    assert classify_param("moe/router_w", params["moe"]["router_w"]) == "adam_decay"
+    assert classify_param("moe/post_norm_w", params["moe"]["post_norm_w"]) == "adam_no_decay"
     assert classify_param("embed_tokens", params["embed_tokens"]) == "adam_decay"
     assert classify_param("iter_adaln/loop_alpha", params["iter_adaln"]["loop_alpha"]) == "adam_no_decay"
     assert classify_param("moe/router_bias", params["moe"]["router_bias"]) == "frozen"
 
-    x = jax.random.randint(jax.random.PRNGKey(8), (2, 16), 0, 512, dtype=jnp.int32)
-    y = jax.random.randint(jax.random.PRNGKey(9), (2, 16), 0, 512, dtype=jnp.int32)
+    for mode, steps in (("cubic5", 5), ("quintic", 3)):
+        opt_cfg = OptimConfig(warmup_steps=10, muon_ns_mode=mode, muon_ns_steps=steps)
+        optimizer = create_muon_adamw_optimizer(opt_cfg)
+        opt_state = optimizer.init(params)
 
-    @jax.jit
-    def one_step(p, s):
-        (_, aux), grads = jax.value_and_grad(lambda pp: forward_model(pp, x, y, cfg), has_aux=True)(p)
-        updates, next_s = optimizer.update(grads, s, p)
-        next_p = optax.apply_updates(p, updates)
-        return updates, next_p, next_s, aux
+        @jax.jit
+        def one_step(p, s, opt=optimizer):
+            (_, aux), grads = jax.value_and_grad(lambda pp: forward_model(pp, x, y, cfg), has_aux=True)(p)
+            updates, next_s = opt.update(grads, s, p)
+            next_p = optax.apply_updates(p, updates)
+            return updates, next_p, next_s, aux
 
-    updates, new_params, new_opt_state, aux = one_step(params, opt_state)
+        updates, new_params, new_opt_state, aux = one_step(params, opt_state)
 
-    assert float(jnp.max(jnp.abs(updates["moe"]["router_bias"]))) == 0.0
-    assert float(jnp.linalg.norm(updates["moe"]["w_gate_up"])) > 0.0
-    assert float(jnp.linalg.norm(updates["mla"]["w_dq"])) > 0.0
-    assert float(jnp.linalg.norm(updates["embed_tokens"])) > 0.0
-    assert new_opt_state is not None
+        assert float(jnp.max(jnp.abs(updates["moe"]["router_bias"]))) == 0.0
+        assert float(jnp.linalg.norm(updates["moe"]["w_gate_up"])) > 0.0
+        assert float(jnp.linalg.norm(updates["moe"]["w_down"])) > 0.0
+        assert float(jnp.linalg.norm(updates["mla"]["w_dq"])) > 0.0
+        assert float(jnp.linalg.norm(updates["embed_tokens"])) > 0.0
+        assert new_opt_state is not None
 
     # 4. Aux-Loss-Free bias update direction
     counts = jnp.zeros((8, cfg.n_routed_experts), dtype=jnp.float32).at[0, 0].set(100.0)
@@ -296,6 +357,41 @@ def test_chunked_cross_entropy_equivalence() -> None:
     np.testing.assert_allclose(float(sv_vd_loss), float(dense_loss), atol=1e-4)
     np.testing.assert_allclose(np.asarray(sv_vd_dh, dtype=np.float32), np.asarray(dense_dh, dtype=np.float32), atol=5e-3)
     np.testing.assert_allclose(np.asarray(sv_vd_dw.T, dtype=np.float32), np.asarray(dense_dw, dtype=np.float32), atol=5e-3)
+
+    # Verify single-pass fused CE (_fused_chunked_ce and _fused_chunked_ce_vd) including non-unit cotangent scaling
+    scale = 2.5
+    h_chunks = hidden.reshape(2, 16, 64)
+    t_chunks = targets.reshape(2, 16)
+    m_chunks = mask.reshape(2, 16)
+    fu_loss, (fu_dh, fu_dw) = jax.value_and_grad(
+        lambda h, w: scale * _fused_chunked_ce(h, w, t_chunks, m_chunks, denom), argnums=(0, 1)
+    )(h_chunks, lm_w)
+    np.testing.assert_allclose(float(fu_loss), scale * float(dense_loss), atol=1e-4)
+    np.testing.assert_allclose(
+        np.asarray(fu_dh.reshape(2, 16, 64), dtype=np.float32),
+        scale * np.asarray(dense_dh, dtype=np.float32),
+        atol=1.5e-2,
+    )
+    np.testing.assert_allclose(
+        np.asarray(fu_dw, dtype=np.float32),
+        scale * np.asarray(dense_dw, dtype=np.float32),
+        atol=1.5e-2,
+    )
+
+    fu_vd_loss, (fu_vd_dh, fu_vd_dw) = jax.value_and_grad(
+        lambda h, w_vd: scale * _fused_chunked_ce_vd(h, w_vd, t_chunks, m_chunks, denom), argnums=(0, 1)
+    )(h_chunks, lm_w_vd)
+    np.testing.assert_allclose(float(fu_vd_loss), scale * float(dense_loss), atol=1e-4)
+    np.testing.assert_allclose(
+        np.asarray(fu_vd_dh.reshape(2, 16, 64), dtype=np.float32),
+        scale * np.asarray(dense_dh, dtype=np.float32),
+        atol=1.5e-2,
+    )
+    np.testing.assert_allclose(
+        np.asarray(fu_vd_dw.T, dtype=np.float32),
+        scale * np.asarray(dense_dw, dtype=np.float32),
+        atol=1.5e-2,
+    )
 
 
 def test_checkpoint_roundtrip_and_fp4_kv(tmp_path: Path) -> None:
@@ -524,7 +620,7 @@ def test_mhc_compute_gates_and_moe_dispatch_combine_equivalence() -> None:
         gd_ref = jax.grad(lambda d_: jnp.mean(jnp.zeros((num_tokens, d_model), dtype=dtype).at[token_indices].add(d_).astype(jnp.float32) * cot_comb))(down_out)
         np.testing.assert_allclose(np.asarray(gd_fast, dtype=np.float32), np.asarray(gd_ref, dtype=np.float32), atol=tol, rtol=tol)
 
-        # Verify _permute_1d forward & gradient equivalence
+        # Verify _permute_1d and _sorted_weights_from_sort forward & gradient equivalence
         w_1d = jax.random.normal(k2, (num_tokens * top_k,), dtype=dtype)
         cot_1d = jax.random.normal(k3, (num_tokens * top_k,), dtype=jnp.float32)
         p_fast = _permute_1d(w_1d, sort_order, inv_order)
@@ -533,3 +629,124 @@ def test_mhc_compute_gates_and_moe_dispatch_combine_equivalence() -> None:
         gp_fast = jax.grad(lambda w_: jnp.mean(_permute_1d(w_, sort_order, inv_order).astype(jnp.float32) * cot_1d))(w_1d)
         gp_ref = jax.grad(lambda w_: jnp.mean(w_[sort_order].astype(jnp.float32) * cot_1d))(w_1d)
         np.testing.assert_allclose(np.asarray(gp_fast, dtype=np.float32), np.asarray(gp_ref, dtype=np.float32), atol=tol, rtol=tol)
+
+        _, _, sw_f32 = jax.lax.sort(
+            (flat_experts, jnp.arange(flat_experts.shape[0], dtype=jnp.int32), w_1d.astype(jnp.float32)),
+            num_keys=1,
+        )
+        sw_fast = _sorted_weights_from_sort(w_1d, sw_f32, inv_order)
+        np.testing.assert_allclose(np.asarray(sw_fast, dtype=np.float32), np.asarray(p_ref, dtype=np.float32), atol=tol)
+        gsw_fast = jax.grad(lambda w_: jnp.mean(_sorted_weights_from_sort(w_, sw_f32, inv_order).astype(jnp.float32) * cot_1d))(w_1d)
+        np.testing.assert_allclose(np.asarray(gsw_fast, dtype=np.float32), np.asarray(gp_ref, dtype=np.float32), atol=tol, rtol=tol)
+
+
+def test_2stream_closed_form_mhc_and_engram_conv() -> None:
+    def _ref_mhc2_gates(p, x_streams, eps=1e-6):
+        dt = x_streams.dtype
+        bsz, seq_len, _, d_model = x_streams.shape
+        x_flat = x_streams.reshape(bsz, seq_len, 2 * d_model)
+        x_norm = rms_norm(x_flat, p["norm_w"], eps=eps)
+        all_dyn = (x_norm @ p["phi_all"]).astype(jnp.float32)
+        h_pre = jax.nn.sigmoid(p["alpha_pre"] * all_dyn[..., :2] + p["b_pre"])
+        h_pre = (h_pre / (jnp.sum(h_pre, axis=-1, keepdims=True) + eps)).astype(dt)
+        h_post = (2.0 * jax.nn.sigmoid(p["alpha_post"] * all_dyn[..., 2:4] + p["b_post"])).astype(dt)
+        pv = jax.nn.sigmoid(p["alpha_res"] * all_dyn[..., 4:5] + p["b_res"]).astype(dt)
+        qv = jnp.asarray(1.0, dtype=dt) - pv
+        h_res = jnp.stack(
+            [jnp.concatenate([pv, qv], axis=-1), jnp.concatenate([qv, pv], axis=-1)],
+            axis=-2,
+        )
+        h_in = jnp.sum(h_pre[:, :, :, None] * x_streams, axis=2)
+        return h_in, h_pre, h_post, h_res
+
+    k1, k2, k3, k4 = jax.random.split(jax.random.PRNGKey(505), 4)
+    for dtype, tol in ((jnp.float32, 1e-5), (jnp.bfloat16, 2e-2)):
+        p2 = init_mhc_sublayer_params(k1, d_model=32, n_streams=2, dtype=dtype)
+        p2["norm_w"] = (1.0 + 0.1 * jax.random.normal(k2, p2["norm_w"].shape, dtype=dtype)).astype(dtype)
+        p2["alpha_res"] = jnp.asarray(0.4, dtype=jnp.float32)
+        p2["b_res"] = jnp.asarray([0.3], dtype=jnp.float32)
+        xs = jax.random.normal(k3, (2, 6, 2, 32), dtype=dtype)
+
+        hi, hp, hpo, hr = mhc_compute_gates(p2, xs, sinkhorn_iters=10, eps=1e-6)
+        assert hr.shape == (2, 6, 2, 2)
+        np.testing.assert_allclose(np.asarray(jnp.sum(hr, axis=-1), dtype=np.float32), 1.0, atol=tol)
+        np.testing.assert_allclose(np.asarray(jnp.sum(hr, axis=-2), dtype=np.float32), 1.0, atol=tol)
+
+        outs_ref = _ref_mhc2_gates(p2, xs, eps=1e-6)
+        for a, b in zip((hi, hp, hpo, hr), outs_ref, strict=True):
+            np.testing.assert_allclose(np.asarray(a, dtype=np.float32), np.asarray(b, dtype=np.float32), atol=tol, rtol=tol)
+
+        sub = jax.random.normal(k4, (2, 6, 32), dtype=dtype)
+        out_zero = mhc_post_merge(xs, sub, hpo, hr, loop_gate=0.0)
+        np.testing.assert_allclose(np.asarray(out_zero, dtype=np.float32), np.asarray(xs, dtype=np.float32), atol=1e-6)
+
+        cot = jax.random.normal(k2, (2, 6, 2, 32), dtype=jnp.float32)
+        lg = jnp.asarray(0.42, dtype=dtype)
+        g_fast = jax.grad(
+            lambda x_in, s_in, hp_in, hr_in: jnp.mean(
+                mhc_post_merge(x_in, s_in, hp_in, hr_in, loop_gate=lg).astype(jnp.float32) * cot
+            ),
+            argnums=(0, 1, 2, 3),
+        )(xs, sub, hpo, hr)
+        g_ref = jax.grad(
+            lambda x_in, s_in, hp_in, hr_in: jnp.mean(
+                (
+                    (1.0 - lg) * x_in
+                    + lg * (jnp.einsum("bsij,bsjd->bsid", hr_in, x_in) + hp_in[..., None] * s_in[:, :, None, :])
+                ).astype(jnp.float32)
+                * cot
+            ),
+            argnums=(0, 1, 2, 3),
+        )(xs, sub, hpo, hr)
+        for gf, gr in zip(g_fast, g_ref, strict=True):
+            np.testing.assert_allclose(np.asarray(gf, dtype=np.float32), np.asarray(gr, dtype=np.float32), atol=tol, rtol=tol)
+
+    # Verify causal depthwise conv1d equivalence vs explicit dilated loop (including seq_len < pad_len)
+    def _ref_causal_conv(x_in, w_in, b_in, dilation):
+        k_sz = w_in.shape[0]
+        pad_len = (k_sz - 1) * dilation
+        s_len = x_in.shape[1]
+        padded = jnp.pad(x_in, ((0, 0), (pad_len, 0), (0, 0)))
+        acc = jnp.zeros_like(x_in)
+        for k in range(k_sz):
+            start = pad_len - k * dilation
+            acc = acc + padded[:, start : start + s_len, :] * w_in[k][None, None, :].astype(x_in.dtype)
+        return jax.nn.silu(acc + b_in[None, None, :].astype(x_in.dtype))
+
+    for seq_len, dilation in ((16, 3), (5, 3), (8, 1)):
+        xc = jax.random.normal(k1, (2, seq_len, 16), dtype=jnp.bfloat16)
+        wc = jax.random.normal(k2, (4, 16), dtype=jnp.bfloat16)
+        bc = jax.random.normal(k3, (16,), dtype=jnp.bfloat16)
+        yc = _causal_depthwise_conv1d(xc, wc, bc, dilation=dilation)
+        yr = _ref_causal_conv(xc, wc, bc, dilation=dilation)
+        np.testing.assert_allclose(np.asarray(yc, dtype=np.float32), np.asarray(yr, dtype=np.float32), atol=2e-2, rtol=2e-2)
+
+
+def test_async_checkpoint_write_and_inloop_engram(tmp_path: Path) -> None:
+    cfg = LoopMoEConfig(**{**LoopMoEConfig.tiny(num_loops=2).to_dict(), "engram_pre_loop_only": False})
+    params = init_model_params(jax.random.PRNGKey(31), cfg)
+    opt_cfg = OptimConfig(warmup_steps=10)
+    opt = create_muon_adamw_optimizer(opt_cfg)
+    opt_state = opt.init(params)
+
+    x = jax.random.randint(jax.random.PRNGKey(32), (2, 16), 0, 512, dtype=jnp.int32)
+    y = jax.random.randint(jax.random.PRNGKey(33), (2, 16), 0, 512, dtype=jnp.int32)
+    (loss, _), grads = jax.jit(jax.value_and_grad(lambda p: forward_model(p, x, y, cfg), has_aux=True))(params)
+    assert jnp.isfinite(loss)
+    assert float(jnp.linalg.norm(grads["engram"]["w_kv"])) > 0.0
+
+    ckpt_dir, write_future = save_checkpoint(
+        ckpt_root=tmp_path,
+        stage_id=1,
+        step=5,
+        tokens_seen=500,
+        params=params,
+        opt_state=opt_state,
+        cfg=cfg,
+        optim_cfg=opt_cfg,
+        async_write=True,
+    )
+    assert write_future is not None
+    write_future.result()
+    loaded = load_latest_checkpoint(tmp_path, params_template=params, opt_state_template=opt_state)
+    assert loaded is not None and loaded[2]["step"] == 5 and ckpt_dir.exists()

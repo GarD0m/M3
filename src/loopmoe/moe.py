@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 
 from .config import LoopMoEConfig
+from .mhc import rms_norm
 
 
 def init_moe_params(
@@ -22,9 +23,11 @@ def init_moe_params(
     e = cfg.n_routed_experts
     df = cfg.d_ff_expert
     ds = cfg.n_shared_experts * cfg.d_ff_shared
+    router_shape = (cfg.max_loops, d, e) if cfg.untie_router_per_loop else (d, e)
 
-    return {
-        "router_w": jax.random.normal(keys[0], (d, e), dtype=dtype) * (1.0 / jnp.sqrt(float(d))),
+    params: dict[str, jax.Array] = {
+        "router_w": jax.random.normal(keys[0], router_shape, dtype=dtype)
+        * (1.0 / jnp.sqrt(float(d))),
         "router_bias": jnp.zeros((cfg.max_loops, e), dtype=jnp.float32),
         "w_gate_up": jax.random.normal(keys[1], (e, d, 2 * df), dtype=dtype)
         * (1.0 / jnp.sqrt(float(d))),
@@ -34,6 +37,9 @@ def init_moe_params(
         "shared_w_down": jax.random.normal(keys[4], (ds, d), dtype=dtype)
         * (1.0 / jnp.sqrt(float(ds))),
     }
+    if cfg.use_post_moe_rmsnorm:
+        params["post_norm_w"] = jnp.ones((d,), dtype=dtype)
+    return params
 
 
 def _grouped_matmul(
@@ -188,23 +194,59 @@ _moe_combine.defvjp(_moe_combine_fwd, _moe_combine_bwd)
 def _permute_1d(arr: jax.Array, order: jax.Array, inv_order: jax.Array) -> jax.Array:
     """Gather 1D tensor by permutation `order`; backward uses inverse permutation (zero scatter-add)."""
     del inv_order
+    if arr.dtype != jnp.float32:
+        return arr.astype(jnp.float32)[order].astype(arr.dtype)
     return arr[order]
 
 
 def _permute_1d_fwd(
     arr: jax.Array, order: jax.Array, inv_order: jax.Array
 ) -> tuple[jax.Array, tuple[jax.Array]]:
-    return arr[order], (inv_order,)
+    out = arr.astype(jnp.float32)[order].astype(arr.dtype) if arr.dtype != jnp.float32 else arr[order]
+    return out, (inv_order,)
 
 
 def _permute_1d_bwd(
     res: tuple[jax.Array], d_out: jax.Array
 ) -> tuple[jax.Array, None, None]:
     (inv_order,) = res
+    if d_out.dtype != jnp.float32:
+        return (d_out.astype(jnp.float32)[inv_order].astype(d_out.dtype), None, None)
     return (d_out[inv_order], None, None)
 
 
 _permute_1d.defvjp(_permute_1d_fwd, _permute_1d_bwd)
+
+
+@jax.custom_vjp
+def _sorted_weights_from_sort(
+    topk_weights_flat: jax.Array,
+    sorted_weights_f32: jax.Array,
+    inv_order: jax.Array,
+) -> jax.Array:
+    """Return pre-sorted routing weights in forward (zero 1D gather) and un-permute grads in backward."""
+    del inv_order
+    return sorted_weights_f32.astype(topk_weights_flat.dtype)
+
+
+def _sorted_weights_from_sort_fwd(
+    topk_weights_flat: jax.Array,
+    sorted_weights_f32: jax.Array,
+    inv_order: jax.Array,
+) -> tuple[jax.Array, tuple[jax.Array]]:
+    return sorted_weights_f32.astype(topk_weights_flat.dtype), (inv_order,)
+
+
+def _sorted_weights_from_sort_bwd(
+    res: tuple[jax.Array], d_sorted: jax.Array
+) -> tuple[jax.Array, None, None]:
+    (inv_order,) = res
+    # Cast to FP32 before 1D gather to avoid TPU packed-BF16 sublane gather penalty
+    d_unsorted = d_sorted.astype(jnp.float32)[inv_order].astype(d_sorted.dtype)
+    return (d_unsorted, None, None)
+
+
+_sorted_weights_from_sort.defvjp(_sorted_weights_from_sort_fwd, _sorted_weights_from_sort_bwd)
 
 
 def apply_moe(
@@ -212,13 +254,14 @@ def apply_moe(
     x: jax.Array,
     loop_idx: jax.Array | int,
     cfg: LoopMoEConfig,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Run DeepSeek-V4.1-Flash fine-grained MoE for one loop iteration.
 
     Returns:
         out: [B, S, D] MoE output tensor.
         expert_counts: [E] token assignment counts (float32) for Aux-Loss-Free bias updates.
         seq_aux_loss: scalar sequence-wise balance regularization loss.
+        router_mmr: scalar Foil Median Margin Ratio diagnostic.
     """
     bsz, seq_len, d_model = x.shape
     num_tokens = bsz * seq_len
@@ -227,7 +270,16 @@ def apply_moe(
 
     # 1. Sigmoid routing + Aux-Loss-Free bias (bias excluded from gradient flow)
     with jax.named_scope("moe_router"):
-        router_logits = x_flat @ params["router_w"].astype(dt)
+        router_w_t = params["router_w"][loop_idx] if params["router_w"].ndim == 3 else params["router_w"]
+        router_logits = x_flat @ router_w_t.astype(dt)
+        # Foil Eq. 11 Median Margin Ratio diagnostic: exp(mean(z_(1) - z_(E/2)))
+        z_sub = jax.lax.stop_gradient(
+            (router_logits[::8] if num_tokens > 4096 else router_logits).astype(jnp.float32)
+        )
+        z_sorted = jnp.sort(z_sub, axis=-1)
+        mid_idx = cfg.n_routed_experts - (cfg.n_routed_experts // 2)
+        router_mmr = jnp.exp(jnp.clip(jnp.mean(z_sorted[:, -1] - z_sorted[:, mid_idx]), -20.0, 20.0))
+
         scores = jax.nn.sigmoid(router_logits)
         bias_t = jax.lax.stop_gradient(params["router_bias"][loop_idx]).astype(dt)
         biased_scores = scores + bias_t[None, :]
@@ -238,22 +290,23 @@ def apply_moe(
             jnp.sum(topk_scores, axis=-1, keepdims=True) + jnp.asarray(1e-6, dtype=dt)
         )
 
-    # 2. Sort token-expert pairs once; reuse sorted_experts for zero-scatter counts and inv_order for combine/bwd
+    # 2. Sort token-expert pairs + routing weights once; reuse sorted_experts for counts and inv_order for combine/bwd
     with jax.named_scope("moe_sort_dispatch"):
         flat_experts = topk_idx.reshape(-1)
-        sorted_experts, sort_order = jax.lax.sort_key_val(
-            flat_experts, jnp.arange(flat_experts.shape[0], dtype=jnp.int32)
+        arange_idx = jnp.arange(flat_experts.shape[0], dtype=jnp.int32)
+        topk_weights_flat = topk_weights.reshape(-1)
+        sorted_experts, sort_order, sorted_weights_f32 = jax.lax.sort(
+            (flat_experts, arange_idx, jax.lax.stop_gradient(topk_weights_flat).astype(jnp.float32)),
+            num_keys=1,
         )
         token_indices = sort_order // cfg.top_k
-        inv_order = jnp.empty_like(sort_order).at[sort_order].set(
-            jnp.arange(sort_order.shape[0], dtype=sort_order.dtype)
-        )
+        inv_order = jnp.empty_like(sort_order).at[sort_order].set(arange_idx)
         edges = jnp.arange(cfg.n_routed_experts + 1, dtype=sorted_experts.dtype)
         expert_counts = jnp.diff(jnp.searchsorted(sorted_experts, edges, side="left")).astype(
             jnp.float32
         )
 
-        sorted_weights = _permute_1d(topk_weights.reshape(-1), sort_order, inv_order)
+        sorted_weights = _sorted_weights_from_sort(topk_weights_flat, sorted_weights_f32, inv_order)
         sorted_x = _moe_dispatch(x_flat, token_indices, inv_order, cfg.top_k)  # [N*K, D]
         group_sizes = expert_counts.astype(jnp.int32)
 
@@ -294,7 +347,9 @@ def apply_moe(
         shared_out = (jax.nn.silu(shared_gate) * shared_up) @ params["shared_w_down"]
 
     total_out = (routed_out + shared_out).reshape(bsz, seq_len, d_model)
-    return total_out, expert_counts, seq_aux_loss
+    if cfg.use_post_moe_rmsnorm:
+        total_out = rms_norm(total_out, params["post_norm_w"], eps=cfg.rms_norm_eps)
+    return total_out, expert_counts, seq_aux_loss, router_mmr
 
 
 def update_router_biases(
