@@ -222,31 +222,69 @@ _permute_1d.defvjp(_permute_1d_fwd, _permute_1d_bwd)
 def _sorted_weights_from_sort(
     topk_weights_flat: jax.Array,
     sorted_weights_f32: jax.Array,
-    inv_order: jax.Array,
+    sort_order: jax.Array,
 ) -> jax.Array:
-    """Return pre-sorted routing weights in forward (zero 1D gather) and un-permute grads in backward."""
-    del inv_order
+    """Return pre-sorted routing weights in forward (zero 1D gather) and un-permute grads via bitonic sort."""
+    del sort_order
     return sorted_weights_f32.astype(topk_weights_flat.dtype)
 
 
 def _sorted_weights_from_sort_fwd(
     topk_weights_flat: jax.Array,
     sorted_weights_f32: jax.Array,
-    inv_order: jax.Array,
+    sort_order: jax.Array,
 ) -> tuple[jax.Array, tuple[jax.Array]]:
-    return sorted_weights_f32.astype(topk_weights_flat.dtype), (inv_order,)
+    return sorted_weights_f32.astype(topk_weights_flat.dtype), (sort_order,)
 
 
 def _sorted_weights_from_sort_bwd(
     res: tuple[jax.Array], d_sorted: jax.Array
 ) -> tuple[jax.Array, None, None]:
-    (inv_order,) = res
-    # Cast to FP32 before 1D gather to avoid TPU packed-BF16 sublane gather penalty
-    d_unsorted = d_sorted.astype(jnp.float32)[inv_order].astype(d_sorted.dtype)
-    return (d_unsorted, None, None)
+    (sort_order,) = res
+    _, d_unsorted_f32 = jax.lax.sort((sort_order, d_sorted.astype(jnp.float32)), num_keys=1)
+    return (d_unsorted_f32.astype(d_sorted.dtype), None, None)
 
 
 _sorted_weights_from_sort.defvjp(_sorted_weights_from_sort_fwd, _sorted_weights_from_sort_bwd)
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(3,))
+def _attach_topk_vjp(
+    scores: jax.Array,
+    topk_scores_val: jax.Array,
+    topk_idx: jax.Array,
+    n_experts: int,
+) -> jax.Array:
+    """Attach clean Top-K VPU scatter backward onto stop-grad `top_k` outputs (avoids packed-BF16 scatter)."""
+    del scores, topk_idx, n_experts
+    return topk_scores_val
+
+
+def _attach_topk_vjp_fwd(
+    scores: jax.Array,
+    topk_scores_val: jax.Array,
+    topk_idx: jax.Array,
+    n_experts: int,
+) -> tuple[jax.Array, tuple[jax.Array]]:
+    del scores, n_experts
+    return topk_scores_val, (topk_idx,)
+
+
+def _attach_topk_vjp_bwd(
+    n_experts: int, res: tuple[jax.Array], d_topk: jax.Array
+) -> tuple[jax.Array, None, None]:
+    (topk_idx,) = res
+    top_k = topk_idx.shape[-1]
+    dt = d_topk.dtype
+    zero = jnp.asarray(0.0, dtype=dt)
+    e_idx = jnp.arange(n_experts, dtype=topk_idx.dtype)[None, :]
+    d_scores = jnp.where(e_idx == topk_idx[:, 0:1], d_topk[:, 0:1], zero)
+    for k in range(1, top_k):
+        d_scores = d_scores + jnp.where(e_idx == topk_idx[:, k : k + 1], d_topk[:, k : k + 1], zero)
+    return (d_scores, None, None)
+
+
+_attach_topk_vjp.defvjp(_attach_topk_vjp_fwd, _attach_topk_vjp_bwd)
 
 
 def apply_moe(
@@ -282,11 +320,12 @@ def apply_moe(
 
         scores = jax.nn.sigmoid(router_logits)
         bias_f32 = jax.lax.stop_gradient(params["router_bias"][loop_idx])
-        biased_scores = scores + bias_f32.astype(dt)[None, :]
+        biased_scores = jax.lax.stop_gradient(scores) + bias_f32.astype(dt)[None, :]
 
         topk_biased, topk_idx = jax.lax.top_k(biased_scores, cfg.top_k)  # [N, K]
         # Gather router_bias in native FP32 before casting to dt to avoid TPU packed-BF16 1D gather penalty
-        topk_scores = topk_biased - bias_f32[topk_idx].astype(dt)
+        topk_scores_val = topk_biased - bias_f32[topk_idx].astype(dt)
+        topk_scores = _attach_topk_vjp(scores, topk_scores_val, topk_idx, cfg.n_routed_experts)
         topk_weights = topk_scores / (
             jnp.sum(topk_scores, axis=-1, keepdims=True) + jnp.asarray(1e-6, dtype=dt)
         )
@@ -301,13 +340,13 @@ def apply_moe(
             num_keys=1,
         )
         token_indices = sort_order // cfg.top_k
-        inv_order = jnp.empty_like(sort_order).at[sort_order].set(arange_idx)
+        _, inv_order = jax.lax.sort((sort_order, arange_idx), num_keys=1)
         edges = jnp.arange(cfg.n_routed_experts + 1, dtype=sorted_experts.dtype)
         expert_counts = jnp.diff(jnp.searchsorted(sorted_experts, edges, side="left")).astype(
             jnp.float32
         )
 
-        sorted_weights = _sorted_weights_from_sort(topk_weights_flat, sorted_weights_f32, inv_order)
+        sorted_weights = _sorted_weights_from_sort(topk_weights_flat, sorted_weights_f32, sort_order)
         sorted_x = _moe_dispatch(x_flat, token_indices, inv_order, cfg.top_k)  # [N*K, D]
         group_sizes = expert_counts.astype(jnp.int32)
 

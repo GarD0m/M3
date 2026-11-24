@@ -46,6 +46,7 @@ from loopmoe.model import (
     init_model_params,
 )
 from loopmoe.moe import (
+    _attach_topk_vjp,
     _moe_combine,
     _moe_dispatch,
     _permute_1d,
@@ -262,6 +263,17 @@ def test_muon_adamw_optimizer_per_expert_and_no_decay() -> None:
             if mode == "cubic5":
                 sv = np.linalg.svd(np.asarray(ortho_3d[e]), compute_uv=False)
                 assert float(sv.min()) >= 0.70 and float(sv.max()) <= 1.35, f"Cubic5 SV out of band: {sv}"
+
+    g_tall = jax.random.normal(jax.random.PRNGKey(15), (4, 32, 16), dtype=jnp.float32)
+    ortho_tall = per_expert_newton_schulz(g_tall, ns_steps=5, mode="cubic5")
+    assert ortho_tall.shape == g_tall.shape
+    for e in range(4):
+        gram_t = ortho_tall[e].T @ ortho_tall[e]
+        diag_t = jnp.diag(gram_t)
+        off_t = gram_t - jnp.diag(diag_t)
+        assert float(jnp.mean(jnp.abs(off_t))) < 0.25 * float(jnp.mean(diag_t))
+        sv_t = np.linalg.svd(np.asarray(ortho_tall[e]), compute_uv=False)
+        assert float(sv_t.min()) >= 0.70 and float(sv_t.max()) <= 1.35, f"Cubic5 tall SV out of band: {sv_t}"
 
     # 3. Full optimizer init + update + router_bias protection (Cubic5 default + Quintic fallback)
     cfg = LoopMoEConfig.tiny(num_loops=8)
@@ -634,14 +646,43 @@ def test_mhc_compute_gates_and_moe_dispatch_combine_equivalence() -> None:
         gp_ref = jax.grad(lambda w_: jnp.mean(w_[sort_order].astype(jnp.float32) * cot_1d))(w_1d)
         np.testing.assert_allclose(np.asarray(gp_fast, dtype=np.float32), np.asarray(gp_ref, dtype=np.float32), atol=tol, rtol=tol)
 
+        _, inv_order_sort = jax.lax.sort(
+            (sort_order, jnp.arange(sort_order.shape[0], dtype=sort_order.dtype)), num_keys=1
+        )
+        np.testing.assert_array_equal(np.asarray(inv_order_sort), np.asarray(inv_order))
+
         _, _, sw_f32 = jax.lax.sort(
             (flat_experts, jnp.arange(flat_experts.shape[0], dtype=jnp.int32), w_1d.astype(jnp.float32)),
             num_keys=1,
         )
-        sw_fast = _sorted_weights_from_sort(w_1d, sw_f32, inv_order)
+        sw_fast = _sorted_weights_from_sort(w_1d, sw_f32, sort_order)
         np.testing.assert_allclose(np.asarray(sw_fast, dtype=np.float32), np.asarray(p_ref, dtype=np.float32), atol=tol)
-        gsw_fast = jax.grad(lambda w_: jnp.mean(_sorted_weights_from_sort(w_, sw_f32, inv_order).astype(jnp.float32) * cot_1d))(w_1d)
+        gsw_fast = jax.grad(lambda w_: jnp.mean(_sorted_weights_from_sort(w_, sw_f32, sort_order).astype(jnp.float32) * cot_1d))(w_1d)
         np.testing.assert_allclose(np.asarray(gsw_fast, dtype=np.float32), np.asarray(gp_ref, dtype=np.float32), atol=tol, rtol=tol)
+
+        scores_r = jax.nn.sigmoid(logits_r.astype(dtype))
+        bias_r = jax.random.normal(k3, (num_experts,), dtype=jnp.float32) * 0.05
+        cot_tk = jax.random.normal(k4, (num_tokens, top_k), dtype=jnp.float32)
+        tk_fast_grad = jax.grad(
+            lambda sc: jnp.mean(
+                _attach_topk_vjp(
+                    sc,
+                    jax.lax.top_k(jax.lax.stop_gradient(sc) + bias_r.astype(dtype)[None, :], top_k)[0]
+                    - bias_r[topk_idx].astype(dtype),
+                    topk_idx,
+                    num_experts,
+                ).astype(jnp.float32)
+                * cot_tk
+            )
+        )(scores_r)
+        tk_ref_grad = jax.grad(
+            lambda sc: jnp.mean(
+                (jnp.take_along_axis(sc, topk_idx, axis=-1)).astype(jnp.float32) * cot_tk
+            )
+        )(scores_r)
+        np.testing.assert_allclose(
+            np.asarray(tk_fast_grad, dtype=np.float32), np.asarray(tk_ref_grad, dtype=np.float32), atol=tol, rtol=tol
+        )
 
 
 def test_2stream_closed_form_mhc_and_engram_conv() -> None:

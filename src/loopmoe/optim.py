@@ -140,27 +140,31 @@ def _muon_dim_numbers_fn(params: Any) -> Any:
 
 
 def _split_gate_up_tree(tree: Any) -> Any:
-    """Zero-copy reshape moe/w_gate_up (E, D, 2*df) -> (E, D, 2, df) so NS orthogonalizes gate & up separately."""
+    """Split moe/w_gate_up (E, D, 2*df) into two contiguous 3D leaves w_gate & w_up (E, D, df)."""
     if not isinstance(tree, dict) or "moe" not in tree or not isinstance(tree["moe"], dict):
         return tree
-    moe = tree["moe"]
+    moe = dict(tree["moe"])
     w_gu = moe.get("w_gate_up")
     if not hasattr(w_gu, "ndim") or w_gu.ndim != 3:
         return tree
-    e, d, two_df = w_gu.shape
-    return {**tree, "moe": {**moe, "w_gate_up": w_gu.reshape(e, d, 2, two_df // 2)}}
+    w_gate, w_up = jnp.split(w_gu, 2, axis=-1)
+    moe.pop("w_gate_up")
+    moe["w_gate"] = w_gate
+    moe["w_up"] = w_up
+    return {**tree, "moe": moe}
 
 
 def _merge_gate_up_tree(tree: Any) -> Any:
-    """Zero-copy reshape moe/w_gate_up (E, D, 2, df) -> (E, D, 2*df)."""
+    """Merge split 3D leaves moe/w_gate & moe/w_up (E, D, df) back into (E, D, 2*df)."""
     if not isinstance(tree, dict) or "moe" not in tree or not isinstance(tree["moe"], dict):
         return tree
-    moe = tree["moe"]
-    w_gu = moe.get("w_gate_up")
-    if not hasattr(w_gu, "ndim") or w_gu.ndim != 4:
+    moe = dict(tree["moe"])
+    if "w_gate" not in moe or "w_up" not in moe:
         return tree
-    e, d, two, df = w_gu.shape
-    return {**tree, "moe": {**moe, "w_gate_up": w_gu.reshape(e, d, two * df)}}
+    w_gate = moe.pop("w_gate")
+    w_up = moe.pop("w_up")
+    moe["w_gate_up"] = jnp.concatenate([w_gate, w_up], axis=-1)
+    return {**tree, "moe": moe}
 
 
 def _wrap_split_gate_up_muon(tx: optax.GradientTransformation) -> optax.GradientTransformation:
@@ -198,18 +202,17 @@ def orthogonalize_via_cubic_ns(
 
     def _orth(mat: jax.Array) -> jax.Array:
         dt = mat.dtype
-        transposed = False
-        if mat.shape[0] > mat.shape[1]:
-            mat = mat.T
-            transposed = True
         norm = jnp.sqrt(jnp.sum(jnp.square(mat), dtype=jnp.float32)) + jnp.asarray(eps, dtype=jnp.float32)
         inv_norm = (jnp.asarray(1.0, dtype=jnp.float32) / norm).astype(dt)
         mat = mat * inv_norm
-        for a_val, b_val in coeffs:
-            gram = mat @ mat.T
-            mat = jnp.asarray(a_val, dtype=dt) * mat + jnp.asarray(b_val, dtype=dt) * (gram @ mat)
-        if transposed:
-            mat = mat.T
+        if mat.shape[0] <= mat.shape[1]:
+            for a_val, b_val in coeffs:
+                gram = mat @ mat.T
+                mat = jnp.asarray(a_val, dtype=dt) * mat + jnp.asarray(b_val, dtype=dt) * (gram @ mat)
+        else:
+            for a_val, b_val in coeffs:
+                gram = mat.T @ mat
+                mat = jnp.asarray(a_val, dtype=dt) * mat + jnp.asarray(b_val, dtype=dt) * (mat @ gram)
         return mat
 
     reshape_fn, inverse_fn = _compute_muon_reshape(x, dimension_numbers)
