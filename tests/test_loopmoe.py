@@ -32,7 +32,13 @@ from loopmoe.mhc import (
     rms_norm,
     sinkhorn_knopp,
 )
-from loopmoe.mla import quantize_kv_fp4_e2m1
+from loopmoe.mla import (
+    apply_mla,
+    apply_rope,
+    compute_yarn_freqs,
+    init_mla_params,
+    quantize_kv_fp4_e2m1,
+)
 from loopmoe.model import (
     _fused_chunked_ce,
     _fused_chunked_ce_vd,
@@ -46,7 +52,7 @@ from loopmoe.model import (
     init_model_params,
 )
 from loopmoe.moe import (
-    _attach_topk_vjp,
+    _extract_topk_scores,
     _moe_combine,
     _moe_dispatch,
     _permute_1d,
@@ -661,28 +667,52 @@ def test_mhc_compute_gates_and_moe_dispatch_combine_equivalence() -> None:
         np.testing.assert_allclose(np.asarray(gsw_fast, dtype=np.float32), np.asarray(gp_ref, dtype=np.float32), atol=tol, rtol=tol)
 
         scores_r = jax.nn.sigmoid(logits_r.astype(dtype))
-        bias_r = jax.random.normal(k3, (num_experts,), dtype=jnp.float32) * 0.05
         cot_tk = jax.random.normal(k4, (num_tokens, top_k), dtype=jnp.float32)
+        tk_fast = _extract_topk_scores(scores_r, topk_idx, num_experts)
+        tk_ref = jnp.take_along_axis(scores_r, topk_idx, axis=-1)
+        np.testing.assert_allclose(np.asarray(tk_fast, dtype=np.float32), np.asarray(tk_ref, dtype=np.float32), atol=tol)
         tk_fast_grad = jax.grad(
-            lambda sc: jnp.mean(
-                _attach_topk_vjp(
-                    sc,
-                    jax.lax.top_k(jax.lax.stop_gradient(sc) + bias_r.astype(dtype)[None, :], top_k)[0]
-                    - bias_r[topk_idx].astype(dtype),
-                    topk_idx,
-                    num_experts,
-                ).astype(jnp.float32)
-                * cot_tk
-            )
+            lambda sc: jnp.mean(_extract_topk_scores(sc, topk_idx, num_experts).astype(jnp.float32) * cot_tk)
         )(scores_r)
         tk_ref_grad = jax.grad(
-            lambda sc: jnp.mean(
-                (jnp.take_along_axis(sc, topk_idx, axis=-1)).astype(jnp.float32) * cot_tk
-            )
+            lambda sc: jnp.mean(jnp.take_along_axis(sc, topk_idx, axis=-1).astype(jnp.float32) * cot_tk)
         )(scores_r)
         np.testing.assert_allclose(
             np.asarray(tk_fast_grad, dtype=np.float32), np.asarray(tk_ref_grad, dtype=np.float32), atol=tol, rtol=tol
         )
+
+    # Verify apply_mla flat-head RoPE equivalence against reference apply_rope in float32
+    cfg_mla = LoopMoEConfig(**{**LoopMoEConfig.tiny(num_loops=1).to_dict(), "dtype_name": "float32", "untie_mla_per_loop": False})
+    mla_p = init_mla_params(k1, cfg_mla, dtype=jnp.float32)
+    x_mla = jax.random.normal(k2, (2, 16, cfg_mla.d_model), dtype=jnp.float32)
+    out_fast, _ = apply_mla(mla_p, x_mla, cfg_mla)
+
+    # Reference path using apply_rope directly
+    import math as _math
+    c_q_ref = rms_norm(x_mla @ mla_p["w_dq"], mla_p["q_norm_w"], eps=cfg_mla.rms_norm_eps)
+    q_all_ref = (c_q_ref @ mla_p["w_uq"]).reshape(2, 16, cfg_mla.n_heads, cfg_mla.d_qk_head)
+    q_nope_ref, q_rope_ref = jnp.split(q_all_ref, [cfg_mla.d_qk_nope], axis=-1)
+    c_kv_raw_ref, k_rope_shared_ref = jnp.split(x_mla @ mla_p["w_dkv"], [cfg_mla.d_kv_lora], axis=-1)
+    c_kv_ref = rms_norm(c_kv_raw_ref, mla_p["kv_norm_w"], eps=cfg_mla.rms_norm_eps)
+    k_nope_ref = (c_kv_ref @ mla_p["w_uk"]).reshape(2, 16, cfg_mla.n_heads, cfg_mla.d_qk_nope)
+    v_ref = (c_kv_ref @ mla_p["w_uv"]).reshape(2, 16, cfg_mla.n_heads, cfg_mla.d_v)
+    inv_f, ms = compute_yarn_freqs(
+        d_rope=cfg_mla.d_qk_rope,
+        theta=cfg_mla.rope_theta,
+        base_seq_len=cfg_mla.base_seq_len,
+        scale=cfg_mla.yarn_scale,
+        beta_fast=cfg_mla.yarn_beta_fast,
+        beta_slow=cfg_mla.yarn_beta_slow,
+    )
+    q_ref = jnp.concatenate([q_nope_ref, apply_rope(q_rope_ref, inv_f)], axis=-1)
+    k_r_ref = jnp.broadcast_to(apply_rope(k_rope_shared_ref[:, :, None, :], inv_f), (2, 16, cfg_mla.n_heads, cfg_mla.d_qk_rope))
+    k_ref = jnp.concatenate([k_nope_ref, k_r_ref], axis=-1)
+    v_pad = jnp.pad(v_ref, [(0, 0), (0, 0), (0, 0), (0, max(0, cfg_mla.d_qk_head - cfg_mla.d_v))])
+    attn_ref = jax.nn.dot_product_attention(
+        q_ref, k_ref, v_pad, is_causal=True, scale=(ms * ms) / _math.sqrt(float(cfg_mla.d_qk_head))
+    )[..., : cfg_mla.d_v]
+    out_ref = attn_ref.reshape(2, 16, cfg_mla.n_heads * cfg_mla.d_v) @ mla_p["w_o"]
+    np.testing.assert_allclose(np.asarray(out_fast), np.asarray(out_ref), atol=1e-5, rtol=1e-5)
 
 
 def test_2stream_closed_form_mhc_and_engram_conv() -> None:

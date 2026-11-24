@@ -320,8 +320,14 @@ def apply_mla(
 
     with jax.named_scope("mla_qkv_proj"):
         c_q = rms_norm(x @ p["w_dq"], p["q_norm_w"], eps=cfg.rms_norm_eps)
-        q_all = (c_q @ p["w_uq"]).reshape(bsz, seq_len, h, cfg.d_qk_head)
-        q_nope, q_rope = jnp.split(q_all, [cfg.d_qk_nope], axis=-1)
+        half = cfg.d_qk_rope // 2
+        w_uq_4d = p["w_uq"].reshape(cfg.d_q_lora, h, cfg.d_qk_head)
+        w_uq_nope = w_uq_4d[:, :, : cfg.d_qk_nope].reshape(cfg.d_q_lora, h * cfg.d_qk_nope)
+        w_uq_r1 = w_uq_4d[:, :, cfg.d_qk_nope : cfg.d_qk_nope + half].reshape(cfg.d_q_lora, h * half)
+        w_uq_r2 = w_uq_4d[:, :, cfg.d_qk_nope + half :].reshape(cfg.d_q_lora, h * half)
+        q_nope = (c_q @ w_uq_nope).reshape(bsz, seq_len, h, cfg.d_qk_nope)
+        q_r1 = c_q @ w_uq_r1  # [B, S, H * half] -> width 256 (2 full 128-lanes, zero padding)
+        q_r2 = c_q @ w_uq_r2
 
         kv_raw = x @ p["w_dkv"]
         c_kv_raw, k_rope_shared = jnp.split(kv_raw, [cfg.d_kv_lora], axis=-1)
@@ -339,11 +345,24 @@ def apply_mla(
             beta_fast=cfg.yarn_beta_fast,
             beta_slow=cfg.yarn_beta_slow,
         )
-        q_rope = apply_rope(q_rope, inv_freq)
-        k_rope = apply_rope(k_rope_shared[:, :, None, :], inv_freq)
-        k_rope = jnp.broadcast_to(k_rope, (bsz, seq_len, h, cfg.d_qk_rope))
+        positions = jnp.arange(seq_len, dtype=jnp.float32)[:, None]
+        angles = positions * inv_freq[None, :]  # [S, half]
+        cos_2d = jnp.cos(angles).astype(x.dtype)
+        sin_2d = jnp.sin(angles).astype(x.dtype)
 
-        q = jnp.concatenate([q_nope, q_rope], axis=-1)
+        cos_h = jnp.tile(cos_2d, (1, h))[None, :, :]  # [1, S, H * half]
+        sin_h = jnp.tile(sin_2d, (1, h))[None, :, :]
+        q_out1 = (q_r1 * cos_h - q_r2 * sin_h).reshape(bsz, seq_len, h, half)
+        q_out2 = (q_r1 * sin_h + q_r2 * cos_h).reshape(bsz, seq_len, h, half)
+        q = jnp.concatenate([q_nope, q_out1, q_out2], axis=-1)
+
+        k_r1, k_r2 = jnp.split(k_rope_shared, 2, axis=-1)
+        k_out1 = k_r1 * cos_2d[None, :, :] - k_r2 * sin_2d[None, :, :]
+        k_out2 = k_r1 * sin_2d[None, :, :] + k_r2 * cos_2d[None, :, :]
+        k_rope = jnp.broadcast_to(
+            jnp.concatenate([k_out1, k_out2], axis=-1)[:, :, None, :],
+            (bsz, seq_len, h, cfg.d_qk_rope),
+        )
         k = jnp.concatenate([k_nope, k_rope], axis=-1)
 
     softmax_scale = (mscale * mscale) / math.sqrt(float(cfg.d_qk_head))

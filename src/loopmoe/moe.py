@@ -248,43 +248,16 @@ def _sorted_weights_from_sort_bwd(
 _sorted_weights_from_sort.defvjp(_sorted_weights_from_sort_fwd, _sorted_weights_from_sort_bwd)
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(3,))
-def _attach_topk_vjp(
-    scores: jax.Array,
-    topk_scores_val: jax.Array,
-    topk_idx: jax.Array,
-    n_experts: int,
-) -> jax.Array:
-    """Attach clean Top-K VPU scatter backward onto stop-grad `top_k` outputs (avoids packed-BF16 scatter)."""
-    del scores, topk_idx, n_experts
-    return topk_scores_val
-
-
-def _attach_topk_vjp_fwd(
-    scores: jax.Array,
-    topk_scores_val: jax.Array,
-    topk_idx: jax.Array,
-    n_experts: int,
-) -> tuple[jax.Array, tuple[jax.Array]]:
-    del scores, n_experts
-    return topk_scores_val, (topk_idx,)
-
-
-def _attach_topk_vjp_bwd(
-    n_experts: int, res: tuple[jax.Array], d_topk: jax.Array
-) -> tuple[jax.Array, None, None]:
-    (topk_idx,) = res
+def _extract_topk_scores(scores: jax.Array, topk_idx: jax.Array, n_experts: int) -> jax.Array:
+    """Extract [N, K] routing scores from [N, E] via K VPU masked reductions (zero 1D gather/scatter)."""
     top_k = topk_idx.shape[-1]
-    dt = d_topk.dtype
-    zero = jnp.asarray(0.0, dtype=dt)
-    e_idx = jnp.arange(n_experts, dtype=topk_idx.dtype)[None, :]
-    d_scores = jnp.where(e_idx == topk_idx[:, 0:1], d_topk[:, 0:1], zero)
-    for k in range(1, top_k):
-        d_scores = d_scores + jnp.where(e_idx == topk_idx[:, k : k + 1], d_topk[:, k : k + 1], zero)
-    return (d_scores, None, None)
-
-
-_attach_topk_vjp.defvjp(_attach_topk_vjp_fwd, _attach_topk_vjp_bwd)
+    zero = jnp.asarray(0.0, dtype=scores.dtype)
+    e_idx = jnp.arange(n_experts, dtype=topk_idx.dtype)[None, :]  # [1, E]
+    cols = [
+        jnp.sum(jnp.where(e_idx == topk_idx[:, k : k + 1], scores, zero), axis=-1)
+        for k in range(top_k)
+    ]
+    return jnp.stack(cols, axis=-1)
 
 
 def apply_moe(
@@ -322,10 +295,8 @@ def apply_moe(
         bias_f32 = jax.lax.stop_gradient(params["router_bias"][loop_idx])
         biased_scores = jax.lax.stop_gradient(scores) + bias_f32.astype(dt)[None, :]
 
-        topk_biased, topk_idx = jax.lax.top_k(biased_scores, cfg.top_k)  # [N, K]
-        # Gather router_bias in native FP32 before casting to dt to avoid TPU packed-BF16 1D gather penalty
-        topk_scores_val = topk_biased - bias_f32[topk_idx].astype(dt)
-        topk_scores = _attach_topk_vjp(scores, topk_scores_val, topk_idx, cfg.n_routed_experts)
+        _, topk_idx = jax.lax.top_k(biased_scores, cfg.top_k)  # [N, K]
+        topk_scores = _extract_topk_scores(scores, topk_idx, cfg.n_routed_experts)
         topk_weights = topk_scores / (
             jnp.sum(topk_scores, axis=-1, keepdims=True) + jnp.asarray(1e-6, dtype=dt)
         )
