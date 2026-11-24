@@ -66,6 +66,7 @@ from loopmoe.optim import (
     make_warmup_stable_schedule,
     per_expert_newton_schulz,
 )
+from loopmoe.pallas_moe import pallas_moe_combine, pallas_moe_gather
 from train_tokenizer import benchmark_tokenizer, build_bpe_tokenizer, save_hf_tokenizer_files
 
 
@@ -826,3 +827,40 @@ def test_async_checkpoint_write_and_inloop_engram(tmp_path: Path) -> None:
     write_future.result()
     loaded = load_latest_checkpoint(tmp_path, params_template=params, opt_state_template=opt_state)
     assert loaded is not None and loaded[2]["step"] == 5 and ckpt_dir.exists()
+
+
+def test_pallas_moe_dispatch_combine_kernels() -> None:
+    import jax.experimental.pallas as pl
+    from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
+
+    # 1. Exact bit-for-bit numerical equivalence via Pallas CPU interpret mode
+    n_tok, top_k, d_model = 128, 5, 1024
+    m_rows = n_tok * top_k
+    k1, k2, k3 = jax.random.split(jax.random.PRNGKey(909), 3)
+    idx = jax.random.randint(k1, (m_rows,), 0, n_tok, dtype=jnp.int32)
+    perm = jax.random.permutation(k2, m_rows).astype(jnp.int32)
+
+    for dtype in (jnp.bfloat16, jnp.float32):
+        x = jax.random.normal(k3, (n_tok, d_model), dtype=dtype)
+        g_out = pallas_moe_gather(x, idx, interpret=True)
+        np.testing.assert_array_equal(np.asarray(g_out, dtype=np.float32), np.asarray(x[idx], dtype=np.float32))
+
+        down = jax.random.normal(k1, (m_rows, d_model), dtype=dtype)
+        c_out = pallas_moe_combine(down, perm, top_k=top_k, interpret=True)
+        inv_2d = perm.reshape(n_tok, top_k)
+        c_ref = down[inv_2d[:, 0]]
+        for k in range(1, top_k):
+            c_ref = c_ref + down[inv_2d[:, k]]
+        np.testing.assert_array_equal(np.asarray(c_out, dtype=np.float32), np.asarray(c_ref, dtype=np.float32))
+
+    # 2. Mosaic TPU v5e & v6e MLIR lowering at full 1B shapes (32768 x 2048, K=5) with zero shape_cast
+    x_s = jax.ShapeDtypeStruct((32_768, 2048), jnp.bfloat16)
+    idx_s = jax.ShapeDtypeStruct((163_840,), jnp.int32)
+    down_s = jax.ShapeDtypeStruct((163_840, 2048), jnp.bfloat16)
+    for dev in ("TPU v5 lite", "TPU v6 lite"):
+        mesh = AbstractMesh((1,), ("x",), abstract_device=AbstractDevice(dev, num_cores=1, platform="tpu"))
+        with use_abstract_mesh(mesh):
+            mlir_g = pl.lower_as_mlir(pallas_moe_gather, x_s, idx_s, platforms=("tpu",))
+            mlir_c = pl.lower_as_mlir(lambda a, b: pallas_moe_combine(a, b, top_k=5), down_s, idx_s, platforms=("tpu",))
+            assert "shape_cast" not in mlir_g and "shape_cast" not in mlir_c
+            assert "pallas_moe_gather" in mlir_g and "pallas_moe_combine" in mlir_c

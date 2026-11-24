@@ -10,6 +10,7 @@ import jax.numpy as jnp
 
 from .config import LoopMoEConfig
 from .mhc import rms_norm
+from .pallas_moe import can_use_pallas_moe, pallas_moe_combine, pallas_moe_gather
 
 
 def init_moe_params(
@@ -122,6 +123,27 @@ def _gather_sum_topk(arr: jax.Array, inv_order: jax.Array, top_k: int) -> jax.Ar
     return acc
 
 
+def _dispatch_gather(x_flat: jax.Array, token_indices: jax.Array, top_k: int) -> jax.Array:
+    """Gather token rows using pipelined Mosaic TPU Pallas DMA when aligned, else native JAX gather."""
+    if can_use_pallas_moe(x_flat.shape[0], token_indices.shape[0], x_flat.shape[1], top_k):
+        try:
+            return pallas_moe_gather(x_flat, token_indices)
+        except Exception:
+            pass
+    return x_flat[token_indices]
+
+
+def _combine_gather_sum(arr: jax.Array, inv_order: jax.Array, top_k: int) -> jax.Array:
+    """Gather+sum top_k rows per token using double-buffered Pallas VMEM combine on TPU when aligned."""
+    n_rows = inv_order.shape[0] // top_k
+    if can_use_pallas_moe(n_rows, arr.shape[0], arr.shape[1], top_k):
+        try:
+            return pallas_moe_combine(arr, inv_order, top_k)
+        except Exception:
+            pass
+    return _gather_sum_topk(arr, inv_order, top_k)
+
+
 @functools.partial(jax.custom_vjp, nondiff_argnums=(3,))
 def _moe_dispatch(
     x_flat: jax.Array,
@@ -130,8 +152,8 @@ def _moe_dispatch(
     top_k: int,
 ) -> jax.Array:
     """Gather token embeddings into expert-sorted order; backward uses conflict-free inv_order reduce."""
-    del inv_order, top_k
-    return x_flat[token_indices]
+    del inv_order
+    return _dispatch_gather(x_flat, token_indices, top_k)
 
 
 def _moe_dispatch_fwd(
@@ -140,8 +162,7 @@ def _moe_dispatch_fwd(
     inv_order: jax.Array,
     top_k: int,
 ) -> tuple[jax.Array, tuple[jax.Array]]:
-    del top_k
-    return x_flat[token_indices], (inv_order,)
+    return _dispatch_gather(x_flat, token_indices, top_k), (inv_order,)
 
 
 def _moe_dispatch_bwd(
@@ -150,7 +171,7 @@ def _moe_dispatch_bwd(
     d_sorted_x: jax.Array,
 ) -> tuple[jax.Array, None, None]:
     (inv_order,) = res
-    return (_gather_sum_topk(d_sorted_x, inv_order, top_k), None, None)
+    return (_combine_gather_sum(d_sorted_x, inv_order, top_k), None, None)
 
 
 _moe_dispatch.defvjp(_moe_dispatch_fwd, _moe_dispatch_bwd)
@@ -165,7 +186,7 @@ def _moe_combine(
 ) -> jax.Array:
     """Combine expert-sorted outputs per token via conflict-free inv_order gather+sum (zero scatter-add)."""
     del token_indices
-    return _gather_sum_topk(down_out, inv_order, top_k)
+    return _combine_gather_sum(down_out, inv_order, top_k)
 
 
 def _moe_combine_fwd(
@@ -174,7 +195,7 @@ def _moe_combine_fwd(
     inv_order: jax.Array,
     top_k: int,
 ) -> tuple[jax.Array, tuple[jax.Array]]:
-    return _gather_sum_topk(down_out, inv_order, top_k), (token_indices,)
+    return _combine_gather_sum(down_out, inv_order, top_k), (token_indices,)
 
 
 def _moe_combine_bwd(
@@ -182,9 +203,8 @@ def _moe_combine_bwd(
     res: tuple[jax.Array],
     d_routed_out: jax.Array,
 ) -> tuple[jax.Array, None, None]:
-    del top_k
     (token_indices,) = res
-    return (d_routed_out[token_indices], None, None)
+    return (_dispatch_gather(d_routed_out, token_indices, top_k), None, None)
 
 
 _moe_combine.defvjp(_moe_combine_fwd, _moe_combine_bwd)
