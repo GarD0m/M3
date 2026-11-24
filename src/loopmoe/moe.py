@@ -281,11 +281,12 @@ def apply_moe(
         router_mmr = jnp.exp(jnp.clip(jnp.mean(z_sorted[:, -1] - z_sorted[:, mid_idx]), -20.0, 20.0))
 
         scores = jax.nn.sigmoid(router_logits)
-        bias_t = jax.lax.stop_gradient(params["router_bias"][loop_idx]).astype(dt)
-        biased_scores = scores + bias_t[None, :]
+        bias_f32 = jax.lax.stop_gradient(params["router_bias"][loop_idx])
+        biased_scores = scores + bias_f32.astype(dt)[None, :]
 
         topk_biased, topk_idx = jax.lax.top_k(biased_scores, cfg.top_k)  # [N, K]
-        topk_scores = topk_biased - bias_t[topk_idx]
+        # Gather router_bias in native FP32 before casting to dt to avoid TPU packed-BF16 1D gather penalty
+        topk_scores = topk_biased - bias_f32[topk_idx].astype(dt)
         topk_weights = topk_scores / (
             jnp.sum(topk_scores, axis=-1, keepdims=True) + jnp.asarray(1e-6, dtype=dt)
         )

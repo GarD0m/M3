@@ -165,8 +165,11 @@ def expand_streams(x: jax.Array, stream_init: jax.Array | None = None) -> jax.Ar
 
 
 def collapse_streams(x_streams: jax.Array) -> jax.Array:
-    """Collapse [B, S, n_streams, D] -> [B, S, D] via mean projection."""
-    return jnp.mean(x_streams, axis=2)
+    """Collapse [B, S, n_streams, D] -> [B, S, D] in native dtype."""
+    dt = x_streams.dtype
+    if x_streams.shape[2] == 2:
+        return jnp.asarray(0.5, dtype=dt) * (x_streams[:, :, 0, :] + x_streams[:, :, 1, :])
+    return jnp.mean(x_streams, axis=2, dtype=dt)
 
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(1,))
@@ -248,10 +251,7 @@ def mhc_compute_gates(
         if n_streams == 2:
             # Closed-form exact 2x2 Birkhoff polytope projection (zero Sinkhorn iterations)
             res_dyn = all_dyn[..., 4:5]
-            p = jax.nn.sigmoid(
-                params["alpha_res"].astype(jnp.float32) * res_dyn.astype(jnp.float32)
-                + params["b_res"].astype(jnp.float32)
-            ).astype(dt)
+            p = jax.nn.sigmoid(params["alpha_res"].astype(dt) * res_dyn + params["b_res"].astype(dt))
             q = jnp.asarray(1.0, dtype=dt) - p
             h_res = jnp.stack(
                 [jnp.concatenate([p, q], axis=-1), jnp.concatenate([q, p], axis=-1)],

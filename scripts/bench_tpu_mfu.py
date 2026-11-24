@@ -1,15 +1,14 @@
-"""TPU v5e-1 / v6e-1 MFU, XProf profiler, XLA roofline, and bottleneck diagnostics (Test branch)."""
+"""TPU v5e-1 / v6e-1 MFU, XProf profiler, and XLA roofline benchmark (Test branch)."""
 
 from __future__ import annotations
 
 import argparse
-import contextlib
 import gc
 import json
 from pathlib import Path
 import sys
 import time
-from typing import Any, Callable
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
@@ -18,21 +17,9 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 
 from loopmoe.config import TPU_SPECS, LoopMoEConfig, estimate_step_flops
-from loopmoe.engram import apply_engram_step, precompute_engram_kv, prefetch_engram_embeddings
-from loopmoe.iter_adaln import compute_iter_adaln_modulations
-from loopmoe.mhc import mhc_compute_gates, mhc_post_merge
-from loopmoe.mla import apply_mla
-from loopmoe.model import (
-    chunked_cross_entropy_loss,
-    forward_model,
-    get_lm_head_weight,
-    init_model_params,
-    summarize_model,
-)
-from loopmoe.moe import apply_moe
+from loopmoe.model import init_model_params, summarize_model
 from loopmoe.optim import OptimConfig, create_muon_adamw_optimizer
 from train_tpu import make_train_step, maybe_tokamax_autotune
 
@@ -109,172 +96,6 @@ def _extract_xla_analysis(compiled: Any, step_tokens: int, ridge_fpb: float) -> 
     return out
 
 
-def _bench_op(fn: Callable[..., Any], args: tuple[Any, ...], warmup: int = 2, iters: int = 5) -> float:
-    """JIT-compile and measure steady-state execution latency in milliseconds."""
-    jitted = jax.jit(fn)
-    out = jitted(*args)
-    jax.block_until_ready(out)
-    for _ in range(max(0, warmup - 1)):
-        out = jitted(*args)
-        jax.block_until_ready(out)
-    t0 = time.perf_counter()
-    for _ in range(iters):
-        out = jitted(*args)
-    jax.block_until_ready(out)
-    return ((time.perf_counter() - t0) / float(iters)) * 1000.0
-
-
-def run_module_breakdown(
-    cfg: LoopMoEConfig,
-    seq_len: int,
-    micro_bs: int,
-    warmup: int = 2,
-    iters: int = 5,
-    seed: int = 42,
-    autotune_ctx: Any = None,
-) -> dict[str, Any]:
-    """Micro-profile each architectural component individually to expose exact bottlenecks."""
-    params = init_model_params(jax.random.PRNGKey(seed), cfg)
-
-    rng = np.random.default_rng(seed)
-    x_ids = jnp.asarray(rng.integers(64, cfg.vocab_size, size=(micro_bs, seq_len), dtype=np.int32))
-    y_ids = jnp.roll(x_ids, -1, axis=-1)
-    dt = getattr(jnp, cfg.dtype_name)
-    h_2d = jax.random.normal(jax.random.PRNGKey(seed + 1), (micro_bs, seq_len, cfg.d_model), dtype=dt)
-    x_streams = jax.random.normal(
-        jax.random.PRNGKey(seed + 2),
-        (micro_bs, seq_len, cfg.mhc_streams if cfg.use_mhc else 1, cfg.d_model),
-        dtype=dt,
-    )
-    engram_e = prefetch_engram_embeddings(params["engram"], x_ids, cfg) if cfg.use_engram else None
-    engram_kv = precompute_engram_kv(params["engram"], engram_e, cfg) if (cfg.use_engram and engram_e is not None) else None
-    lm_w = get_lm_head_weight(params, cfg)
-
-    timings_ms: dict[str, float] = {}
-    ctx = autotune_ctx if autotune_ctx is not None else contextlib.nullcontext()
-    with ctx:
-        if cfg.use_engram:
-            timings_ms["engram_prefetch"] = round(
-                _bench_op(lambda p, ids: prefetch_engram_embeddings(p, ids, cfg), (params["engram"], x_ids), warmup, iters),
-                3,
-            )
-            timings_ms["engram_step"] = round(
-                _bench_op(lambda p, h, kv: apply_engram_step(p, h, kv, cfg), (params["engram"], h_2d, engram_kv), warmup, iters),
-                3,
-            )
-
-        timings_ms["iter_adaln"] = round(
-            _bench_op(
-                lambda p: compute_iter_adaln_modulations(p, 0, dtype=dt),
-                (params["iter_adaln"],),
-                warmup,
-                iters,
-            ),
-            3,
-        )
-
-        if cfg.use_mhc:
-            def _mhc_full(p, xs, out_h):
-                h_in, _, h_post, h_res = mhc_compute_gates(p, xs, cfg.mhc_sinkhorn_iters, cfg.rms_norm_eps)
-                merged = mhc_post_merge(xs, out_h, h_post, h_res, 1.0)
-                return h_in, merged
-
-            timings_ms["mhc_gates_and_merge"] = round(
-                _bench_op(_mhc_full, (params["mhc"]["attn"], x_streams, h_2d), warmup, iters), 3
-            )
-
-        timings_ms["mla"] = round(
-            _bench_op(lambda p, h: apply_mla(p, h, cfg), (params["mla"], h_2d), warmup, iters), 3
-        )
-        timings_ms["moe_total"] = round(
-            _bench_op(lambda p, h: apply_moe(p, h, 0, cfg), (params["moe"], h_2d), warmup, iters), 3
-        )
-
-        # Isolate MoE dispatch sort/gather overhead vs shared expert
-        def _moe_sort_only(p, h):
-            x_flat = h.reshape(-1, cfg.d_model)
-            rw = p["router_w"][0] if p["router_w"].ndim == 3 else p["router_w"]
-            scores = jax.nn.sigmoid((x_flat @ rw).astype(jnp.float32))
-            _, topk_idx = jax.lax.top_k(scores + p["router_bias"][0][None, :], cfg.top_k)
-            flat_e = topk_idx.reshape(-1)
-            order = jnp.argsort(flat_e)
-            return x_flat[order // cfg.top_k], jnp.bincount(flat_e, length=cfg.n_routed_experts)
-
-        def _moe_shared_only(p, h):
-            xf = h.reshape(-1, cfg.d_model)
-            g, u = jnp.split(xf @ p["shared_w_gate_up"], 2, axis=-1)
-            return (jax.nn.silu(g) * u) @ p["shared_w_down"]
-
-        timings_ms["moe_sort_dispatch_only"] = round(_bench_op(_moe_sort_only, (params["moe"], h_2d), warmup, iters), 3)
-        timings_ms["moe_shared_only"] = round(_bench_op(_moe_shared_only, (params["moe"], h_2d), warmup, iters), 3)
-
-        if cfg.tie_word_embeddings:
-            ce_w = params["embed_tokens"]
-            ce_is_vd = True
-        else:
-            ce_w = lm_w
-            ce_is_vd = False
-        timings_ms["chunked_ce_loss"] = round(
-            _bench_op(
-                lambda h, w, t: chunked_cross_entropy_loss(
-                    h, w, t, chunk_size=cfg.chunk_ce_size, weight_is_vd=ce_is_vd
-                ),
-                (h_2d, ce_w, y_ids),
-                warmup,
-                iters,
-            ),
-            3,
-        )
-
-        # Free activation scratch before full fwd+bwd and donated optimizer step to fit 16 GB HBM
-        del x_streams, h_2d, engram_e, engram_kv, lm_w, ce_w
-        gc.collect()
-
-        timings_ms["full_fwd"] = round(
-            _bench_op(lambda p, xi, yi: forward_model(p, xi, yi, cfg), (params, x_ids, y_ids), warmup, iters),
-            3,
-        )
-        val_grad_fn = jax.value_and_grad(lambda p, xi, yi: forward_model(p, xi, yi, cfg), has_aux=True)
-        timings_ms["full_fwd_bwd"] = round(_bench_op(val_grad_fn, (params, x_ids, y_ids), warmup, iters), 3)
-
-        (_, _), sample_grads = jax.jit(val_grad_fn)(params, x_ids, y_ids)
-        jax.block_until_ready(sample_grads)
-        del val_grad_fn, x_ids, y_ids
-        gc.collect()
-        jax.clear_caches()
-
-    # Defer optimizer state allocation until after full_fwd_bwd so 16 GB HBM fits 9.1 GB program scratch
-    opt = create_muon_adamw_optimizer(OptimConfig(warmup_steps=100))
-    opt_state = opt.init(params)
-
-    @jax.jit(donate_argnums=(0, 1))
-    def _opt_step(p, s, g):
-        upd, ns = opt.update(g, s, p)
-        return optax.apply_updates(p, upd), ns
-
-    params, opt_state = _opt_step(params, opt_state, sample_grads)
-    jax.block_until_ready(params)
-    for _ in range(max(0, warmup - 1)):
-        params, opt_state = _opt_step(params, opt_state, sample_grads)
-        jax.block_until_ready(params)
-    t0 = time.perf_counter()
-    for _ in range(iters):
-        params, opt_state = _opt_step(params, opt_state, sample_grads)
-    jax.block_until_ready(params)
-    timings_ms["optimizer_muon_adamw"] = round(
-        ((time.perf_counter() - t0) / float(iters)) * 1000.0, 3
-    )
-
-    del params, opt_state, sample_grads, _opt_step
-    gc.collect()
-    jax.clear_caches()
-
-    bwd_ms = max(0.0, timings_ms["full_fwd_bwd"] - timings_ms["full_fwd"])
-    timings_ms["bwd_only_est"] = round(bwd_ms, 3)
-    timings_ms["bwd_to_fwd_ratio"] = round(bwd_ms / max(timings_ms["full_fwd"], 1e-6), 2)
-    return timings_ms
-
-
 def _run_single_point(
     base_cfg: LoopMoEConfig,
     seq_len: int,
@@ -290,7 +111,7 @@ def _run_single_point(
     profile_steps: int,
     seed: int,
     autotune: bool = True,
-) -> tuple[dict[str, Any], Any]:
+) -> dict[str, Any]:
     micro_bs = max(1, microbatch)
     micro_tok = micro_bs * seq_len
 
@@ -363,117 +184,21 @@ def _run_single_point(
     gc.collect()
     jax.clear_caches()
 
-    return (
-        {
-            "seq_len": seq_len,
-            "num_loops": num_loops,
-            "micro_bs": micro_bs,
-            "grad_accum": grad_accum,
-            "step_tokens": step_tokens,
-            "compile_s": round(compile_s, 2),
-            "step_ms": round(sec_per_step * 1000.0, 2),
-            "tok_per_sec": round(tok_per_sec, 1),
-            "tflops": round(tflops_achieved, 2),
-            "mfu_pct": round(mfu_pct, 2),
-            "peak_hbm_gb": round(hbm_gb, 2) if hbm_gb is not None else None,
-            "loss": loss_val,
-            **xla_stats,
-        },
-        autotune_ctx,
-    )
-
-
-def diagnose_bottlenecks(
-    cfg: LoopMoEConfig,
-    preset: str,
-    kernels: dict[str, bool],
-    results: list[dict[str, Any]],
-    breakdown: dict[str, Any] | None,
-    microbatch: int,
-    seq_len: int,
-) -> list[str]:
-    """Generate actionable, prioritized bottleneck diagnostics from measured profiler telemetry."""
-    spec = TPU_SPECS[preset]
-    mxu = int(spec["mxu_size"])
-    microbatch_tokens = microbatch * seq_len
-    notes: list[str] = []
-
-    if not kernels["on_tpu"]:
-        notes.append("[Env] Running on non-TPU backend; re-run on Colab TPU v5e-1/v6e-1 for true MXU MFU.")
-    elif not kernels["tokamax_ragged_dot"]:
-        notes.append("[MoE Kernel] tokamax.ragged_dot unavailable; falling back to jax.lax.ragged_dot or gather-einsum.")
-
-    avg_tok_per_expert = (microbatch_tokens * cfg.top_k) / float(cfg.n_routed_experts)
-    if avg_tok_per_expert < mxu:
-        notes.append(
-            f"[MXU Tiling] At microbatch={microbatch} ({microbatch_tokens} tok), avg tokens/expert={avg_tok_per_expert:.1f} < MXU={mxu}. "
-            f"Experts are under-tiled (memory-bound); raise --microbatch (if HBM allows) or use larger d_ff_expert."
-        )
-    elif avg_tok_per_expert < 2 * mxu:
-        notes.append(
-            f"[MXU Tiling] Avg tokens/expert={avg_tok_per_expert:.1f} (~{avg_tok_per_expert/mxu:.2f}x MXU={mxu}). "
-            f"Load imbalance can drop busy experts below 1 full tile; watch exp_cv and tune router_bias_update_rate."
-        )
-
-    valid_res = [r for r in results if "error" not in r]
-    if valid_res:
-        max_hbm = max((r.get("peak_hbm_gb") or 0.0) for r in valid_res)
-        cap_gb = spec["hbm_capacity_gb"]
-        if max_hbm > 0.85 * cap_gb:
-            notes.append(
-                f"[HBM Pressure] Peak HBM={max_hbm:.2f} GB / {cap_gb:.0f} GB (>85%). "
-                f"Reduce --microbatch, lower --chunk-ce-size (e.g. 2048), or enable --remat-sublayers."
-            )
-        elif max_hbm > 0.0 and max_hbm < 0.65 * cap_gb and cfg.remat_sublayers:
-            notes.append(
-                f"[Remat Opportunity] Peak HBM={max_hbm:.2f} GB / {cap_gb:.0f} GB (<65%) with remat_sublayers=True. "
-                f"Try --no-remat-sublayers or raising --microbatch to trade spare HBM for ~20-30% higher MFU."
-            )
-        for r in valid_res:
-            if r.get("bound_regime") == "MEMORY-BOUND":
-                notes.append(
-                    f"[Roofline @ seq={r['seq_len']},R={r['num_loops']}] XLA arithmetic intensity="
-                    f"{r.get('arithmetic_intensity')} FLOPs/B < {preset} ridge ({spec['ridge_flops_per_byte']:.0f}); memory-bandwidth bound."
-                )
-
-    if breakdown:
-        fwd = max(breakdown.get("full_fwd", 0.0), 1e-6)
-        tot_step = fwd + breakdown.get("bwd_only_est", 0.0) + breakdown.get("optimizer_muon_adamw", 0.0)
-        moe_pct = 100.0 * breakdown.get("moe_total", 0.0) / fwd
-        sort_pct_of_moe = 100.0 * breakdown.get("moe_sort_dispatch_only", 0.0) / max(
-            breakdown.get("moe_total", 1e-6), 1e-6
-        )
-        ce_pct = 100.0 * breakdown.get("chunked_ce_loss", 0.0) / fwd
-        opt_pct = 100.0 * breakdown.get("optimizer_muon_adamw", 0.0) / max(tot_step, 1e-6)
-        mhc_pct = 100.0 * breakdown.get("mhc_gates_and_merge", 0.0) / fwd
-
-        if moe_pct > 45.0:
-            notes.append(f"[MoE Dominance] MoE takes {moe_pct:.1f}% of forward pass (sort/dispatch is {sort_pct_of_moe:.1f}% of MoE).")
-        if sort_pct_of_moe > 20.0:
-            notes.append(
-                f"[MoE Dispatch Overhead] argsort/token gather is {sort_pct_of_moe:.1f}% of MoE time; "
-                f"consider padded/capacity-factor routing or Pallas fused scatter."
-            )
-        if ce_pct > 20.0:
-            notes.append(
-                f"[Chunked CE Overhead] chunked_ce_loss takes {ce_pct:.1f}% of forward; "
-                f"try larger --chunk-ce-size (e.g. 4096/8192) if HBM allows."
-            )
-        if mhc_pct > 15.0:
-            notes.append(
-                f"[mHC Overhead] mHC Sinkhorn+merge takes {mhc_pct:.1f}% of forward; consider fewer Sinkhorn iters (10 vs 20)."
-            )
-        if opt_pct > 15.0:
-            notes.append(
-                f"[Optimizer Overhead] Un-amortized Muon+AdamW step takes {opt_pct:.1f}% of 1-microbatch step "
-                f"({cfg.n_routed_experts} experts); amortize with larger --grad-accum (e.g. 16 on v5e-1)."
-            )
-        if breakdown.get("bwd_to_fwd_ratio", 0.0) > 2.7:
-            notes.append(
-                f"[Remat Tax] bwd/fwd ratio={breakdown['bwd_to_fwd_ratio']}x (>2.7x); heavy recomputation detected."
-            )
-
-    return notes
+    return {
+        "seq_len": seq_len,
+        "num_loops": num_loops,
+        "micro_bs": micro_bs,
+        "grad_accum": grad_accum,
+        "step_tokens": step_tokens,
+        "compile_s": round(compile_s, 2),
+        "step_ms": round(sec_per_step * 1000.0, 2),
+        "tok_per_sec": round(tok_per_sec, 1),
+        "tflops": round(tflops_achieved, 2),
+        "mfu_pct": round(mfu_pct, 2),
+        "peak_hbm_gb": round(hbm_gb, 2) if hbm_gb is not None else None,
+        "loss": loss_val,
+        **xla_stats,
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -502,15 +227,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, default=2)
     parser.add_argument("--bench-steps", type=int, default=5)
     parser.add_argument("--peak-tflops", type=float, default=None)
-    parser.add_argument("--breakdown", action="store_true", help="Run per-module micro-profiler.")
-    parser.add_argument("--breakdown-seq-len", type=int, default=4096)
     parser.add_argument("--profile-dir", type=str, default=None, help="Output dir for JAX XProf/Perfetto trace.")
     parser.add_argument("--profile-seq-len", type=int, default=None)
     parser.add_argument("--profile-loops", type=int, default=1)
     parser.add_argument("--profile-steps", type=int, default=3)
     parser.add_argument("--use-csa2-long", action="store_true")
     parser.add_argument("--tiny", action="store_true")
-    parser.add_argument("--out-json", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -555,16 +277,13 @@ def main() -> None:
             points.append((target_4k, 8))
 
     prof_target_seq = args.profile_seq_len or (seq_lens[0] if args.tiny else (4096 if 4096 in seq_lens else seq_lens[0]))
-    breakdown_target_seq = seq_lens[0] if args.tiny else args.breakdown_seq_len
-    breakdown_autotune_ctx: Any = contextlib.nullcontext()
-    results: list[dict[str, Any]] = []
     print("\n| SeqLen | Loops | Batch | Compile(s) | Step(ms) | Tok/s | TFLOPS | MFU(%) | PeakHBM(GB) | XLA_AI | Regime |")
     print("| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
 
     for seq_len, loops in points:
         trace_here = args.profile_dir if (args.profile_dir and seq_len == prof_target_seq and loops == args.profile_loops) else None
         try:
-            res, pt_autotune_ctx = _run_single_point(
+            res = _run_single_point(
                 base_cfg=base_cfg,
                 seq_len=seq_len,
                 num_loops=loops,
@@ -580,9 +299,6 @@ def main() -> None:
                 seed=args.seed,
                 autotune=args.autotune,
             )
-            if seq_len == breakdown_target_seq and loops == 1:
-                breakdown_autotune_ctx = pt_autotune_ctx
-            results.append(res)
             hbm_str = f"{res['peak_hbm_gb']:.2f}" if res["peak_hbm_gb"] is not None else "N/A"
             ai_str = f"{res['arithmetic_intensity']:.1f}" if "arithmetic_intensity" in res else "N/A"
             reg_str = res.get("bound_regime", "N/A")
@@ -593,47 +309,6 @@ def main() -> None:
             )
         except Exception as exc:
             print(f"| {seq_len} | {loops} | ERR | - | - | - | - | - | - | - | {type(exc).__name__}: {exc} |")
-            results.append({"seq_len": seq_len, "num_loops": loops, "error": str(exc)})
-
-    breakdown: dict[str, Any] | None = None
-    if args.breakdown:
-        b_cfg = base_cfg.with_stage(seq_len=breakdown_target_seq, num_loops=1, use_csa2_indexer=args.use_csa2_long)
-        breakdown = run_module_breakdown(
-            b_cfg,
-            breakdown_target_seq,
-            micro_bs,
-            warmup=args.warmup_steps,
-            iters=args.bench_steps,
-            seed=args.seed,
-            autotune_ctx=breakdown_autotune_ctx,
-        )
-        print(f"\n=== Module Micro-Breakdown (seq={breakdown_target_seq}, microbatch={micro_bs}, R=1) ===")
-        fwd_ref = max(breakdown["full_fwd"], 1e-6)
-        for k, v in breakdown.items():
-            if k in ("bwd_to_fwd_ratio",):
-                print(f"  {k:24s}: {v}x")
-            else:
-                pct = 100.0 * float(v) / fwd_ref
-                print(f"  {k:24s}: {v:8.3f} ms ({pct:5.1f}% of full_fwd)")
-
-    diagnoses = diagnose_bottlenecks(base_cfg, args.tpu_preset, kernels, results, breakdown, micro_bs, seq_lens[0])
-    print("\n=== Automated Bottleneck Diagnostics ===")
-    for note in diagnoses:
-        print(f"- {note}")
-
-    if args.out_json:
-        out_path = Path(args.out_json)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "preset": args.tpu_preset,
-            "kernels": kernels,
-            "config": base_cfg.to_dict(),
-            "results": results,
-            "breakdown": breakdown,
-            "diagnoses": diagnoses,
-        }
-        out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        print(f"\nSaved benchmark & profiler report to {out_path}")
 
 
 if __name__ == "__main__":

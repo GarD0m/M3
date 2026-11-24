@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -160,10 +162,11 @@ def apply_engram_step(
 
     h_norm = rms_norm(h_t, params["norm_q_w"], eps=cfg.rms_norm_eps)
 
-    gate_logits = jnp.sum(h_norm * k_norm, axis=-1, keepdims=True, dtype=jnp.float32) / jnp.sqrt(
-        float(cfg.d_model)
+    dt = h_t.dtype
+    gate_logits = jnp.sum(h_norm * k_norm, axis=-1, keepdims=True, dtype=dt) * jnp.asarray(
+        1.0 / math.sqrt(float(cfg.d_model)), dtype=dt
     )
-    gate = jax.nn.sigmoid(gate_logits).astype(h_t.dtype)
+    gate = jax.nn.sigmoid(gate_logits)
     u = gate * v
 
     u_norm = rms_norm(u, params["norm_conv_w"], eps=cfg.rms_norm_eps)

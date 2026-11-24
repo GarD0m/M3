@@ -81,7 +81,7 @@ def _single_loop_step(
         alpha_attn = alphas[1].astype(dt)
         alpha_moe = alphas[2].astype(dt)
 
-        if cfg.embed_reinject_lambda > 0.0:
+        if cfg.embed_reinject_lambda > 0.0 and cfg.num_loops > 1:
             # LOOM embedding re-injection for t >= 1 (1-indexed t >= 2), gated by alpha_engram so
             # R=1 -> R=N expansion preserves exact step-0 logits when loop_alpha[1:, 0] == 0.
             g_t = jnp.asarray(cfg.embed_reinject_lambda, dtype=dt) / jnp.asarray(loop_idx + 1, dtype=dt)
@@ -198,26 +198,36 @@ def forward_hidden(
     stream_init = params["mhc"]["stream_init"] if cfg.use_mhc else None
     x_streams = expand_streams(x, stream_init)
 
-    def scan_body(carry: jax.Array, loop_idx: jax.Array):
-        return _single_loop_step(params, carry, x_embed, engram_kv, loop_idx, cfg)
+    if cfg.num_loops == 1:
+        x_streams, (ec0, seq_aux_loss, gate_mean0, router_mmr) = _single_loop_step(
+            params, x_streams, x_embed, engram_kv, 0, cfg
+        )
+        expert_counts = ec0[None, :]
+        engram_gate_mean = (
+            pre_gate_mean if (cfg.use_engram and cfg.engram_pre_loop_only) else gate_mean0
+        )
+    else:
+        def scan_body(carry: jax.Array, loop_idx: jax.Array):
+            return _single_loop_step(params, carry, x_embed, engram_kv, loop_idx, cfg)
 
-    use_loop_remat = cfg.remat_per_loop and (cfg.num_loops > 1)
-    step_fn = jax.checkpoint(scan_body) if use_loop_remat else scan_body
-    loop_indices = jnp.arange(cfg.num_loops, dtype=jnp.int32)
-    x_streams, (expert_counts, seq_aux_losses, gate_means, router_mmrs) = jax.lax.scan(
-        step_fn, x_streams, loop_indices
-    )
-    seq_aux_loss = jnp.mean(seq_aux_losses)
-    engram_gate_mean = (
-        pre_gate_mean if (cfg.use_engram and cfg.engram_pre_loop_only) else jnp.mean(gate_means)
-    )
+        use_loop_remat = cfg.remat_per_loop and (cfg.num_loops > 1)
+        step_fn = jax.checkpoint(scan_body) if use_loop_remat else scan_body
+        loop_indices = jnp.arange(cfg.num_loops, dtype=jnp.int32)
+        x_streams, (expert_counts, seq_aux_losses, gate_means, router_mmrs) = jax.lax.scan(
+            step_fn, x_streams, loop_indices
+        )
+        seq_aux_loss = jnp.mean(seq_aux_losses)
+        engram_gate_mean = (
+            pre_gate_mean if (cfg.use_engram and cfg.engram_pre_loop_only) else jnp.mean(gate_means)
+        )
+        router_mmr = jnp.mean(router_mmrs)
 
     hidden = rms_norm(collapse_streams(x_streams), params["final_norm_w"], eps=cfg.rms_norm_eps)
     aux = {
         "expert_counts": expert_counts,  # [num_loops, E]
         "seq_aux_loss": seq_aux_loss,
         "engram_gate_mean": engram_gate_mean,
-        "router_mmr": jnp.mean(router_mmrs),
+        "router_mmr": router_mmr,
     }
     return hidden, aux
 

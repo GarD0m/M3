@@ -203,7 +203,8 @@ def orthogonalize_via_cubic_ns(
             mat = mat.T
             transposed = True
         norm = jnp.sqrt(jnp.sum(jnp.square(mat), dtype=jnp.float32)) + jnp.asarray(eps, dtype=jnp.float32)
-        mat = (mat.astype(jnp.float32) / norm).astype(dt)
+        inv_norm = (jnp.asarray(1.0, dtype=jnp.float32) / norm).astype(dt)
+        mat = mat * inv_norm
         for a_val, b_val in coeffs:
             gram = mat @ mat.T
             mat = jnp.asarray(a_val, dtype=dt) * mat + jnp.asarray(b_val, dtype=dt) * (gram @ mat)
@@ -239,16 +240,26 @@ def scale_by_cubic_muon(
             if callable(weight_dimension_numbers)
             else weight_dimension_numbers
         )
+        def _bias_corr_native(tree: Any, step_count: jax.Array) -> Any:
+            inv_bias_corr = jnp.asarray(1.0, dtype=jnp.float32) / (
+                jnp.asarray(1.0, dtype=jnp.float32)
+                - jnp.asarray(beta, dtype=jnp.float32) ** step_count.astype(jnp.float32)
+            )
+            return jax.tree_util.tree_map(lambda x: x * inv_bias_corr.astype(x.dtype), tree)
+
         mu = optax.tree.update_moment(updates, state.mu, beta, 1)
         count_inc = optax.tree.safe_increment(state.count) if hasattr(optax.tree, "safe_increment") else (state.count + jnp.asarray(1, dtype=jnp.int32))
         if nesterov:
+            mu_corr = _bias_corr_native(mu, count_inc + jnp.asarray(1, dtype=jnp.int32))
+            g_corr = _bias_corr_native(updates, count_inc)
             mu_hat = jax.tree_util.tree_map(
-                lambda m, g: beta * m + (1.0 - beta) * g,
-                optax.tree.bias_correction(mu, beta, count_inc + jnp.asarray(1, dtype=jnp.int32)),
-                optax.tree.bias_correction(updates, beta, count_inc),
+                lambda m, g: jnp.asarray(beta, dtype=m.dtype) * m
+                + jnp.asarray(1.0 - beta, dtype=g.dtype) * g,
+                mu_corr,
+                g_corr,
             )
         else:
-            mu_hat = optax.tree.bias_correction(mu, beta, count_inc)
+            mu_hat = _bias_corr_native(mu, count_inc)
 
         is_leaf = lambda v: v is None or _is_weight_dim_nums(v)
         ortho_updates = jax.tree_util.tree_map(

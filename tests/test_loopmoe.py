@@ -25,6 +25,7 @@ from loopmoe.config import (
 )
 from loopmoe.engram import _causal_depthwise_conv1d
 from loopmoe.mhc import (
+    collapse_streams,
     init_mhc_sublayer_params,
     mhc_compute_gates,
     mhc_post_merge,
@@ -298,6 +299,9 @@ def test_muon_adamw_optimizer_per_expert_and_no_decay() -> None:
         assert float(jnp.linalg.norm(updates["moe"]["w_down"])) > 0.0
         assert float(jnp.linalg.norm(updates["mla"]["w_dq"])) > 0.0
         assert float(jnp.linalg.norm(updates["embed_tokens"])) > 0.0
+        if mode == "cubic5":
+            assert updates["moe"]["w_gate_up"].dtype == jnp.bfloat16
+            assert updates["mla"]["w_dq"].dtype == jnp.bfloat16
         assert new_opt_state is not None
 
     # 4. Aux-Loss-Free bias update direction
@@ -666,6 +670,7 @@ def test_2stream_closed_form_mhc_and_engram_conv() -> None:
         p2["alpha_res"] = jnp.asarray(0.4, dtype=jnp.float32)
         p2["b_res"] = jnp.asarray([0.3], dtype=jnp.float32)
         xs = jax.random.normal(k3, (2, 6, 2, 32), dtype=dtype)
+        assert collapse_streams(xs).dtype == dtype
 
         hi, hp, hpo, hr = mhc_compute_gates(p2, xs, sinkhorn_iters=10, eps=1e-6)
         assert hr.shape == (2, 6, 2, 2)
