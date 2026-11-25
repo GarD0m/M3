@@ -108,7 +108,7 @@ def _run_single_point(
     ridge_fpb: float,
     use_csa2: bool,
     profile_dir: str | None,
-    profile_steps: int,
+    profile_steps: int | None,
     seed: int,
     autotune: bool = True,
 ) -> dict[str, Any]:
@@ -152,27 +152,31 @@ def _run_single_point(
             params, opt_state, metrics = compiled(params, opt_state, bx, by)
             jax.block_until_ready(metrics["loss"])
 
-        # Optional JAX Profiler XProf / Perfetto trace capture
+        # Timed steady-state benchmark (single pass; shares steps with XProf trace if profile_dir is set)
         if profile_dir:
+            n_run = profile_steps if (profile_steps is not None and profile_steps > 0) else bench_steps
             pdir = Path(profile_dir)
             pdir.mkdir(parents=True, exist_ok=True)
             jax.profiler.start_trace(str(pdir))
             try:
-                for s_idx in range(profile_steps):
+                t_start = time.perf_counter()
+                for s_idx in range(n_run):
                     with jax.profiler.StepTraceAnnotation("train_step", step_num=s_idx):
                         params, opt_state, metrics = compiled(params, opt_state, bx, by)
-                        jax.block_until_ready(metrics["loss"])
+                jax.block_until_ready(metrics["loss"])
+                elapsed = max(time.perf_counter() - t_start, 1e-6)
             finally:
                 jax.profiler.stop_trace()
+            steps_timed = n_run
+        else:
+            t_start = time.perf_counter()
+            for _ in range(bench_steps):
+                params, opt_state, metrics = compiled(params, opt_state, bx, by)
+            jax.block_until_ready(metrics["loss"])
+            elapsed = max(time.perf_counter() - t_start, 1e-6)
+            steps_timed = bench_steps
 
-        # Timed steady-state benchmark
-        t_start = time.perf_counter()
-        for _ in range(bench_steps):
-            params, opt_state, metrics = compiled(params, opt_state, bx, by)
-        jax.block_until_ready(metrics["loss"])
-        elapsed = max(time.perf_counter() - t_start, 1e-6)
-
-    sec_per_step = elapsed / float(bench_steps)
+    sec_per_step = elapsed / float(steps_timed)
     tok_per_sec = float(step_tokens) / sec_per_step
     step_flops = estimate_step_flops(cfg, micro_bs, seq_len) * grad_accum
     tflops_achieved = (step_flops / sec_per_step) / 1e12
@@ -230,7 +234,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profile-dir", type=str, default=None, help="Output dir for JAX XProf/Perfetto trace.")
     parser.add_argument("--profile-seq-len", type=int, default=None)
     parser.add_argument("--profile-loops", type=int, default=1)
-    parser.add_argument("--profile-steps", type=int, default=3)
+    parser.add_argument(
+        "--profile-steps",
+        type=int,
+        default=None,
+        help="Optional step count when profiling (defaults to --bench-steps; runs once for both timing and trace).",
+    )
     parser.add_argument("--use-csa2-long", action="store_true")
     parser.add_argument("--tiny", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
