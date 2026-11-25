@@ -326,7 +326,12 @@ def parse_args() -> argparse.Namespace:
         default="v6e-1",
         help="Hardware preset adjusting peak TFLOPS, chunk CE size, sublayer remat, and default microbatch.",
     )
-    parser.add_argument("--remat-sublayers", action="store_true", help="Enable sublayer remat inside loop.")
+    parser.add_argument(
+        "--remat-sublayers",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable/disable sublayer remat inside loop (auto-enabled on v5e-1 at >=16K).",
+    )
     parser.add_argument(
         "--remat-moe",
         action=argparse.BooleanOptionalAction,
@@ -334,6 +339,12 @@ def parse_args() -> argparse.Namespace:
         help="Checkpoint only the MoE sublayer (saves ~3 GB HBM at microbatch>=8 without recomputing MLA/mHC).",
     )
     parser.add_argument("--chunk-ce-size", type=int, default=None, help="Chunk size for chunked cross-entropy.")
+    parser.add_argument(
+        "--moe-chunk-size",
+        type=int,
+        default=None,
+        help="Token chunk size inside MoE to reduce peak HBM at >=16K (0=unchunked; auto 4096 on v5e-1 at seq>=16384).",
+    )
     parser.add_argument(
         "--autotune",
         action=argparse.BooleanOptionalAction,
@@ -410,6 +421,8 @@ def main() -> None:
         cfg_overrides["remat_moe"] = True
     if args.chunk_ce_size is not None:
         cfg_overrides["chunk_ce_size"] = args.chunk_ce_size
+    if args.moe_chunk_size is not None:
+        cfg_overrides["moe_chunk_size"] = args.moe_chunk_size
     if cfg_overrides:
         base_cfg = LoopMoEConfig(**{**base_cfg.to_dict(), **cfg_overrides})
     print(summarize_model(base_cfg))
@@ -501,10 +514,26 @@ def main() -> None:
             # Keep idx_* parameter shapes consistent across stages while staying dense below 16K
             stage_overrides["csa2_topk"] = stage.seq_len
         if args.tpu_preset == "v5e-1" and not args.tiny and stage.seq_len >= 16384:
+            if args.remat_sublayers is None and not stage_model_cfg.remat_sublayers:
+                stage_overrides["remat_sublayers"] = True
             if args.remat_moe is None and not stage_model_cfg.remat_moe:
                 stage_overrides["remat_moe"] = True
+            if args.moe_chunk_size is None and stage_model_cfg.moe_chunk_size == 0:
+                stage_overrides["moe_chunk_size"] = 4096
             if args.chunk_ce_size is None and stage_model_cfg.chunk_ce_size > 4096:
                 stage_overrides["chunk_ce_size"] = 4096
+            explicit_risks = []
+            if args.remat_sublayers is False:
+                explicit_risks.append("--no-remat-sublayers")
+            if args.remat_moe is False:
+                explicit_risks.append("--no-remat-moe")
+            if args.chunk_ce_size is not None and args.chunk_ce_size > 4096:
+                explicit_risks.append(f"--chunk-ce-size {args.chunk_ce_size}")
+            if explicit_risks:
+                print(
+                    f"[WARN v5e-1 @ seq={stage.seq_len}] Explicit flags disable 16 GB HBM savings: "
+                    + ", ".join(explicit_risks)
+                )
         if stage_overrides:
             stage_model_cfg = LoopMoEConfig(**{**stage_model_cfg.to_dict(), **stage_overrides})
 

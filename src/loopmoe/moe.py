@@ -348,42 +348,17 @@ def _token_drop_scatter_bwd(
 _token_drop_scatter.defvjp(_token_drop_scatter_fwd, _token_drop_scatter_bwd)
 
 
-def apply_moe(
+def _apply_moe_core(
     params: dict[str, jax.Array],
-    x: jax.Array,
+    x_flat: jax.Array,
     loop_idx: jax.Array | int,
     cfg: LoopMoEConfig,
-    keep_scores: jax.Array | None = None,
-    capacity_factor: float = 1.0,
+    active_bsz: int,
+    active_seq: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Run DeepSeek-V4.1-Flash fine-grained MoE with optional training early-exit token dropping.
-
-    Returns:
-        out: [B, S, D] MoE output tensor (zeros for early-exited tokens when `keep_scores` drops them).
-        expert_counts: [E] token assignment counts (float32) for Aux-Loss-Free bias updates.
-        seq_aux_loss: scalar sequence-wise balance regularization loss.
-        router_mmr: scalar Foil Median Margin Ratio diagnostic.
-    """
-    bsz, seq_len, d_model = x.shape
-    num_tokens = bsz * seq_len
-    x_flat = x.reshape(num_tokens, d_model)
+    """Core single-chunk / full-batch MoE computation over `[N, D]` tokens."""
+    num_tokens, _ = x_flat.shape
     dt = x_flat.dtype
-
-    active_idx: jax.Array | None = None
-    gather_back_idx: jax.Array | None = None
-    active_bsz, active_seq = bsz, seq_len
-    if keep_scores is not None and 0.0 < capacity_factor < 1.0 and num_tokens > 1:
-        cap = max(1, int(math.ceil(num_tokens * float(capacity_factor))))
-        if num_tokens >= 128:
-            cap = min(num_tokens, ((cap + 127) // 128) * 128)
-        if cap < num_tokens:
-            _, active_idx = jax.lax.top_k(keep_scores.reshape(num_tokens), cap)
-            gather_back_idx = jnp.full((num_tokens,), cap, dtype=jnp.int32).at[active_idx].set(
-                jnp.arange(cap, dtype=jnp.int32)
-            )
-            x_flat = _token_drop_gather(x_flat, active_idx, gather_back_idx)
-            num_tokens = cap
-            active_bsz, active_seq = 1, cap
 
     # 1. Sigmoid routing + Aux-Loss-Free bias (bias excluded from gradient flow)
     with jax.named_scope("moe_router"):
@@ -399,7 +374,7 @@ def apply_moe(
         )
         z_sorted = jnp.sort(z_sub, axis=-1)
         mid_idx = cfg.n_routed_experts - (cfg.n_routed_experts // 2)
-        router_mmr = jnp.exp(jnp.clip(jnp.mean(z_sorted[:, -1] - z_sorted[:, mid_idx]), -20.0, 20.0))
+        mean_margin = jnp.mean(z_sorted[:, -1] - z_sorted[:, mid_idx])
 
         scores = jax.nn.sigmoid(router_logits)
         bias_f32 = jax.lax.stop_gradient(params["router_bias"][loop_idx])
@@ -470,6 +445,72 @@ def apply_moe(
     total_flat = routed_out + shared_out
     if cfg.use_post_moe_rmsnorm:
         total_flat = rms_norm(total_flat, params["post_norm_w"], eps=cfg.rms_norm_eps)
+    return total_flat, expert_counts, seq_aux_loss, mean_margin
+
+
+def apply_moe(
+    params: dict[str, jax.Array],
+    x: jax.Array,
+    loop_idx: jax.Array | int,
+    cfg: LoopMoEConfig,
+    keep_scores: jax.Array | None = None,
+    capacity_factor: float = 1.0,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Run DeepSeek-V4.1-Flash fine-grained MoE with optional token dropping & token-chunked scan."""
+    bsz, seq_len, d_model = x.shape
+    num_tokens = bsz * seq_len
+    x_flat = x.reshape(num_tokens, d_model)
+
+    active_idx: jax.Array | None = None
+    gather_back_idx: jax.Array | None = None
+    active_bsz, active_seq = bsz, seq_len
+    if keep_scores is not None and 0.0 < capacity_factor < 1.0 and num_tokens > 1:
+        cap = max(1, int(math.ceil(num_tokens * float(capacity_factor))))
+        if num_tokens >= 128:
+            cap = min(num_tokens, ((cap + 127) // 128) * 128)
+        if cap < num_tokens:
+            _, active_idx = jax.lax.top_k(keep_scores.reshape(num_tokens), cap)
+            gather_back_idx = jnp.full((num_tokens,), cap, dtype=jnp.int32).at[active_idx].set(
+                jnp.arange(cap, dtype=jnp.int32)
+            )
+            x_flat = _token_drop_gather(x_flat, active_idx, gather_back_idx)
+            num_tokens = cap
+            active_bsz, active_seq = 1, cap
+
+    chunk_sz = int(cfg.moe_chunk_size)
+    if (
+        chunk_sz > 0
+        and num_tokens > chunk_sz
+        and num_tokens % chunk_sz == 0
+        and cfg.seq_aux_loss_weight == 0.0
+    ):
+        num_chunks = num_tokens // chunk_sz
+        x_chunks = x_flat.reshape(num_chunks, chunk_sz, d_model)
+
+        def _chunk_step(carry, x_chunk):
+            ec_acc, margin_acc = carry
+            out_c, ec_c, _, margin_c = _apply_moe_core(
+                params, x_chunk, loop_idx, cfg, 1, chunk_sz
+            )
+            return (ec_acc + ec_c, margin_acc + margin_c), out_c
+
+        init_counts = jnp.zeros((cfg.n_routed_experts,), dtype=jnp.float32)
+        init_margin = jnp.asarray(0.0, dtype=jnp.float32)
+        (expert_counts, margin_sum), out_chunks = jax.lax.scan(
+            jax.checkpoint(_chunk_step),
+            (init_counts, init_margin),
+            x_chunks,
+            unroll=1,
+        )
+        total_flat = out_chunks.reshape(num_tokens, d_model)
+        seq_aux_loss = jnp.asarray(0.0, dtype=jnp.float32)
+        router_mmr = jnp.exp(jnp.clip(margin_sum / float(num_chunks), -20.0, 20.0))
+    else:
+        total_flat, expert_counts, seq_aux_loss, mean_margin = _apply_moe_core(
+            params, x_flat, loop_idx, cfg, active_bsz, active_seq
+        )
+        router_mmr = jnp.exp(jnp.clip(mean_margin, -20.0, 20.0))
+
     if active_idx is not None:
         assert gather_back_idx is not None
         scattered = _token_drop_scatter(total_flat, active_idx, gather_back_idx)

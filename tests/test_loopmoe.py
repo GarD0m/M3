@@ -53,6 +53,7 @@ from loopmoe.model import (
     forward_logits,
     forward_model,
     init_model_params,
+    summarize_model,
 )
 from loopmoe.moe import (
     _extract_topk_scores,
@@ -62,6 +63,8 @@ from loopmoe.moe import (
     _sorted_weights_from_sort,
     _token_drop_gather,
     _token_drop_scatter,
+    apply_moe,
+    init_moe_params,
     update_router_biases,
 )
 from loopmoe.optim import (
@@ -1134,3 +1137,40 @@ def test_glm54_kv_reuse_and_dynamic_loop_early_exit() -> None:
         np.asarray(logits_static_full, dtype=np.float32),
         atol=1e-2,
     )
+
+
+def test_token_chunked_moe_and_r1_summary() -> None:
+    """Verify token-chunked MoE matches unchunked forward/grads and R=1 summary reports dyn=False."""
+    s_r1 = summarize_model(LoopMoEConfig.tiny(num_loops=1))
+    assert "R=1, dyn=False" in s_r1 and "dyn=True" not in s_r1
+    s_r8 = summarize_model(LoopMoEConfig.tiny(num_loops=8))
+    assert "max_R=8, dyn=True" in s_r8
+
+    k1, k2, k3 = jax.random.split(jax.random.PRNGKey(1301), 3)
+    for dtype, tol in ((jnp.float32, 1e-5), (jnp.bfloat16, 2e-2)):
+        cfg_ref = LoopMoEConfig(
+            **{**LoopMoEConfig.tiny(num_loops=1).to_dict(), "dtype_name": "float32" if dtype == jnp.float32 else "bfloat16", "moe_chunk_size": 0}
+        )
+        cfg_chk = LoopMoEConfig(**{**cfg_ref.to_dict(), "moe_chunk_size": 16})
+        moe_p = init_moe_params(k1, cfg_ref, dtype=dtype)
+        x_in = jax.random.normal(k2, (2, 32, cfg_ref.d_model), dtype=dtype)
+        cot = jax.random.normal(k3, (2, 32, cfg_ref.d_model), dtype=jnp.float32)
+
+        def _run(p, x, c):
+            out, ec, aux_l, mmr = apply_moe(p, x, 0, c)
+            loss = jnp.mean(out.astype(jnp.float32) * cot) + aux_l
+            return loss, (out, ec, mmr)
+
+        (_, (out_ref, ec_ref, mmr_ref)), (gp_ref, gx_ref) = jax.jit(
+            jax.value_and_grad(_run, argnums=(0, 1), has_aux=True), static_argnums=(2,)
+        )(moe_p, x_in, cfg_ref)
+        (_, (out_chk, ec_chk, mmr_chk)), (gp_chk, gx_chk) = jax.jit(
+            jax.value_and_grad(_run, argnums=(0, 1), has_aux=True), static_argnums=(2,)
+        )(moe_p, x_in, cfg_chk)
+
+        np.testing.assert_allclose(np.asarray(out_chk, dtype=np.float32), np.asarray(out_ref, dtype=np.float32), atol=tol, rtol=tol)
+        np.testing.assert_array_equal(np.asarray(ec_chk), np.asarray(ec_ref))
+        assert jnp.isfinite(mmr_chk) and float(mmr_chk) >= 1.0 and float(mmr_ref) >= 1.0
+        np.testing.assert_allclose(np.asarray(gx_chk, dtype=np.float32), np.asarray(gx_ref, dtype=np.float32), atol=tol, rtol=tol)
+        for lr, lc in zip(jax.tree_util.tree_leaves(gp_ref), jax.tree_util.tree_leaves(gp_chk), strict=True):
+            np.testing.assert_allclose(np.asarray(lc, dtype=np.float32), np.asarray(lr, dtype=np.float32), atol=tol, rtol=tol)

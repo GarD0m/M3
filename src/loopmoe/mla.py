@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import math
+import warnings
 
 import jax
 import jax.numpy as jnp
@@ -298,8 +299,12 @@ def _run_causal_attention(
                 )
                 out = attn_op(q_pad, k_pad, v_pad, is_causal=True, logits_scale=softmax_scale)
                 return out[..., :d_v]
-            except Exception:
-                pass
+            except Exception as exc:
+                warnings.warn(
+                    f"[MLA] PallasMosaicTpuFlashAttention failed at seq_len={seq_len}: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
         try:
             import tokamax  # type: ignore
@@ -316,8 +321,12 @@ def _run_causal_attention(
                     kwargs["implementation"] = "mosaic"
                 out = fn(q_pad, k_pad, v_pad, **kwargs)
                 return out[..., :d_v]
-        except Exception:
-            pass
+        except Exception as exc:
+            warnings.warn(
+                f"[MLA] tokamax.dot_product_attention failed at seq_len={seq_len}: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
         if seq_len >= 128 and seq_len % 128 == 0:
             try:
@@ -336,8 +345,12 @@ def _run_causal_attention(
                 v_hsd = jnp.swapaxes(v_pad, 1, 2)
                 out_hsd = jax.vmap(splash_fn)(q_hsd, k_hsd, v_hsd)
                 return jnp.swapaxes(out_hsd, 1, 2)[..., :d_v]
-            except Exception:
-                pass
+            except Exception as exc:
+                warnings.warn(
+                    f"[MLA] splash_attention failed at seq_len={seq_len}: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
     return _sdpa_matched(q, k, v)
 

@@ -213,6 +213,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--microbatch", type=int, default=None, help="Microbatch size in sequences per step (default: 4 on v5e-1, 8 on v6e-1, 2 on --tiny).")
     parser.add_argument("--grad-accum", type=int, default=None, help="Gradient accumulation steps (default: 16 on v5e-1, 8 on v6e-1, 1 on --tiny).")
     parser.add_argument("--chunk-ce-size", type=int, default=None)
+    parser.add_argument(
+        "--moe-chunk-size",
+        type=int,
+        default=None,
+        help="Token chunk size inside MoE to reduce peak HBM at >=16K (0=unchunked; auto 4096 on v5e-1 at seq>=16384).",
+    )
     parser.add_argument("--remat-sublayers", action="store_true", default=None)
     parser.add_argument("--no-remat-sublayers", action="store_false", dest="remat_sublayers")
     parser.add_argument(
@@ -250,6 +256,7 @@ def main() -> None:
     micro_bs = args.microbatch or (2 if args.tiny else int(spec["default_microbatch"]))
     grad_accum = args.grad_accum or (1 if args.tiny else int(spec["default_grad_accum"]))
     chunk_ce = args.chunk_ce_size or (16 if args.tiny else int(spec["default_chunk_ce_size"]))
+    moe_chunk = 0 if args.moe_chunk_size is None else args.moe_chunk_size
     seq_lens = args.seq_lens or ([32] if args.tiny else [4096])
 
     kernels = _probe_tpu_kernels()
@@ -264,15 +271,30 @@ def main() -> None:
         **{
             **base_cfg.to_dict(),
             "chunk_ce_size": chunk_ce,
+            "moe_chunk_size": moe_chunk,
             "remat_sublayers": remat_sub,
             "remat_moe": remat_moe,
             "use_csa2_indexer": bool(args.use_csa2_long),
         }
     )
-    print(summarize_model(base_cfg))
     print(
-        f"Execution config: microbatch={micro_bs} (seq={seq_lens[0]} -> {micro_bs * seq_lens[0]} tok), "
-        f"grad_accum={grad_accum}, chunk_ce={chunk_ce}, remat_sublayers={remat_sub}, remat_moe={remat_moe}, autotune={args.autotune}"
+        summarize_model(
+            base_cfg.with_stage(
+                seq_len=seq_lens[0],
+                num_loops=max(args.loops),
+                use_csa2_indexer=bool(args.use_csa2_long),
+            )
+        )
+    )
+    first_micro = (
+        micro_bs
+        if (args.microbatch is not None or args.tiny)
+        else max(1, (int(spec["default_microbatch"]) * 4096) // seq_lens[0])
+    )
+    print(
+        f"Execution config: microbatch={first_micro} (seq={seq_lens[0]} -> {first_micro * seq_lens[0]} tok), "
+        f"grad_accum={grad_accum}, chunk_ce={chunk_ce}, moe_chunk={moe_chunk}, "
+        f"remat_sublayers={remat_sub}, remat_moe={remat_moe}, autotune={args.autotune}"
     )
 
     points: list[tuple[int, int]] = [(s, r) for r in args.loops for s in seq_lens]
@@ -286,10 +308,19 @@ def main() -> None:
 
     for seq_len, loops in points:
         point_cfg = base_cfg
+        point_micro_bs = (
+            micro_bs
+            if (args.microbatch is not None or args.tiny)
+            else max(1, (int(spec["default_microbatch"]) * 4096) // seq_len)
+        )
         if args.tpu_preset == "v5e-1" and not args.tiny and seq_len >= 16384:
             auto_overrides: dict[str, Any] = {}
+            if args.remat_sublayers is None and not base_cfg.remat_sublayers:
+                auto_overrides["remat_sublayers"] = True
             if args.remat_moe is None and not base_cfg.remat_moe:
                 auto_overrides["remat_moe"] = True
+            if args.moe_chunk_size is None and base_cfg.moe_chunk_size == 0:
+                auto_overrides["moe_chunk_size"] = 4096
             if args.chunk_ce_size is None and base_cfg.chunk_ce_size > 4096:
                 auto_overrides["chunk_ce_size"] = 4096
             if auto_overrides:
@@ -297,6 +328,19 @@ def main() -> None:
                 print(
                     f"[Auto-HBM v5e-1 @ seq={seq_len}] "
                     + ", ".join(f"{k}={v}" for k, v in auto_overrides.items())
+                )
+            explicit_risks = []
+            if args.remat_sublayers is False:
+                explicit_risks.append("--no-remat-sublayers")
+            if args.remat_moe is False:
+                explicit_risks.append("--no-remat-moe")
+            if args.chunk_ce_size is not None and args.chunk_ce_size > 4096:
+                explicit_risks.append(f"--chunk-ce-size {args.chunk_ce_size}")
+            if explicit_risks:
+                print(
+                    f"[WARN v5e-1 @ seq={seq_len}] Explicit flags disable 16 GB HBM savings: "
+                    + ", ".join(explicit_risks)
+                    + " (omit them to auto-fit 32K)"
                 )
         trace_here = (
             None
@@ -312,7 +356,7 @@ def main() -> None:
                 base_cfg=point_cfg,
                 seq_len=seq_len,
                 num_loops=loops,
-                microbatch=micro_bs,
+                microbatch=point_micro_bs,
                 grad_accum=grad_accum,
                 warmup_steps=args.warmup_steps,
                 bench_steps=args.bench_steps,

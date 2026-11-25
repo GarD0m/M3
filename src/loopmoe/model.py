@@ -1598,10 +1598,14 @@ expand_checkpoint_1_to_8_loops = expand_checkpoint_1_to_n_loops
 def summarize_model(cfg: LoopMoEConfig) -> str:
     """Format human-readable parameter and capacity breakdown."""
     stats = count_analytic_params(cfg)
+    loop_summary = (
+        f"max_R={cfg.num_loops}, dyn={cfg.is_dynamic_loop_active}, kv_reuse={cfg.reuse_kv_across_loops}, "
+        f"cap={cfg.train_loop_capacity_factor:.2f}, ce_k={cfg.dynamic_loop_ce_sample_depths}"
+        if cfg.num_loops > 1
+        else "R=1, dyn=False"
+    )
     return (
-        f"LoopMoE(d={cfg.d_model}, V={cfg.vocab_size}, max_R={cfg.num_loops}, "
-        f"dyn={cfg.use_dynamic_loop}, kv_reuse={cfg.reuse_kv_across_loops}, "
-        f"cap={cfg.train_loop_capacity_factor:.2f}, ce_k={cfg.dynamic_loop_ce_sample_depths}, "
+        f"LoopMoE(d={cfg.d_model}, V={cfg.vocab_size}, {loop_summary}, "
         f"experts={cfg.n_routed_experts}x{cfg.d_ff_expert} top-{cfg.top_k}+shared) | "
         f"Total={stats['total']/1e6:.2f}M | Emb={stats['embedding']/1e6:.2f}M | "
         f"Engram={stats['engram_total']/1e6:.2f}M ({stats['engram_sparse_ratio']*100:.1f}% sparse) | "

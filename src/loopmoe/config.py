@@ -178,6 +178,11 @@ class LoopMoEConfig:
     remat_per_loop: bool = True
     remat_sublayers: bool = False
     remat_moe: bool = False
+    moe_chunk_size: int = 0
+
+    @property
+    def is_dynamic_loop_active(self) -> bool:
+        return bool(self.use_dynamic_loop and self.num_loops > 1)
 
     @property
     def num_engram_tables(self) -> int:
