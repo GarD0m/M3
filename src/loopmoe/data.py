@@ -102,13 +102,31 @@ def iter_source_texts(
                     if not wanted:
                         continue
                     for batch in pf.iter_batches(batch_size=512, columns=wanted):
-                        cols = batch.to_pydict()
+                        cols = {k: batch.column(k).to_pylist() for k in wanted}
+                        text_keys = [k for k in ("full_content", "content", "text") if k in cols]
+                        repos = cols.get("repo_name")
+                        rels = cols.get("relative_path")
                         n_rows = len(cols[wanted[0]])
                         for i in range(n_rows):
-                            row = {k: cols[k][i] for k in wanted}
-                            text = _extract_text_from_batch_row(row)
-                            if text is not None and len(text) >= min_chars:
-                                yield text
+                            val = None
+                            for tk in text_keys:
+                                cand = cols[tk][i]
+                                if isinstance(cand, str) and cand.strip():
+                                    val = cand
+                                    break
+                            if val is None:
+                                continue
+                            rel = rels[i] if rels is not None else None
+                            if isinstance(rel, str) and rel:
+                                repo = repos[i] if repos is not None else None
+                                prefix = (
+                                    f"# {repo}/{rel}\n"
+                                    if isinstance(repo, str) and repo
+                                    else f"# {rel}\n"
+                                )
+                                val = prefix + val
+                            if len(val) >= min_chars:
+                                yield val
             except Exception:
                 # Skip transient network/corrupt parquet slice rather than crashing long runs
                 continue
@@ -330,8 +348,8 @@ class ShardBatchPrefetcher:
                         if self._stop.is_set():
                             return
                         item = (
-                            np.asarray(x_all[b_i], dtype=np.int32),
-                            np.asarray(y_all[b_i], dtype=np.int32),
+                            np.array(x_all[b_i], dtype=np.uint16, copy=True),
+                            np.array(y_all[b_i], dtype=np.uint16, copy=True),
                         )
                         while not self._stop.is_set():
                             try:
@@ -388,11 +406,11 @@ class StreamingTokenPrefetcher:
 
             while not self._stop.is_set():
                 while len(buf) < need:
-                    batch_texts = [next(text_iter) for _ in range(32)]
+                    batch_texts = [next(text_iter) for _ in range(256)]
                     for enc in self.tokenizer.encode_batch(batch_texts):
                         buf.extend(enc.ids)
                         buf.append(eos_id)
-                arr = np.asarray(buf[:need], dtype=np.int32)
+                arr = np.asarray(buf[:need], dtype=np.uint16)
                 del buf[: self.micro_bs * self.seq_len]
                 x = arr[:-1].reshape(self.micro_bs, self.seq_len)
                 y = arr[1:].reshape(self.micro_bs, self.seq_len)

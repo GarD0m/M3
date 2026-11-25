@@ -1,69 +1,50 @@
-# 1B 1-Layer DeepSeek-V4.1-Flash LoopMoE
+# 1.49B 1-Layer DeepSeek-V4.1-Flash LoopMoE
 
-A ~1.17B parameter, **single physical layer (`L=1`)** LLM combining **DeepSeek-V4.1-Flash** architectural primitives with **LoopMoE** (`arXiv:2606.04438`), engineered for local 64K bilingual tokenizer construction and high-MFU single-chip Google Colab **TPU v6e-1** (`918 TFLOPS BF16`, `32 GB HBM`) training via **JAX + Optax + OpenXLA Tokamax**.
+A **1.49B parameter, single physical layer (`L=1`)** LLM combining **DeepSeek-V4.1-Flash** architectural primitives with **LoopMoE** & dynamic early-exit (`arXiv:2611.05724`), engineered specifically for explicit config-driven **TPU v6e-1** (`918 TFLOPS BF16`, `32 GB HBM`) training via **JAX + Optax + OpenXLA Tokamax**.
 
 ---
 
-## Architecture Breakdown (`d_model = 2048`, `V = 65,536`, `L = 1`)
+## Architecture Breakdown (`d_model = 2048`, `V = 32,768`, `L = 1`)
 
 | Module | Design | Parameters |
 | :--- | :--- | :---: |
-| **Tied Token Embedding / Head** | `65,536 × 2048`, exact 256×256 MXU aligned | **134.22M** |
-| **Engram Conditional Memory** (`arXiv:2601.07372`) | 8 prime tables (`1.60M × 128`, 2-gram & 3-gram), pre-loop single gather, RMSNorm context gating + causal conv | **209.04M** (20.5% sparse) |
-| **Single-Pass mHC** (`arXiv:2512.24880`) | `n_streams = 4`, Sinkhorn-Knopp doubly stochastic `H_res` (10 iters) + bounded `H_pre`, `H_post` | **0.40M** |
-| **LoopMoE IterAdaLN** (`arXiv:2606.04438`) | Joint `(h_t, loop_emb[t])` bottleneck MLP + `loop_alpha[t]` step-0 identity gating for `R=1 -> R=8` | **2.10M** |
-| **MLA + YaRN (+ optional CSA2)** | `16` heads, `d_q_lora=768`, `d_kv_lora=512`, `d_qk=96+32=128`, `d_v=128`; **Tokamax / Pallas Splash Attention** | **10.29M** |
-| **Fine-Grained DeepSeek MoE** | `256` routed (`d_ff=512`, top-5) + `1` shared (`d_ff=512`), **Tokamax Megablox `ragged_dot`**, Aux-Loss-Free per-loop bias | **808.98M** |
-| **Total** | Active non-emb/loop: `35.92M` (`Attn:FFN = 1:1.83`) | **1,165.07M (~1.17B)** |
+| **Tied Token Embedding / Head** | `32,768 × 2048`, native BF16 chunked CE | **67.11M** |
+| **Engram Conditional Memory** (`arXiv:2601.07372`) | 4 prime 1024-aligned tables (`2048 × 1024`, `d_head=256`), Row-Wise Factored AdamW | **541.08M** (39.9% sparse) |
+| **Single-Pass mHC** (`arXiv:2512.24880`) | `n_streams = 2` closed-form Birkhoff doubly stochastic residual | **0.26M** |
+| **LoopMoE IterAdaLN** | Per-loop bottleneck MLP (`b=128`) + `loop_alpha[t]` step-0 identity gating (`max_loops=32`) | **~2M** |
+| **MLA + YaRN** | `16` heads, `d_q_lora=768`, `d_kv_lora=512`, `d_qk=96+32=128`, `d_v=128`; 8-bank cyclic Q/O + Loop-0 KV reuse; **Fused Splash Attention** | **61.68M** |
+| **Fine-Grained DeepSeek MoE** | `128` routed (`d_ff=1024`, top-4) + `1` shared (`d_ff=1024`), **Pallas DMA gather/combine + Tokamax `ragged_dot`**, Aux-Loss-Free bias | **813.70M** |
+| **Total** | Active non-emb/loop: `41.80M` (`Attn:FFN = 1:3.06`), `bptt_window=8` | **1,485.60M (~1.49B)** |
 
 ---
 
-## 7-Stage Progressive Curriculum (21B Tokens Total)
+## Explicit TPU v6e-1 Config & Lookahead Curriculum (`configs/v6e_1_train.json`)
 
-Global batch size: **262,144 tokens/step** (`32,768` microbatch tokens × `8` grad accum steps).  
-Optimizer: **Muon** (`lr=0.015`, 3D `vmap` per-expert Newton-Schulz `ns_steps=4`, Moonshot `consistent_rms=0.2`) + BF16 **AdamW** (`lr=1.5e-3`, `b2=0.95`) with **Warmup-Stable schedule (NO decay)**.
+All hyperparameters, per-stage batch sizes, and rematerialization flags are explicitly declared in [`configs/v6e_1_train.json`](configs/v6e_1_train.json) (no hidden defaults):
 
-| Stage | Seq Len | Tokens | Loops | Web EN | Web ZH | Code | Math | Tiers |
-| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- |
-| 1 | 1K | 4B | 1 | 32% | 28% | 22% | 18% | Ultra-FineWeb-L3 + Code-L3 + Math-L3 |
-| 2 | 2K | 4B | 1 | 28% | 24% | 25% | 23% | Ultra-FineWeb-L3 + Code-L3 + Math-L3 |
-| 3 | 4K | 4B | 1 | 24% | 20% | 28% | 28% | Ultra-FineWeb-L3 + Code-L3 + Math-L3 |
-| 4 | 8K | 4B | 1 | 20% | 16% | 36% | 28% | Ultra-FineWeb-L3 + Code-L3 + Math-L3 |
-| 5 | 16K | 2B | 1 | 18% | 14% | 40% | 28% | Ultra-FineWeb-L3 + Code-L3 + Math-L3 |
-| 6 | 32K | 2B | 1 | 16% | 14% | 42% | 28% | Ultra-FineWeb-L3 + Code-L3 + Math-L3 |
-| 7 | 4K | 1B | **8** | 12% | 10% | 35% | 43% | Ultra-FineWeb-L3 + Code-L3 + Math-L3 |
+- **Phase 1 (`R = 1`)**:
+  - `S1 (4K)`: `microbatch=16, grad_accum=4, warmup_steps=1000, remat_moe=false, remat_sublayers=false` (no Lookahead during warmup)
+  - `S2 (8K)`: `microbatch=8, grad_accum=4, warmup_steps=0, remat_moe=false, remat_sublayers=false`
+  - `S3 (16K)`: `microbatch=2, grad_accum=8, warmup_steps=0, remat_moe=false, remat_sublayers=false`
+  - `S4 (32K)`: `microbatch=1, grad_accum=8, warmup_steps=0, remat_moe=false, remat_sublayers=false`
+- **Phase 2 (`R = 2, 3, ..., 32` at `32K`)**:
+  - `S5..S35`: `microbatch=1, grad_accum=8, bptt_window=8, remat_moe=true, remat_sublayers=false, chunk_ce_size=8192`
+- **Lookahead Time-Efficiency Switching**:
+  - After stage warmup completes, alternates a large block on stage $A$ (`main_steps=200`) with a small probe block on next stage $B$ (`probe_steps=20`), using strictly **stage $B$'s training `ce_loss`** (`eff_A = (prev_tail - head) / t_A` vs `eff_B = (head - tail) / t_B_eff`) to switch only when stage $B$ yields faster loss reduction per second.
 
 ---
 
 ## Quickstart
 
-### 1. Local Setup & Verification
 ```bash
 pip install -r requirements.txt
 pytest -v tests/test_loopmoe.py
-```
 
-### 2. Build 64K Bilingual Tokenizer Locally (L3 Corpus)
-```bash
-python scripts/train_tokenizer.py \
-  --target-gb 2.0 \
-  --output-dir artifacts/tokenizer_64k
-```
-
-### 3. (Optional) Pre-pack `uint16` L3 Shards Locally
-```bash
-python scripts/prepare_shards.py \
-  --tokenizer artifacts/tokenizer_64k/tokenizer.json \
-  --out-dir artifacts/shards
-```
-
-### 4. Train on Google Colab TPU v6e-1 (Local Checkpoints)
-Open [`notebooks/colab_tpu_v6e_train.ipynb`](notebooks/colab_tpu_v6e_train.ipynb) on a Colab **TPU v6e-1** runtime, or run:
-```bash
+# Train on TPU v6e-1 using explicit config (zero hidden defaults)
 python scripts/train_tpu.py \
+  --config configs/v6e_1_train.json \
   --data-mode stream \
-  --tokenizer artifacts/tokenizer_64k/tokenizer.json \
+  --tokenizer artifacts/tokenizer_32k_en/tokenizer.json \
   --ckpt-dir checkpoints \
-  --cache-dir jax_cache \
-  --keep-last-k 3
+  --cache-dir jax_cache
 ```

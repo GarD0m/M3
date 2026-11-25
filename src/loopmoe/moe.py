@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import functools
 import inspect
+import math
 
 import jax
 import jax.numpy as jnp
 
 from .config import LoopMoEConfig
+from .mhc import rms_norm
+from .pallas_moe import can_use_pallas_moe, pallas_moe_combine, pallas_moe_gather
 
 
 def init_moe_params(
@@ -16,15 +19,18 @@ def init_moe_params(
     cfg: LoopMoEConfig,
     dtype: jnp.dtype = jnp.bfloat16,
 ) -> dict[str, jax.Array]:
-    """Initialize routed experts (3D tensors for per-expert Muon), shared expert, and router."""
+    """Initialize routed experts (3D tensors for per-expert Muon), shared expert, and cyclic routers."""
     keys = jax.random.split(key, 5)
     d = cfg.d_model
     e = cfg.n_routed_experts
     df = cfg.d_ff_expert
     ds = cfg.n_shared_experts * cfg.d_ff_shared
+    n_router_banks = min(cfg.max_loops, max(1, cfg.router_weight_banks))
+    router_shape = (n_router_banks, d, e) if cfg.untie_router_per_loop else (d, e)
 
-    return {
-        "router_w": jax.random.normal(keys[0], (d, e), dtype=dtype) * (1.0 / jnp.sqrt(float(d))),
+    params: dict[str, jax.Array] = {
+        "router_w": jax.random.normal(keys[0], router_shape, dtype=dtype)
+        * (1.0 / jnp.sqrt(float(d))),
         "router_bias": jnp.zeros((cfg.max_loops, e), dtype=jnp.float32),
         "w_gate_up": jax.random.normal(keys[1], (e, d, 2 * df), dtype=dtype)
         * (1.0 / jnp.sqrt(float(d))),
@@ -34,6 +40,9 @@ def init_moe_params(
         "shared_w_down": jax.random.normal(keys[4], (ds, d), dtype=dtype)
         * (1.0 / jnp.sqrt(float(ds))),
     }
+    if cfg.use_post_moe_rmsnorm:
+        params["post_norm_w"] = jnp.ones((d,), dtype=dtype)
+    return params
 
 
 def _grouped_matmul(
@@ -116,6 +125,27 @@ def _gather_sum_topk(arr: jax.Array, inv_order: jax.Array, top_k: int) -> jax.Ar
     return acc
 
 
+def _dispatch_gather(x_flat: jax.Array, token_indices: jax.Array, top_k: int) -> jax.Array:
+    """Gather token rows using pipelined Mosaic TPU Pallas DMA when aligned, else native JAX gather."""
+    if can_use_pallas_moe(x_flat.shape[0], token_indices.shape[0], x_flat.shape[1], top_k):
+        try:
+            return pallas_moe_gather(x_flat, token_indices)
+        except Exception:
+            pass
+    return x_flat[token_indices]
+
+
+def _combine_gather_sum(arr: jax.Array, inv_order: jax.Array, top_k: int) -> jax.Array:
+    """Gather+sum top_k rows per token using double-buffered Pallas VMEM combine on TPU when aligned."""
+    n_rows = inv_order.shape[0] // top_k
+    if can_use_pallas_moe(n_rows, arr.shape[0], arr.shape[1], top_k):
+        try:
+            return pallas_moe_combine(arr, inv_order, top_k)
+        except Exception:
+            pass
+    return _gather_sum_topk(arr, inv_order, top_k)
+
+
 @functools.partial(jax.custom_vjp, nondiff_argnums=(3,))
 def _moe_dispatch(
     x_flat: jax.Array,
@@ -124,8 +154,8 @@ def _moe_dispatch(
     top_k: int,
 ) -> jax.Array:
     """Gather token embeddings into expert-sorted order; backward uses conflict-free inv_order reduce."""
-    del inv_order, top_k
-    return x_flat[token_indices]
+    del inv_order
+    return _dispatch_gather(x_flat, token_indices, top_k)
 
 
 def _moe_dispatch_fwd(
@@ -134,8 +164,7 @@ def _moe_dispatch_fwd(
     inv_order: jax.Array,
     top_k: int,
 ) -> tuple[jax.Array, tuple[jax.Array]]:
-    del top_k
-    return x_flat[token_indices], (inv_order,)
+    return _dispatch_gather(x_flat, token_indices, top_k), (inv_order,)
 
 
 def _moe_dispatch_bwd(
@@ -144,7 +173,7 @@ def _moe_dispatch_bwd(
     d_sorted_x: jax.Array,
 ) -> tuple[jax.Array, None, None]:
     (inv_order,) = res
-    return (_gather_sum_topk(d_sorted_x, inv_order, top_k), None, None)
+    return (_combine_gather_sum(d_sorted_x, inv_order, top_k), None, None)
 
 
 _moe_dispatch.defvjp(_moe_dispatch_fwd, _moe_dispatch_bwd)
@@ -159,7 +188,7 @@ def _moe_combine(
 ) -> jax.Array:
     """Combine expert-sorted outputs per token via conflict-free inv_order gather+sum (zero scatter-add)."""
     del token_indices
-    return _gather_sum_topk(down_out, inv_order, top_k)
+    return _combine_gather_sum(down_out, inv_order, top_k)
 
 
 def _moe_combine_fwd(
@@ -168,7 +197,7 @@ def _moe_combine_fwd(
     inv_order: jax.Array,
     top_k: int,
 ) -> tuple[jax.Array, tuple[jax.Array]]:
-    return _gather_sum_topk(down_out, inv_order, top_k), (token_indices,)
+    return _combine_gather_sum(down_out, inv_order, top_k), (token_indices,)
 
 
 def _moe_combine_bwd(
@@ -176,9 +205,8 @@ def _moe_combine_bwd(
     res: tuple[jax.Array],
     d_routed_out: jax.Array,
 ) -> tuple[jax.Array, None, None]:
-    del top_k
     (token_indices,) = res
-    return (d_routed_out[token_indices], None, None)
+    return (_dispatch_gather(d_routed_out, token_indices, top_k), None, None)
 
 
 _moe_combine.defvjp(_moe_combine_fwd, _moe_combine_bwd)
@@ -188,72 +216,193 @@ _moe_combine.defvjp(_moe_combine_fwd, _moe_combine_bwd)
 def _permute_1d(arr: jax.Array, order: jax.Array, inv_order: jax.Array) -> jax.Array:
     """Gather 1D tensor by permutation `order`; backward uses inverse permutation (zero scatter-add)."""
     del inv_order
+    if arr.dtype != jnp.float32:
+        return arr.astype(jnp.float32)[order].astype(arr.dtype)
     return arr[order]
 
 
 def _permute_1d_fwd(
     arr: jax.Array, order: jax.Array, inv_order: jax.Array
 ) -> tuple[jax.Array, tuple[jax.Array]]:
-    return arr[order], (inv_order,)
+    out = arr.astype(jnp.float32)[order].astype(arr.dtype) if arr.dtype != jnp.float32 else arr[order]
+    return out, (inv_order,)
 
 
 def _permute_1d_bwd(
     res: tuple[jax.Array], d_out: jax.Array
 ) -> tuple[jax.Array, None, None]:
     (inv_order,) = res
+    if d_out.dtype != jnp.float32:
+        return (d_out.astype(jnp.float32)[inv_order].astype(d_out.dtype), None, None)
     return (d_out[inv_order], None, None)
 
 
 _permute_1d.defvjp(_permute_1d_fwd, _permute_1d_bwd)
 
 
-def apply_moe(
+@jax.custom_vjp
+def _sorted_weights_from_sort(
+    topk_weights_flat: jax.Array,
+    sorted_weights_f32: jax.Array,
+    sort_order: jax.Array,
+) -> jax.Array:
+    """Return pre-sorted routing weights in forward (zero 1D gather) and un-permute grads via bitonic sort."""
+    del sort_order
+    return sorted_weights_f32.astype(topk_weights_flat.dtype)
+
+
+def _sorted_weights_from_sort_fwd(
+    topk_weights_flat: jax.Array,
+    sorted_weights_f32: jax.Array,
+    sort_order: jax.Array,
+) -> tuple[jax.Array, tuple[jax.Array]]:
+    return sorted_weights_f32.astype(topk_weights_flat.dtype), (sort_order,)
+
+
+def _sorted_weights_from_sort_bwd(
+    res: tuple[jax.Array], d_sorted: jax.Array
+) -> tuple[jax.Array, None, None]:
+    (sort_order,) = res
+    _, d_unsorted_f32 = jax.lax.sort((sort_order, d_sorted.astype(jnp.float32)), num_keys=1)
+    return (d_unsorted_f32.astype(d_sorted.dtype), None, None)
+
+
+_sorted_weights_from_sort.defvjp(_sorted_weights_from_sort_fwd, _sorted_weights_from_sort_bwd)
+
+
+def _extract_topk_scores(scores: jax.Array, topk_idx: jax.Array, n_experts: int) -> jax.Array:
+    """Extract [N, K] routing scores from [N, E] via K VPU masked reductions (zero 1D gather/scatter)."""
+    top_k = topk_idx.shape[-1]
+    zero = jnp.asarray(0.0, dtype=scores.dtype)
+    e_idx = jnp.arange(n_experts, dtype=topk_idx.dtype)[None, :]  # [1, E]
+    cols = [
+        jnp.sum(jnp.where(e_idx == topk_idx[:, k : k + 1], scores, zero), axis=-1)
+        for k in range(top_k)
+    ]
+    return jnp.stack(cols, axis=-1)
+
+
+def _pallas_or_jax_gather(src_2d: jax.Array, idx_1d: jax.Array) -> jax.Array:
+    """Gather rows `[idx_1d]` from `src_2d` via Mosaic TPU Pallas DMA when aligned, else JAX gather."""
+    if can_use_pallas_moe(src_2d.shape[0], idx_1d.shape[0], src_2d.shape[1], 1):
+        try:
+            return pallas_moe_gather(src_2d, idx_1d)
+        except Exception:
+            pass
+    return src_2d[idx_1d]
+
+
+def _pad_zero_sentinel(arr: jax.Array) -> jax.Array:
+    """Append an aligned block of zero sentinel row(s) at `arr.shape[0]` for scatter-free routing."""
+    pad_rows = 128 if (arr.shape[0] % 128 == 0 and arr.shape[1] % 1024 == 0) else 1
+    return jnp.pad(arr, ((0, pad_rows), (0, 0)))
+
+
+@jax.custom_vjp
+def _token_drop_gather(
+    x_flat: jax.Array, active_idx: jax.Array, gather_back_idx: jax.Array
+) -> jax.Array:
+    """Gather `[cap, D]` active tokens via Pallas DMA; backward gathers gradients (zero scatter)."""
+    del gather_back_idx
+    return _pallas_or_jax_gather(x_flat, active_idx)
+
+
+def _token_drop_gather_fwd(
+    x_flat: jax.Array, active_idx: jax.Array, gather_back_idx: jax.Array
+) -> tuple[jax.Array, tuple[jax.Array]]:
+    return _pallas_or_jax_gather(x_flat, active_idx), (gather_back_idx,)
+
+
+def _token_drop_gather_bwd(
+    res: tuple[jax.Array], d_active: jax.Array
+) -> tuple[jax.Array, None, None]:
+    (gather_back_idx,) = res
+    return (_pallas_or_jax_gather(_pad_zero_sentinel(d_active), gather_back_idx), None, None)
+
+
+_token_drop_gather.defvjp(_token_drop_gather_fwd, _token_drop_gather_bwd)
+
+
+@jax.custom_vjp
+def _token_drop_scatter(
+    active_out: jax.Array, active_idx: jax.Array, gather_back_idx: jax.Array
+) -> jax.Array:
+    """Place `[cap, D]` active MoE outputs into `[N, D]` via Pallas DMA gather + zero sentinel."""
+    del active_idx
+    return _pallas_or_jax_gather(_pad_zero_sentinel(active_out), gather_back_idx)
+
+
+def _token_drop_scatter_fwd(
+    active_out: jax.Array, active_idx: jax.Array, gather_back_idx: jax.Array
+) -> tuple[jax.Array, tuple[jax.Array]]:
+    return _pallas_or_jax_gather(_pad_zero_sentinel(active_out), gather_back_idx), (active_idx,)
+
+
+def _token_drop_scatter_bwd(
+    res: tuple[jax.Array], d_scattered: jax.Array
+) -> tuple[jax.Array, None, None]:
+    (active_idx,) = res
+    return (_pallas_or_jax_gather(d_scattered, active_idx), None, None)
+
+
+_token_drop_scatter.defvjp(_token_drop_scatter_fwd, _token_drop_scatter_bwd)
+
+
+def _apply_moe_core(
     params: dict[str, jax.Array],
-    x: jax.Array,
+    x_flat: jax.Array,
     loop_idx: jax.Array | int,
     cfg: LoopMoEConfig,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Run DeepSeek-V4.1-Flash fine-grained MoE for one loop iteration.
-
-    Returns:
-        out: [B, S, D] MoE output tensor.
-        expert_counts: [E] token assignment counts (float32) for Aux-Loss-Free bias updates.
-        seq_aux_loss: scalar sequence-wise balance regularization loss.
-    """
-    bsz, seq_len, d_model = x.shape
-    num_tokens = bsz * seq_len
-    x_flat = x.reshape(num_tokens, d_model)
+    active_bsz: int,
+    active_seq: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Core single-chunk / full-batch MoE computation over `[N, D]` tokens."""
+    num_tokens, _ = x_flat.shape
     dt = x_flat.dtype
 
     # 1. Sigmoid routing + Aux-Loss-Free bias (bias excluded from gradient flow)
     with jax.named_scope("moe_router"):
-        router_logits = x_flat @ params["router_w"].astype(dt)
-        scores = jax.nn.sigmoid(router_logits)
-        bias_t = jax.lax.stop_gradient(params["router_bias"][loop_idx]).astype(dt)
-        biased_scores = scores + bias_t[None, :]
+        router_w_t = (
+            params["router_w"][loop_idx % params["router_w"].shape[0]]
+            if params["router_w"].ndim == 3
+            else params["router_w"]
+        )
+        router_logits = x_flat @ router_w_t.astype(dt)
+        # Foil Eq. 11 Median Margin Ratio diagnostic: exp(mean(z_(1) - z_(E/2)))
+        z_sub = jax.lax.stop_gradient(
+            (router_logits[::8] if num_tokens > 4096 else router_logits).astype(jnp.float32)
+        )
+        z_sorted = jnp.sort(z_sub, axis=-1)
+        mid_idx = cfg.n_routed_experts - (cfg.n_routed_experts // 2)
+        mean_margin = jnp.mean(z_sorted[:, -1] - z_sorted[:, mid_idx])
 
-        topk_biased, topk_idx = jax.lax.top_k(biased_scores, cfg.top_k)  # [N, K]
-        topk_scores = topk_biased - bias_t[topk_idx]
+        scores = jax.nn.sigmoid(router_logits)
+        bias_f32 = jax.lax.stop_gradient(params["router_bias"][loop_idx])
+        biased_scores = jax.lax.stop_gradient(scores) + bias_f32.astype(dt)[None, :]
+
+        _, topk_idx = jax.lax.top_k(biased_scores, cfg.top_k)  # [N, K]
+        topk_scores = _extract_topk_scores(scores, topk_idx, cfg.n_routed_experts)
         topk_weights = topk_scores / (
             jnp.sum(topk_scores, axis=-1, keepdims=True) + jnp.asarray(1e-6, dtype=dt)
         )
 
-    # 2. Sort token-expert pairs once; reuse sorted_experts for zero-scatter counts and inv_order for combine/bwd
+    # 2. Sort token-expert pairs + routing weights once; reuse sorted_experts for counts and inv_order for combine/bwd
     with jax.named_scope("moe_sort_dispatch"):
         flat_experts = topk_idx.reshape(-1)
-        sorted_experts, sort_order = jax.lax.sort_key_val(
-            flat_experts, jnp.arange(flat_experts.shape[0], dtype=jnp.int32)
+        arange_idx = jnp.arange(flat_experts.shape[0], dtype=jnp.int32)
+        topk_weights_flat = topk_weights.reshape(-1)
+        sorted_experts, sort_order, sorted_weights_f32 = jax.lax.sort(
+            (flat_experts, arange_idx, jax.lax.stop_gradient(topk_weights_flat).astype(jnp.float32)),
+            num_keys=1,
         )
         token_indices = sort_order // cfg.top_k
-        inv_order = jnp.empty_like(sort_order).at[sort_order].set(
-            jnp.arange(sort_order.shape[0], dtype=sort_order.dtype)
-        )
+        _, inv_order = jax.lax.sort((sort_order, arange_idx), num_keys=1)
         edges = jnp.arange(cfg.n_routed_experts + 1, dtype=sorted_experts.dtype)
         expert_counts = jnp.diff(jnp.searchsorted(sorted_experts, edges, side="left")).astype(
             jnp.float32
         )
 
-        sorted_weights = _permute_1d(topk_weights.reshape(-1), sort_order, inv_order)
+        sorted_weights = _sorted_weights_from_sort(topk_weights_flat, sorted_weights_f32, sort_order)
         sorted_x = _moe_dispatch(x_flat, token_indices, inv_order, cfg.top_k)  # [N*K, D]
         group_sizes = expert_counts.astype(jnp.int32)
 
@@ -261,12 +410,12 @@ def apply_moe(
         scores_norm = scores / (
             jnp.sum(scores, axis=-1, keepdims=True) + jnp.asarray(1e-6, dtype=dt)
         )
-        scores_seq = scores_norm.reshape(bsz, seq_len, cfg.n_routed_experts)
-        idx_seq = topk_idx.reshape(bsz, seq_len, cfg.top_k)
+        scores_seq = scores_norm.reshape(active_bsz, active_seq, cfg.n_routed_experts)
+        idx_seq = topk_idx.reshape(active_bsz, active_seq, cfg.top_k)
         seq_counts = jax.vmap(
             lambda idx: jnp.diff(jnp.searchsorted(jnp.sort(idx.reshape(-1)), edges, side="left"))
         )(idx_seq).astype(jnp.float32)
-        ce = seq_counts * (float(cfg.n_routed_experts) / float(seq_len * cfg.top_k))  # [B, E]
+        ce = seq_counts * (float(cfg.n_routed_experts) / float(active_seq * cfg.top_k))  # [B, E]
         pi = jnp.mean(scores_seq, axis=1, dtype=jnp.float32)  # [B, E]
         seq_aux_loss = cfg.seq_aux_loss_weight * jnp.mean(jnp.sum(ce * pi, axis=-1))
     else:
@@ -293,8 +442,80 @@ def apply_moe(
         shared_gate, shared_up = jnp.split(shared_gate_up, 2, axis=-1)
         shared_out = (jax.nn.silu(shared_gate) * shared_up) @ params["shared_w_down"]
 
-    total_out = (routed_out + shared_out).reshape(bsz, seq_len, d_model)
-    return total_out, expert_counts, seq_aux_loss
+    total_flat = routed_out + shared_out
+    if cfg.use_post_moe_rmsnorm:
+        total_flat = rms_norm(total_flat, params["post_norm_w"], eps=cfg.rms_norm_eps)
+    return total_flat, expert_counts, seq_aux_loss, mean_margin
+
+
+def apply_moe(
+    params: dict[str, jax.Array],
+    x: jax.Array,
+    loop_idx: jax.Array | int,
+    cfg: LoopMoEConfig,
+    keep_scores: jax.Array | None = None,
+    capacity_factor: float = 1.0,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Run DeepSeek-V4.1-Flash fine-grained MoE with optional token dropping & token-chunked scan."""
+    bsz, seq_len, d_model = x.shape
+    num_tokens = bsz * seq_len
+    x_flat = x.reshape(num_tokens, d_model)
+
+    active_idx: jax.Array | None = None
+    gather_back_idx: jax.Array | None = None
+    active_bsz, active_seq = bsz, seq_len
+    if keep_scores is not None and 0.0 < capacity_factor < 1.0 and num_tokens > 1:
+        cap = max(1, int(math.ceil(num_tokens * float(capacity_factor))))
+        if num_tokens >= 128:
+            cap = min(num_tokens, ((cap + 127) // 128) * 128)
+        if cap < num_tokens:
+            _, active_idx = jax.lax.top_k(keep_scores.reshape(num_tokens), cap)
+            gather_back_idx = jnp.full((num_tokens,), cap, dtype=jnp.int32).at[active_idx].set(
+                jnp.arange(cap, dtype=jnp.int32)
+            )
+            x_flat = _token_drop_gather(x_flat, active_idx, gather_back_idx)
+            num_tokens = cap
+            active_bsz, active_seq = 1, cap
+
+    chunk_sz = int(cfg.moe_chunk_size)
+    if (
+        chunk_sz > 0
+        and num_tokens > chunk_sz
+        and num_tokens % chunk_sz == 0
+        and cfg.seq_aux_loss_weight == 0.0
+    ):
+        num_chunks = num_tokens // chunk_sz
+        x_chunks = x_flat.reshape(num_chunks, chunk_sz, d_model)
+
+        def _chunk_step(carry, x_chunk):
+            ec_acc, margin_acc = carry
+            out_c, ec_c, _, margin_c = _apply_moe_core(
+                params, x_chunk, loop_idx, cfg, 1, chunk_sz
+            )
+            return (ec_acc + ec_c, margin_acc + margin_c), out_c
+
+        init_counts = jnp.zeros((cfg.n_routed_experts,), dtype=jnp.float32)
+        init_margin = jnp.asarray(0.0, dtype=jnp.float32)
+        (expert_counts, margin_sum), out_chunks = jax.lax.scan(
+            jax.checkpoint(_chunk_step),
+            (init_counts, init_margin),
+            x_chunks,
+            unroll=1,
+        )
+        total_flat = out_chunks.reshape(num_tokens, d_model)
+        seq_aux_loss = jnp.asarray(0.0, dtype=jnp.float32)
+        router_mmr = jnp.exp(jnp.clip(margin_sum / float(num_chunks), -20.0, 20.0))
+    else:
+        total_flat, expert_counts, seq_aux_loss, mean_margin = _apply_moe_core(
+            params, x_flat, loop_idx, cfg, active_bsz, active_seq
+        )
+        router_mmr = jnp.exp(jnp.clip(mean_margin, -20.0, 20.0))
+
+    if active_idx is not None:
+        assert gather_back_idx is not None
+        scattered = _token_drop_scatter(total_flat, active_idx, gather_back_idx)
+        return scattered.reshape(bsz, seq_len, d_model), expert_counts, seq_aux_loss, router_mmr
+    return total_flat.reshape(bsz, seq_len, d_model), expert_counts, seq_aux_loss, router_mmr
 
 
 def update_router_biases(

@@ -115,12 +115,17 @@ def init_mhc_sublayer_params(
 ) -> dict[str, jax.Array]:
     """Initialize parameters for one Single-Pass mHC sublayer wrapper."""
     in_dim = n_streams * d_model
-    out_dim = 2 * n_streams + n_streams * n_streams
+    res_dim = 1 if n_streams == 2 else n_streams * n_streams
+    out_dim = 2 * n_streams + res_dim
     scale = 1.0 / jnp.sqrt(float(in_dim))
 
-    # Initialize b_res near identity so initial H_res ~ I after Sinkhorn-Knopp
-    b_res_init = jnp.full((n_streams, n_streams), -6.0, dtype=jnp.float32)
-    b_res_init = b_res_init.at[jnp.arange(n_streams), jnp.arange(n_streams)].set(0.0)
+    if n_streams == 2:
+        # Closed-form 2x2 Birkhoff: H_res = [[p, 1-p], [1-p, p]] with p = sigmoid(6.0) ~ 0.9975
+        b_res_init = jnp.asarray([6.0], dtype=jnp.float32)
+    else:
+        # Initialize b_res near identity so initial H_res ~ I after Sinkhorn-Knopp
+        b_res_init = jnp.full((n_streams, n_streams), -6.0, dtype=jnp.float32)
+        b_res_init = b_res_init.at[jnp.arange(n_streams), jnp.arange(n_streams)].set(0.0)
 
     return {
         "norm_w": jnp.ones((in_dim,), dtype=dtype),
@@ -160,8 +165,11 @@ def expand_streams(x: jax.Array, stream_init: jax.Array | None = None) -> jax.Ar
 
 
 def collapse_streams(x_streams: jax.Array) -> jax.Array:
-    """Collapse [B, S, n_streams, D] -> [B, S, D] via mean projection."""
-    return jnp.mean(x_streams, axis=2)
+    """Collapse [B, S, n_streams, D] -> [B, S, D] in native dtype."""
+    dt = x_streams.dtype
+    if x_streams.shape[2] == 2:
+        return jnp.asarray(0.5, dtype=dt) * (x_streams[:, :, 0, :] + x_streams[:, :, 1, :])
+    return jnp.mean(x_streams, axis=2, dtype=dt)
 
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(1,))
@@ -230,7 +238,6 @@ def mhc_compute_gates(
 
         pre_dyn = all_dyn[..., :n_streams]
         post_dyn = all_dyn[..., n_streams : 2 * n_streams]
-        res_dyn = all_dyn[..., 2 * n_streams :].reshape(bsz, seq_len, n_streams, n_streams)
 
         h_pre = jax.nn.sigmoid(
             params["alpha_pre"].astype(dt) * pre_dyn + params["b_pre"].astype(dt)
@@ -240,6 +247,20 @@ def mhc_compute_gates(
         h_post = jnp.asarray(2.0, dtype=dt) * jax.nn.sigmoid(
             params["alpha_post"].astype(dt) * post_dyn + params["b_post"].astype(dt)
         )
+
+        if n_streams == 2:
+            # Closed-form exact 2x2 Birkhoff polytope projection (zero Sinkhorn iterations)
+            res_dyn = all_dyn[..., 4:5]
+            p = jax.nn.sigmoid(params["alpha_res"].astype(dt) * res_dyn + params["b_res"].astype(dt))
+            q = jnp.asarray(1.0, dtype=dt) - p
+            h_res = jnp.stack(
+                [jnp.concatenate([p, q], axis=-1), jnp.concatenate([q, p], axis=-1)],
+                axis=-2,
+            )
+            h_in = h_pre[:, :, 0:1] * streams[0] + h_pre[:, :, 1:2] * streams[1]
+            return h_in, h_pre, h_post, h_res
+
+        res_dyn = all_dyn[..., 2 * n_streams :].reshape(bsz, seq_len, n_streams, n_streams)
         h_res_logits = params["alpha_res"].astype(dt) * res_dyn + params["b_res"].astype(dt)
         h_res = sinkhorn_knopp(h_res_logits, num_iters=sinkhorn_iters, eps=eps).astype(dt)
 
@@ -262,10 +283,23 @@ def mhc_post_merge(
         n_streams = x_streams.shape[2]
         gate = jnp.asarray(loop_gate, dtype=dt)
         one_minus_gate = jnp.asarray(1.0, dtype=dt) - gate
-        eye = jnp.eye(n_streams, dtype=dt)[None, None, :, :]
-        h_res_eff = one_minus_gate * eye + gate * h_res.astype(dt)
         h_post_eff = gate * h_post.astype(dt)
         out_dt = sublayer_out.astype(dt)
+
+        if n_streams == 2:
+            x0 = x_streams[:, :, 0, :]
+            x1 = x_streams[:, :, 1, :]
+            h_res_dt = h_res.astype(dt)
+            r00 = one_minus_gate + gate * h_res_dt[:, :, 0, 0]
+            r01 = gate * h_res_dt[:, :, 0, 1]
+            r10 = gate * h_res_dt[:, :, 1, 0]
+            r11 = one_minus_gate + gate * h_res_dt[:, :, 1, 1]
+            y0 = r00[..., None] * x0 + r01[..., None] * x1 + h_post_eff[:, :, 0, None] * out_dt
+            y1 = r10[..., None] * x0 + r11[..., None] * x1 + h_post_eff[:, :, 1, None] * out_dt
+            return jnp.stack([y0, y1], axis=2)
+
+        eye = jnp.eye(n_streams, dtype=dt)[None, None, :, :]
+        h_res_eff = one_minus_gate * eye + gate * h_res.astype(dt)
         streams = [x_streams[:, :, j, :] for j in range(n_streams)]
         out_streams = []
         for i in range(n_streams):

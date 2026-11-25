@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -114,42 +116,53 @@ def _causal_depthwise_conv1d(
     bias: jax.Array,
     dilation: int,
 ) -> jax.Array:
-    """Apply causal 1D depthwise convolution over sequence axis=1 in native dtype."""
+    """Apply causal 1D depthwise convolution via explicit shifted slices (zero XLA conv/pad overhead)."""
     kernel_size = weight.shape[0]
-    pad_len = (kernel_size - 1) * dilation
     seq_len = x.shape[1]
-    padded = jnp.pad(x, ((0, 0), (pad_len, 0), (0, 0)))
-
-    acc = jnp.zeros(x.shape, dtype=x.dtype)
-    w_cast = weight.astype(x.dtype)
-    for k in range(kernel_size):
+    pad_len = (kernel_size - 1) * dilation
+    x_pad = jnp.pad(x, ((0, 0), (pad_len, 0), (0, 0)))
+    w = weight.astype(x.dtype)
+    acc = x_pad[:, pad_len : pad_len + seq_len, :] * w[0][None, None, :]
+    for k in range(1, kernel_size):
         start = pad_len - k * dilation
-        sl = padded[:, start : start + seq_len, :]
-        acc = acc + sl * w_cast[k][None, None, :]
-    acc = acc + bias[None, None, :].astype(x.dtype)
-    return jax.nn.silu(acc)
+        acc = acc + x_pad[:, start : start + seq_len, :] * w[k][None, None, :]
+    return jax.nn.silu(acc + bias[None, None, :].astype(x.dtype))
+
+
+def precompute_engram_kv(
+    params: dict[str, jax.Array],
+    engram_e: jax.Array,
+    cfg: LoopMoEConfig,
+) -> tuple[jax.Array, jax.Array]:
+    """Project gathered Engram embeddings into normalized K and V once outside the recurrent loop."""
+    kv = engram_e @ params["w_kv"]
+    k, v = jnp.split(kv, 2, axis=-1)
+    k_norm = rms_norm(k, params["norm_k_w"], eps=cfg.rms_norm_eps)
+    return k_norm, v
 
 
 def apply_engram_step(
     params: dict[str, jax.Array],
     h_t: jax.Array,
-    engram_e: jax.Array | None,
+    engram_e_or_kv: jax.Array | tuple[jax.Array, jax.Array] | None,
     cfg: LoopMoEConfig,
 ) -> tuple[jax.Array, jax.Array]:
-    """Compute context-aware Engram gating and causal depthwise conv refinement for one loop."""
-    if not cfg.use_engram or engram_e is None:
+    """Compute context-aware Engram gating and causal depthwise conv refinement."""
+    if not cfg.use_engram or engram_e_or_kv is None:
         return jnp.zeros_like(h_t), jnp.asarray(0.0, dtype=jnp.float32)
 
-    kv = engram_e @ params["w_kv"]
-    k, v = jnp.split(kv, 2, axis=-1)
+    if isinstance(engram_e_or_kv, tuple):
+        k_norm, v = engram_e_or_kv
+    else:
+        k_norm, v = precompute_engram_kv(params, engram_e_or_kv, cfg)
 
     h_norm = rms_norm(h_t, params["norm_q_w"], eps=cfg.rms_norm_eps)
-    k_norm = rms_norm(k, params["norm_k_w"], eps=cfg.rms_norm_eps)
 
-    gate_logits = jnp.sum(h_norm * k_norm, axis=-1, keepdims=True, dtype=jnp.float32) / jnp.sqrt(
-        float(cfg.d_model)
+    dt = h_t.dtype
+    gate_logits = jnp.sum(h_norm * k_norm, axis=-1, keepdims=True, dtype=dt) * jnp.asarray(
+        1.0 / math.sqrt(float(cfg.d_model)), dtype=dt
     )
-    gate = jax.nn.sigmoid(gate_logits).astype(h_t.dtype)
+    gate = jax.nn.sigmoid(gate_logits)
     u = gate * v
 
     u_norm = rms_norm(u, params["norm_conv_w"], eps=cfg.rms_norm_eps)
