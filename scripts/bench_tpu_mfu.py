@@ -285,6 +285,19 @@ def main() -> None:
     print("| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
 
     for seq_len, loops in points:
+        point_cfg = base_cfg
+        if args.tpu_preset == "v5e-1" and not args.tiny and seq_len >= 16384:
+            auto_overrides: dict[str, Any] = {}
+            if args.remat_moe is None and not base_cfg.remat_moe:
+                auto_overrides["remat_moe"] = True
+            if args.chunk_ce_size is None and base_cfg.chunk_ce_size > 4096:
+                auto_overrides["chunk_ce_size"] = 4096
+            if auto_overrides:
+                point_cfg = LoopMoEConfig(**{**base_cfg.to_dict(), **auto_overrides})
+                print(
+                    f"[Auto-HBM v5e-1 @ seq={seq_len}] "
+                    + ", ".join(f"{k}={v}" for k, v in auto_overrides.items())
+                )
         trace_here = (
             None
             if not args.profile_dir
@@ -296,7 +309,7 @@ def main() -> None:
         )
         try:
             res = _run_single_point(
-                base_cfg=base_cfg,
+                base_cfg=point_cfg,
                 seq_len=seq_len,
                 num_loops=loops,
                 microbatch=micro_bs,

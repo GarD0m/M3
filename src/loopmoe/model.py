@@ -182,7 +182,7 @@ def _single_loop_step(
             params, x_streams, shift_a, scale_a, gate_a, alpha_attn, loop_idx, cached_kv
         )
 
-        # 4. DeepSeek MoE sublayer inside Single-Pass mHC (optional Top-C early-exit token dropping)
+        # 4. DeepSeek MoE sublayer inside Single-Pass mHC (optional Top-C token-drop & remat)
         def _moe_sublayer(p, xs, sm, scm, gm, am, lidx, ks):
             with jax.named_scope("mhc_moe_sublayer"):
                 if cfg.use_mhc:
@@ -195,26 +195,14 @@ def _single_loop_step(
                 h_in_m_norm = apply_adaln(
                     h_in_m, p["iter_adaln"]["norm_moe_w"], scm, sm, cfg.rms_norm_eps
                 )
-                if cfg.remat_moe and not cfg.remat_sublayers:
-                    moe_out, ec, aux_l, mmr = jax.checkpoint(
-                        lambda pm, h_in, li, ks_in: apply_moe(
-                            pm,
-                            h_in,
-                            li,
-                            cfg,
-                            keep_scores=ks_in,
-                            capacity_factor=moe_capacity_factor,
-                        )
-                    )(p["moe"], h_in_m_norm, lidx, ks)
-                else:
-                    moe_out, ec, aux_l, mmr = apply_moe(
-                        p["moe"],
-                        h_in_m_norm,
-                        lidx,
-                        cfg,
-                        keep_scores=ks,
-                        capacity_factor=moe_capacity_factor,
-                    )
+                moe_out, ec, aux_l, mmr = apply_moe(
+                    p["moe"],
+                    h_in_m_norm,
+                    lidx,
+                    cfg,
+                    keep_scores=ks,
+                    capacity_factor=moe_capacity_factor,
+                )
                 moe_out = moe_out * gm.astype(dt)
 
                 if cfg.use_mhc:
@@ -223,7 +211,11 @@ def _single_loop_step(
                     next_xs = xs + am * moe_out[:, :, None, :]
                 return next_xs, ec, aux_l, mmr
 
-        moe_fn = jax.checkpoint(_moe_sublayer) if cfg.remat_sublayers else _moe_sublayer
+        moe_fn = (
+            jax.checkpoint(_moe_sublayer)
+            if (cfg.remat_sublayers or cfg.remat_moe)
+            else _moe_sublayer
+        )
         x_streams, expert_counts, seq_aux_loss, router_mmr = moe_fn(
             params, x_streams, shift_m, scale_m, gate_m, alpha_moe, loop_idx, keep_scores
         )
@@ -244,13 +236,25 @@ def _embed_and_engram(
         with jax.named_scope("engram_prefetch"):
             engram_e = prefetch_engram_embeddings(params["engram"], input_ids, cfg)
             assert engram_e is not None
-            engram_kv = precompute_engram_kv(params["engram"], engram_e, cfg)
         if cfg.engram_pre_loop_only:
-            with jax.named_scope("engram_step"):
-                engram_delta, pre_gate_mean = apply_engram_step(params["engram"], x, engram_kv, cfg)
-                alpha_engram_0 = params["iter_adaln"]["loop_alpha"][0, 0].astype(x.dtype)
-                x = x + alpha_engram_0 * engram_delta
+            def _pre_engram_apply(p_eng, x_in, eng_e, a0):
+                with jax.named_scope("engram_step"):
+                    ekv = precompute_engram_kv(p_eng, eng_e, cfg)
+                    engram_delta, p_gm = apply_engram_step(p_eng, x_in, ekv, cfg)
+                    return x_in + a0.astype(x_in.dtype) * engram_delta, p_gm
+
+            pre_fn = (
+                jax.checkpoint(_pre_engram_apply)
+                if (cfg.remat_moe or cfg.remat_sublayers)
+                else _pre_engram_apply
+            )
+            x, pre_gate_mean = pre_fn(
+                params["engram"], x, engram_e, params["iter_adaln"]["loop_alpha"][0, 0]
+            )
             engram_kv = None
+        else:
+            with jax.named_scope("engram_prefetch"):
+                engram_kv = precompute_engram_kv(params["engram"], engram_e, cfg)
 
     x_embed = x
     stream_init = params["mhc"]["stream_init"] if cfg.use_mhc else None
@@ -616,7 +620,7 @@ def forward_dynamic_exit(
     )
     h_0 = rms_norm(collapse_streams(x_streams_0), params["final_norm_w"], eps=cfg.rms_norm_eps)
     lam_0 = jax.nn.sigmoid(
-        jnp.einsum("bsd,d->bs", h_0.astype(jnp.float32), w_halt[0].astype(jnp.float32)) + b_halt[0]
+        jnp.einsum("bsd,d->bs", h_0, w_halt[0].astype(h_0.dtype)).astype(jnp.float32) + b_halt[0]
     )
     halted_0 = lam_0 >= tau
     loop_kv = cached_kv_0 if cfg.reuse_kv_across_loops else None
@@ -647,7 +651,7 @@ def forward_dynamic_exit(
         )
         h_r = rms_norm(collapse_streams(next_xs), params["final_norm_w"], eps=cfg.rms_norm_eps)
         lam_r = jax.nn.sigmoid(
-            jnp.einsum("bsd,d->bs", h_r.astype(jnp.float32), w_halt[r].astype(jnp.float32))
+            jnp.einsum("bsd,d->bs", h_r, w_halt[r].astype(h_r.dtype)).astype(jnp.float32)
             + b_halt[r]
         )
         out_h = jnp.where(halted[:, :, None], out_h, h_r)
@@ -669,7 +673,10 @@ def _ce_chunk_loss_and_lse(
     tc: jax.Array,
     mc: jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
-    lse = jax.scipy.special.logsumexp(logits_bf16.astype(jnp.float32), axis=-1)
+    m = jnp.max(logits_bf16, axis=-1, keepdims=True)
+    exp_s = jnp.exp(logits_bf16 - m)
+    sum_exp = jnp.sum(exp_s, axis=-1, dtype=jnp.float32)
+    lse = m.squeeze(-1).astype(jnp.float32) + jnp.log(sum_exp)
     z_t = (
         jnp.take_along_axis(logits_bf16, tc[:, None], axis=-1)
         .squeeze(-1)
@@ -687,10 +694,38 @@ def _ce_chunk_dlogits(
     scale_factor: jax.Array,
     out_dtype: jnp.dtype,
 ) -> jax.Array:
-    # Pure elementwise pipeline fuses exp -> where -> scale -> bf16 in VPU without FP32 [chunk, V] HBM spills
-    probs = jnp.exp(logits_bf16.astype(jnp.float32) - lse_c[:, None])
-    diff = jnp.where(vocab_idx == tc[:, None], probs - 1.0, probs)
-    return (diff * (mc * scale_factor)[:, None]).astype(out_dtype)
+    # Compute probs and diff strictly in native BF16 to halve [chunk, V] HBM & VPU bandwidth
+    dt = logits_bf16.dtype
+    probs = jnp.exp(logits_bf16 - lse_c[:, None].astype(dt))
+    diff = jnp.where(vocab_idx == tc[:, None], probs - jnp.asarray(1.0, dtype=dt), probs)
+    return (diff * (mc * scale_factor).astype(dt)[:, None]).astype(out_dtype)
+
+
+def _ce_chunk_nll_and_dlogits(
+    logits_bf16: jax.Array,
+    tc: jax.Array,
+    mc: jax.Array,
+    vocab_idx: jax.Array,
+    scale_factor: jax.Array,
+    out_dtype: jnp.dtype,
+) -> tuple[jax.Array, jax.Array]:
+    """Single-exp native-BF16 CE forward+backward chunk kernel (only [chunk] reductions in FP32)."""
+    dt = logits_bf16.dtype
+    m = jnp.max(logits_bf16, axis=-1, keepdims=True)
+    exp_s = jnp.exp(logits_bf16 - m)
+    sum_exp = jnp.sum(exp_s, axis=-1, dtype=jnp.float32)
+    lse = m.squeeze(-1).astype(jnp.float32) + jnp.log(sum_exp)
+    z_t = (
+        jnp.take_along_axis(logits_bf16, tc[:, None], axis=-1)
+        .squeeze(-1)
+        .astype(jnp.float32)
+    )
+    nll_c = lse - z_t
+    inv_sum = (jnp.asarray(1.0, dtype=jnp.float32) / sum_exp).astype(dt)
+    probs = exp_s * inv_sum[:, None]
+    diff = jnp.where(vocab_idx == tc[:, None], probs - jnp.asarray(1.0, dtype=dt), probs)
+    d_logits = (diff * (mc * scale_factor).astype(dt)[:, None]).astype(out_dtype)
+    return nll_c, d_logits
 
 
 def _run_scan_ce_fwd(
@@ -1012,8 +1047,10 @@ def _run_fused_ce_fwd_bwd(
             if weight_is_vd
             else (hc @ lm_weight)
         )
-        chunk_loss, lse = _ce_chunk_loss_and_lse(logits_bf16, tc, mc)
-        d_logits = _ce_chunk_dlogits(logits_bf16, lse, tc, mc, vocab_idx, inv_denom, hc.dtype)
+        nll_c, d_logits = _ce_chunk_nll_and_dlogits(
+            logits_bf16, tc, mc, vocab_idx, inv_denom, hc.dtype
+        )
+        chunk_loss = jnp.sum(nll_c * mc)
         if weight_is_vd:
             d_hc = (d_logits @ lm_weight).astype(hc.dtype)
             d_w_acc = d_w_acc + jax.lax.dot_general(
@@ -1107,7 +1144,10 @@ def _ce_chunk_nll_and_lse(
     logits_bf16: jax.Array,
     tc: jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
-    lse = jax.scipy.special.logsumexp(logits_bf16.astype(jnp.float32), axis=-1)
+    m = jnp.max(logits_bf16, axis=-1, keepdims=True)
+    exp_s = jnp.exp(logits_bf16 - m)
+    sum_exp = jnp.sum(exp_s, axis=-1, dtype=jnp.float32)
+    lse = m.squeeze(-1).astype(jnp.float32) + jnp.log(sum_exp)
     z_t = (
         jnp.take_along_axis(logits_bf16, tc[:, None], axis=-1)
         .squeeze(-1)
@@ -1169,9 +1209,10 @@ def _run_fused_ce_fwd_bwd_nll(
             if weight_is_vd
             else (hc @ lm_weight)
         )
-        nll_c, lse = _ce_chunk_nll_and_lse(logits_bf16, tc)
+        nll_c, d_logits = _ce_chunk_nll_and_dlogits(
+            logits_bf16, tc, mc, vocab_idx, inv_denom, hc.dtype
+        )
         chunk_loss = jnp.sum(nll_c * mc)
-        d_logits = _ce_chunk_dlogits(logits_bf16, lse, tc, mc, vocab_idx, inv_denom, hc.dtype)
         if weight_is_vd:
             d_hc = (d_logits @ lm_weight).astype(hc.dtype)
             d_w_acc = d_w_acc + jax.lax.dot_general(

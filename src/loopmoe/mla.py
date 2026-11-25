@@ -195,10 +195,11 @@ def compute_csa2_lightning_mask(
     # Score_{i, j} = sum_h w_{i, h} * ReLU(q_{i, h} . k_j)
     raw = jnp.einsum("bshd,btd->bsht", q_idx, k_idx)
     raw = jax.nn.relu(raw)
-    scores = jnp.sum(weights[:, :, :, None] * raw, axis=2).astype(jnp.float32)  # [B, S, S]
+    scores = jnp.sum(weights[:, :, :, None] * raw, axis=2).astype(x.dtype)  # [B, S, S]
 
     causal = jnp.tril(jnp.ones((seq_len, seq_len), dtype=bool))[None, :, :]
-    scores = jnp.where(causal, scores, -1e9)
+    mask_val = jnp.asarray(-1e4 if x.dtype == jnp.bfloat16 else -1e9, dtype=x.dtype)
+    scores = jnp.where(causal, scores, mask_val)
 
     k_select = min(cfg.csa2_topk, seq_len)
     _, topk_idx = jax.lax.top_k(scores, k_select)

@@ -130,56 +130,78 @@ def make_train_step(
     ) -> tuple[dict[str, Any], Any, dict[str, jax.Array]]:
         step_idx = _extract_opt_step(opt_state)
         base_rng = jax.random.fold_in(jax.random.PRNGKey(seed), step_idx)
-        zero_grads = jax.tree_util.tree_map(jnp.zeros_like, params)
-        init_counts = jnp.zeros((model_cfg.num_loops, model_cfg.n_routed_experts), dtype=jnp.float32)
-        init_carry = (
-            zero_grads,
-            jnp.asarray(0.0, dtype=jnp.float32),
-            jnp.asarray(0.0, dtype=jnp.float32),
-            jnp.asarray(0.0, dtype=jnp.float32),
-            jnp.asarray(0.0, dtype=jnp.float32),
-            jnp.asarray(0.0, dtype=jnp.float32),
-            jnp.asarray(0.0, dtype=jnp.float32),
-            init_counts,
-        )
+        default_exp_r = jnp.asarray(float(model_cfg.num_loops), dtype=jnp.float32)
+        default_h_ent = jnp.asarray(0.0, dtype=jnp.float32)
 
-        inv_g = 1.0 / float(grad_accum_steps)
-
-        def accum_body(carry, microbatch):
-            g_acc, loss_acc, ce_acc, gate_acc, mmr_acc, exp_r_acc, h_ent_acc, cnt_acc = carry
-            x_mb, y_mb, mb_idx = microbatch
-            x_mb = x_mb.astype(jnp.int32)
-            y_mb = y_mb.astype(jnp.int32)
-            mb_key = jax.random.fold_in(base_rng, mb_idx) if model_cfg.num_loops > 1 else None
+        if grad_accum_steps == 1:
+            mb_key = (
+                jax.random.fold_in(base_rng, jnp.asarray(0, dtype=jnp.int32))
+                if model_cfg.num_loops > 1
+                else None
+            )
             with jax.named_scope("fwd_bwd_microbatch"):
-                (loss, aux), grads = grad_fn(params, x_mb, y_mb, mb_key)
-            g_acc = jax.tree_util.tree_map(lambda a, g: a + g, g_acc, grads)
-            return (
-                g_acc,
-                loss_acc + loss * inv_g,
-                ce_acc + aux["ce_loss"] * inv_g,
-                gate_acc + aux["engram_gate_mean"] * inv_g,
-                mmr_acc + aux["router_mmr"] * inv_g,
-                exp_r_acc + aux.get("expected_loops", jnp.asarray(float(model_cfg.num_loops), dtype=jnp.float32)) * inv_g,
-                h_ent_acc + aux.get("halt_entropy", jnp.asarray(0.0, dtype=jnp.float32)) * inv_g,
-                cnt_acc + aux["expert_counts"] * inv_g,
-            ), None
+                (loss_mean, aux), grads_mean = grad_fn(
+                    params, batch_xs[0].astype(jnp.int32), batch_ys[0].astype(jnp.int32), mb_key
+                )
+            ce_mean = aux["ce_loss"]
+            gate_mean = aux["engram_gate_mean"]
+            mmr_mean = aux["router_mmr"]
+            exp_r_mean = aux.get("expected_loops", default_exp_r)
+            h_ent_mean = aux.get("halt_entropy", default_h_ent)
+            counts_mean = aux["expert_counts"]
+        else:
+            zero_grads = jax.tree_util.tree_map(jnp.zeros_like, params)
+            init_counts = jnp.zeros(
+                (model_cfg.num_loops, model_cfg.n_routed_experts), dtype=jnp.float32
+            )
+            init_carry = (
+                zero_grads,
+                jnp.asarray(0.0, dtype=jnp.float32),
+                jnp.asarray(0.0, dtype=jnp.float32),
+                jnp.asarray(0.0, dtype=jnp.float32),
+                jnp.asarray(0.0, dtype=jnp.float32),
+                jnp.asarray(0.0, dtype=jnp.float32),
+                jnp.asarray(0.0, dtype=jnp.float32),
+                init_counts,
+            )
 
-        mb_indices = jnp.arange(grad_accum_steps, dtype=jnp.int32)
-        with jax.named_scope("grad_accum_scan"):
-            (
-                grads_sum,
-                loss_mean,
-                ce_mean,
-                gate_mean,
-                mmr_mean,
-                exp_r_mean,
-                h_ent_mean,
-                counts_mean,
-            ), _ = jax.lax.scan(accum_body, init_carry, (batch_xs, batch_ys, mb_indices))
-        grads_mean = jax.tree_util.tree_map(
-            lambda g: g * jnp.asarray(inv_g, dtype=g.dtype), grads_sum
-        )
+            inv_g = 1.0 / float(grad_accum_steps)
+
+            def accum_body(carry, microbatch):
+                g_acc, loss_acc, ce_acc, gate_acc, mmr_acc, exp_r_acc, h_ent_acc, cnt_acc = carry
+                x_mb, y_mb, mb_idx = microbatch
+                x_mb = x_mb.astype(jnp.int32)
+                y_mb = y_mb.astype(jnp.int32)
+                mb_key = jax.random.fold_in(base_rng, mb_idx) if model_cfg.num_loops > 1 else None
+                with jax.named_scope("fwd_bwd_microbatch"):
+                    (loss, aux), grads = grad_fn(params, x_mb, y_mb, mb_key)
+                # Fuse inv_g scaling into accumulation to avoid a duplicate full-model grads_mean pytree
+                g_acc = jax.tree_util.tree_map(
+                    lambda a, g: a + g * jnp.asarray(inv_g, dtype=g.dtype), g_acc, grads
+                )
+                return (
+                    g_acc,
+                    loss_acc + loss * inv_g,
+                    ce_acc + aux["ce_loss"] * inv_g,
+                    gate_acc + aux["engram_gate_mean"] * inv_g,
+                    mmr_acc + aux["router_mmr"] * inv_g,
+                    exp_r_acc + aux.get("expected_loops", default_exp_r) * inv_g,
+                    h_ent_acc + aux.get("halt_entropy", default_h_ent) * inv_g,
+                    cnt_acc + aux["expert_counts"] * inv_g,
+                ), None
+
+            mb_indices = jnp.arange(grad_accum_steps, dtype=jnp.int32)
+            with jax.named_scope("grad_accum_scan"):
+                (
+                    grads_mean,
+                    loss_mean,
+                    ce_mean,
+                    gate_mean,
+                    mmr_mean,
+                    exp_r_mean,
+                    h_ent_mean,
+                    counts_mean,
+                ), _ = jax.lax.scan(accum_body, init_carry, (batch_xs, batch_ys, mb_indices))
 
         with jax.named_scope("optimizer_muon_adamw"):
             updates, new_opt_state = optimizer.update(grads_mean, opt_state, params)
@@ -474,11 +496,17 @@ def main() -> None:
             num_loops=stage.num_loops,
             use_csa2_indexer=bool(args.use_csa2_long),
         )
+        stage_overrides: dict[str, Any] = {}
         if args.use_csa2_long and stage.seq_len < 16384:
             # Keep idx_* parameter shapes consistent across stages while staying dense below 16K
-            stage_model_cfg = LoopMoEConfig(
-                **{**stage_model_cfg.to_dict(), "csa2_topk": stage.seq_len}
-            )
+            stage_overrides["csa2_topk"] = stage.seq_len
+        if args.tpu_preset == "v5e-1" and not args.tiny and stage.seq_len >= 16384:
+            if args.remat_moe is None and not stage_model_cfg.remat_moe:
+                stage_overrides["remat_moe"] = True
+            if args.chunk_ce_size is None and stage_model_cfg.chunk_ce_size > 4096:
+                stage_overrides["chunk_ce_size"] = 4096
+        if stage_overrides:
+            stage_model_cfg = LoopMoEConfig(**{**stage_model_cfg.to_dict(), **stage_overrides})
 
         # Smooth R=1 -> R=8 expansion entering Stage 7
         if stage.num_loops > prev_num_loops and prev_num_loops == 1:

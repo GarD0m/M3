@@ -320,16 +320,20 @@ def scale_by_row_adam(
         bc2 = jnp.asarray(1.0, dtype=jnp.float32) - jnp.asarray(b2, dtype=jnp.float32) ** c_f32
 
         def _step_leaf(g: jax.Array, m: jax.Array, v: jax.Array):
-            g_f32 = g.astype(jnp.float32)
-            new_m_f32 = jnp.asarray(b1, dtype=jnp.float32) * m.astype(jnp.float32) + (
-                jnp.asarray(1.0 - b1, dtype=jnp.float32) * g_f32
-            )
-            row_sq = jnp.mean(jnp.square(g_f32), axis=-1, keepdims=True)
+            dt = g.dtype
+            b1_d = jnp.asarray(b1, dtype=dt)
+            one_m_b1_d = jnp.asarray(1.0 - b1, dtype=dt)
+            new_m = b1_d * m.astype(dt) + one_m_b1_d * g
+            row_sq = jnp.mean(jnp.square(g), axis=-1, keepdims=True, dtype=jnp.float32)
             new_v = jnp.asarray(b2, dtype=jnp.float32) * v + (
                 jnp.asarray(1.0 - b2, dtype=jnp.float32) * row_sq
             )
-            upd = (new_m_f32 / bc1) / (jnp.sqrt(new_v / bc2) + jnp.asarray(eps, dtype=jnp.float32))
-            return upd.astype(g.dtype), new_m_f32.astype(mu_dtype_can), new_v
+            inv_denom = (
+                jnp.asarray(1.0, dtype=jnp.float32)
+                / (bc1 * (jnp.sqrt(new_v / bc2) + jnp.asarray(eps, dtype=jnp.float32)))
+            ).astype(dt)
+            upd = new_m * inv_denom
+            return upd, new_m.astype(mu_dtype_can), new_v
 
         treedef = jax.tree_util.tree_structure(updates)
         u_leaves = jax.tree_util.tree_leaves(updates)
