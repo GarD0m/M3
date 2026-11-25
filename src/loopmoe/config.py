@@ -51,10 +51,35 @@ def is_prime(n: int) -> bool:
     return True
 
 
-def generate_prime_table_sizes(total_slots: int, num_tables: int) -> tuple[int, ...]:
-    """Generate `num_tables` distinct prime bucket sizes summing close to `total_slots`."""
+def generate_prime_table_sizes(
+    total_slots: int, num_tables: int, align_to: int = 1
+) -> tuple[int, ...]:
+    """Generate `num_tables` distinct prime bucket sizes summing to `total_slots` (aligned if requested)."""
     if num_tables <= 0:
         return ()
+    if align_to > 1 and num_tables >= 2 and not (align_to % 2 == 0 and num_tables % 2 == 1):
+        aligned_total = ((max(total_slots, num_tables * 17) + align_to - 1) // align_to) * align_to
+        if aligned_total % 2 != num_tables % 2:
+            aligned_total += align_to
+        while True:
+            target = max(17, aligned_total // num_tables)
+            prefix: list[int] = []
+            candidate = target if target % 2 == 1 else target + 1
+            while len(prefix) < num_tables - 2:
+                if is_prime(candidate):
+                    prefix.append(candidate)
+                candidate += 2
+            rem = aligned_total - sum(prefix)
+            used = set(prefix)
+            pa = (rem // 2) if (rem // 2) % 2 == 1 else (rem // 2 - 1)
+            for _ in range(max(16, target // 2)):
+                pb = rem - pa
+                if pa >= 17 and pb >= 17 and pa != pb and pa not in used and pb not in used:
+                    if is_prime(pa) and is_prime(pb):
+                        return tuple(sorted((*prefix, pa, pb)))
+                pa -= 2
+            aligned_total += align_to if (align_to % 2 == 0) else (2 * align_to)
+
     target = max(17, total_slots // num_tables)
     primes: list[int] = []
     candidate = target if target % 2 == 1 else target + 1
@@ -67,7 +92,7 @@ def generate_prime_table_sizes(total_slots: int, num_tables: int) -> tuple[int, 
 
 @dataclass(frozen=True)
 class LoopMoEConfig:
-    """Configuration for 1B 1-Layer DeepSeek-V4.1-Flash LoopMoE."""
+    """Configuration for DeepSeek-V4.1-Flash LoopMoE."""
 
     # Core backbone
     vocab_size: int = 32_768
@@ -95,12 +120,13 @@ class LoopMoEConfig:
     mhc_sinkhorn_iters: int = 10
     mhc_alpha_init: float = 0.01
 
-    # DeepSeek-V4.1-Flash Engram Conditional Memory (~20.5% of sparse capacity)
+    # DeepSeek-V4.1-Flash Engram Conditional Memory (~39.9% of sparse capacity, 2048*1024 1024-aligned slots)
     use_engram: bool = True
     engram_orders: tuple[int, ...] = (2, 3)
     engram_hash_heads: int = 2
     engram_head_dim: int = 256
-    engram_total_slots: int = 800_000
+    engram_total_slots: int = 2_097_152  # 2048 * 1024 (exact prime sum % 1024 == 0, ~537M table params)
+    engram_slot_alignment: int = 1024
     engram_conv_kernel: int = 4
     engram_conv_dilation: int = 3
     engram_seed: int = 20260112
@@ -126,7 +152,7 @@ class LoopMoEConfig:
     d_ff_expert: int = 1024
     n_shared_experts: int = 1
     d_ff_shared: int = 1024
-    top_k: int = 5
+    top_k: int = 4
     routed_scaling_factor: float = 2.5
     router_bias_update_rate: float = 1e-3
     seq_aux_loss_weight: float = 0.0
@@ -155,7 +181,11 @@ class LoopMoEConfig:
     def engram_table_sizes(self) -> tuple[int, ...]:
         if not self.use_engram:
             return ()
-        return generate_prime_table_sizes(self.engram_total_slots, self.num_engram_tables)
+        return generate_prime_table_sizes(
+            self.engram_total_slots,
+            self.num_engram_tables,
+            align_to=self.engram_slot_alignment,
+        )
 
     @property
     def d_engram(self) -> int:
@@ -210,6 +240,7 @@ class LoopMoEConfig:
             engram_hash_heads=2,
             engram_head_dim=8,
             engram_total_slots=400,
+            engram_slot_alignment=1,
             engram_conv_kernel=4,
             engram_conv_dilation=1,
             engram_pre_loop_only=True,

@@ -21,6 +21,7 @@ from loopmoe.config import (
     LoopMoEConfig,
     count_analytic_params,
     estimate_step_flops,
+    generate_prime_table_sizes,
     is_prime,
 )
 from loopmoe.engram import _causal_depthwise_conv1d
@@ -75,16 +76,24 @@ from train_tokenizer import benchmark_tokenizer, build_bpe_tokenizer, save_hf_to
 def test_full_1b_analytic_params_and_tiny_exact_match() -> None:
     cfg = LoopMoEConfig()
     stats = count_analytic_params(cfg)
-    assert 1.10e9 <= stats["total"] <= 1.25e9, f"Expected ~1.17B params, got {stats['total']}"
-    assert 0.20 <= stats["engram_sparse_ratio"] <= 0.25, stats["engram_sparse_ratio"]
+    assert 1.45e9 <= stats["total"] <= 1.55e9, f"Expected ~1.49B params, got {stats['total']}"
+    assert 0.38 <= stats["engram_sparse_ratio"] <= 0.42, stats["engram_sparse_ratio"]
     assert all(is_prime(p) for p in cfg.engram_table_sizes)
     assert len(set(cfg.engram_table_sizes)) == len(cfg.engram_table_sizes)
+    assert cfg.engram_total_slots == 2_097_152
+    assert cfg.engram_slot_alignment == 1024
+    assert cfg.d_engram == 1024
+    assert sum(cfg.engram_table_sizes) == 2_097_152
+    assert sum(cfg.engram_table_sizes) % 1024 == 0
+    aligned_2m = generate_prime_table_sizes(2_097_152, 4, align_to=1024)
+    assert sum(aligned_2m) == 2_097_152 and sum(aligned_2m) % 1024 == 0
+    assert all(is_prime(p) for p in aligned_2m) and len(set(aligned_2m)) == 4
     assert cfg.vocab_size == 32_768
     assert cfg.mhc_streams == 2
     assert cfg.n_routed_experts == 128
     assert cfg.d_ff_expert == 1024
     assert cfg.d_ff_shared == 1024
-    assert cfg.top_k == 5
+    assert cfg.top_k == 4
     assert cfg.seq_aux_loss_weight == 0.0
     assert cfg.engram_pre_loop_only is True
     assert cfg.untie_mla_per_loop is True
@@ -867,7 +876,7 @@ def test_pallas_moe_dispatch_combine_kernels() -> None:
     from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
 
     # 1. Exact bit-for-bit numerical equivalence via Pallas CPU interpret mode
-    n_tok, top_k, d_model = 128, 5, 1024
+    n_tok, top_k, d_model = 128, 4, 1024
     m_rows = n_tok * top_k
     k1, k2, k3 = jax.random.split(jax.random.PRNGKey(909), 3)
     idx = jax.random.randint(k1, (m_rows,), 0, n_tok, dtype=jnp.int32)
@@ -886,15 +895,15 @@ def test_pallas_moe_dispatch_combine_kernels() -> None:
             c_ref = c_ref + down[inv_2d[:, k]]
         np.testing.assert_array_equal(np.asarray(c_out, dtype=np.float32), np.asarray(c_ref, dtype=np.float32))
 
-    # 2. Mosaic TPU v5e & v6e MLIR lowering at full 1B shapes (32768 x 2048, K=5) with zero shape_cast
+    # 2. Mosaic TPU v5e & v6e MLIR lowering at full 1B shapes (32768 x 2048, K=4) with zero shape_cast
     x_s = jax.ShapeDtypeStruct((32_768, 2048), jnp.bfloat16)
-    idx_s = jax.ShapeDtypeStruct((163_840,), jnp.int32)
-    down_s = jax.ShapeDtypeStruct((163_840, 2048), jnp.bfloat16)
+    idx_s = jax.ShapeDtypeStruct((131_072,), jnp.int32)
+    down_s = jax.ShapeDtypeStruct((131_072, 2048), jnp.bfloat16)
     for dev in ("TPU v5 lite", "TPU v6 lite"):
         mesh = AbstractMesh((1,), ("x",), abstract_device=AbstractDevice(dev, num_cores=1, platform="tpu"))
         with use_abstract_mesh(mesh):
             mlir_g = pl.lower_as_mlir(pallas_moe_gather, x_s, idx_s, platforms=("tpu",))
-            mlir_c = pl.lower_as_mlir(lambda a, b: pallas_moe_combine(a, b, top_k=5), down_s, idx_s, platforms=("tpu",))
+            mlir_c = pl.lower_as_mlir(lambda a, b: pallas_moe_combine(a, b, top_k=4), down_s, idx_s, platforms=("tpu",))
             assert "shape_cast" not in mlir_g and "shape_cast" not in mlir_c
             assert "pallas_moe_gather" in mlir_g and "pallas_moe_combine" in mlir_c
 
