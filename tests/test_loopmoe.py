@@ -123,6 +123,9 @@ def test_full_1b_analytic_params_and_tiny_exact_match() -> None:
     assert estimate_step_flops(LoopMoEConfig(num_loops=32, train_loop_capacity_factor=0.5), 2, 4096) < (
         estimate_step_flops(LoopMoEConfig(num_loops=32, train_loop_capacity_factor=1.0), 2, 4096)
     )
+    assert estimate_step_flops(LoopMoEConfig(num_loops=32, bptt_window=8), 2, 4096) < (
+        estimate_step_flops(LoopMoEConfig(num_loops=32, bptt_window=0), 2, 4096)
+    )
 
     # Verify curriculum token sum == 21B (20B R=1 + 1B R=8) and all stages use L3
     assert sum(s.target_tokens for s in DEFAULT_CURRICULUM if s.num_loops == 1) == 20_000_000_000

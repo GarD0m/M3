@@ -116,21 +116,17 @@ def _causal_depthwise_conv1d(
     bias: jax.Array,
     dilation: int,
 ) -> jax.Array:
-    """Apply causal 1D depthwise convolution over sequence axis=1 in native dtype via conv_general_dilated."""
+    """Apply causal 1D depthwise convolution via explicit shifted slices (zero XLA conv/pad overhead)."""
     kernel_size = weight.shape[0]
+    seq_len = x.shape[1]
     pad_len = (kernel_size - 1) * dilation
-    # Flip kernel so k=0 multiplies x[t], k=1 multiplies x[t-dilation], etc.
-    rhs = weight[::-1, None, :].astype(x.dtype)
-    conv = jax.lax.conv_general_dilated(
-        lhs=x,
-        rhs=rhs,
-        window_strides=(1,),
-        padding=((pad_len, 0),),
-        rhs_dilation=(dilation,),
-        dimension_numbers=("NWC", "WIO", "NWC"),
-        feature_group_count=x.shape[-1],
-    )
-    return jax.nn.silu(conv + bias[None, None, :].astype(x.dtype))
+    x_pad = jnp.pad(x, ((0, 0), (pad_len, 0), (0, 0)))
+    w = weight.astype(x.dtype)
+    acc = x_pad[:, pad_len : pad_len + seq_len, :] * w[0][None, None, :]
+    for k in range(1, kernel_size):
+        start = pad_len - k * dilation
+        acc = acc + x_pad[:, start : start + seq_len, :] * w[k][None, None, :]
+    return jax.nn.silu(acc + bias[None, None, :].astype(x.dtype))
 
 
 def precompute_engram_kv(

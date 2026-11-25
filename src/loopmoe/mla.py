@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import math
 import warnings
@@ -268,65 +269,161 @@ def _run_causal_attention(
         v_pad = _pad_last_dim_to_multiple(v, target_dim) if d_v != target_dim else v
 
         if seq_len >= 128 and seq_len % 128 == 0:
-            try:
-                from jax.experimental.pallas.ops.tpu.splash_attention import QKVLayout  # type: ignore
-                from tokamax._src.ops.attention import pallas_mosaic_tpu as _tpu_attn  # type: ignore
-                from tokamax._src.ops.attention import pallas_mosaic_tpu_vjp as _tpu_attn_vjp  # type: ignore
+            blk = (min(512, seq_len) // 128) * 128
+            blk_kv_dkv = (min(1024, seq_len) // 128) * 128
+            blk_c = min(256, blk)
 
-                blk = (min(512, seq_len) // 128) * 128
-                blk_kv_dkv = (min(1024, seq_len) // 128) * 128
-                blk_c = min(256, blk)
-                vjp_op = _tpu_attn_vjp.PallasMosaicTpuFlashAttentionVjp(
-                    config=_tpu_attn_vjp.Config(
-                        block_q_dkv=blk,
-                        block_kv_dkv=blk_kv_dkv,
-                        block_kv_dkv_compute=blk_c,
-                        use_base2_exp=True,
+            if seq_len <= 4096:
+                try:
+                    from jax.experimental.pallas.ops.tpu.splash_attention import QKVLayout  # type: ignore
+                    from tokamax._src.ops.attention import pallas_mosaic_tpu as _tpu_attn  # type: ignore
+                    from tokamax._src.ops.attention import pallas_mosaic_tpu_vjp as _tpu_attn_vjp  # type: ignore
+
+                    vjp_op = _tpu_attn_vjp.PallasMosaicTpuFlashAttentionVjp(
+                        config=_tpu_attn_vjp.Config(
+                            block_q_dkv=blk,
+                            block_kv_dkv=blk_kv_dkv,
+                            block_kv_dkv_compute=blk_c,
+                            use_base2_exp=True,
+                        )
                     )
-                )
-                attn_op = _tpu_attn.PallasMosaicTpuFlashAttention(
-                    config=_tpu_attn.Config(
-                        block_q=blk,
-                        block_kv=blk,
-                        block_kv_compute=blk_c,
-                        q_layout=QKVLayout.HEAD_DIM_MINOR,
-                        k_layout=QKVLayout.HEAD_DIM_MINOR,
-                        v_layout=QKVLayout.HEAD_DIM_MINOR,
-                        use_experimental_scheduler=False,
-                        use_base2_exp=True,
-                    ),
-                    vjp=vjp_op,
-                )
-                out = attn_op(q_pad, k_pad, v_pad, is_causal=True, logits_scale=softmax_scale)
-                return out[..., :d_v]
+                    attn_op = _tpu_attn.PallasMosaicTpuFlashAttention(
+                        config=_tpu_attn.Config(
+                            block_q=blk,
+                            block_kv=blk,
+                            block_kv_compute=blk_c,
+                            q_layout=QKVLayout.HEAD_DIM_MINOR,
+                            k_layout=QKVLayout.HEAD_DIM_MINOR,
+                            v_layout=QKVLayout.HEAD_DIM_MINOR,
+                            use_experimental_scheduler=False,
+                            use_base2_exp=True,
+                        ),
+                        vjp=vjp_op,
+                    )
+                    out = attn_op(q_pad, k_pad, v_pad, is_causal=True, logits_scale=softmax_scale)
+                    return out[..., :d_v]
+                except Exception as exc:
+                    warnings.warn(
+                        f"[MLA] PallasMosaicTpuFlashAttention failed at seq_len={seq_len}: {exc}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+            else:
+                # For >=8K, fused backward materializes f32[B, S//1024, H, S, 128] (8.59 GB at 32K!).
+                # Use unfused Splash Attention backward (separate dKV + dQ kernels) so dQ is reduced in VMEM.
+                blk_dq = min(256, blk)
+
+                def _invoke_unfused_splash(
+                    make_fn,
+                    block_sizes_cls,
+                    qkv_layout_cls,
+                    causal_mask_cls,
+                    mh_mask_cls,
+                ) -> jax.Array:
+                    valid_fields = {f.name for f in dataclasses.fields(block_sizes_cls)}
+                    candidates = {
+                        "block_q": blk,
+                        "block_kv": blk,
+                        "block_kv_compute": blk_c,
+                        "block_q_dkv": blk,
+                        "block_kv_dkv": blk_kv_dkv,
+                        "block_kv_dkv_compute": blk_c,
+                        "block_q_dq": blk_dq,
+                        "block_kv_dq": blk_dq,
+                        "block_kv_dq_compute": blk_c,
+                        "use_fused_bwd_kernel": False,
+                        "q_layout": qkv_layout_cls.HEAD_DIM_MINOR,
+                        "k_layout": qkv_layout_cls.HEAD_DIM_MINOR,
+                        "v_layout": qkv_layout_cls.HEAD_DIM_MINOR,
+                        "use_base2_exp": True,
+                        "fuse_reciprocal": True,
+                    }
+                    bs = block_sizes_cls(**{k: v for k, v in candidates.items() if k in valid_fields})
+                    num_heads = q_pad.shape[2]
+                    mask = mh_mask_cls([causal_mask_cls(shape=(seq_len, seq_len)) for _ in range(num_heads)])
+                    mk_sig = inspect.signature(make_fn)
+                    mk_kwargs: dict[str, object] = {}
+                    for k, v in (
+                        ("block_sizes", bs),
+                        ("head_shards", 1),
+                        ("q_seq_shards", 1),
+                        ("downcast_smem_data", True),
+                    ):
+                        if k in mk_sig.parameters:
+                            mk_kwargs[k] = v
+                    splash_fn = make_fn(mask, **mk_kwargs)
+                    q_hsd = jnp.swapaxes(q_pad * jnp.asarray(softmax_scale, dtype=q_pad.dtype), 1, 2)
+                    k_hsd = jnp.swapaxes(k_pad, 1, 2)
+                    v_hsd = jnp.swapaxes(v_pad, 1, 2)
+                    out_hsd = jax.vmap(splash_fn)(q_hsd, k_hsd, v_hsd)
+                    return jnp.swapaxes(out_hsd, 1, 2)[..., :d_v]
+
+                try:
+                    from tokamax._src.ops.splash_attention import splash_attention_kernel as _tkx_splash  # type: ignore
+                    from jax.experimental.pallas.ops.tpu.splash_attention import (  # type: ignore
+                        CausalMask as _JaxCausalMask,
+                        MultiHeadMask as _JaxMultiHeadMask,
+                        QKVLayout as _JaxQKVLayout,
+                    )
+
+                    _cm_cls = getattr(_tkx_splash, "CausalMask", _JaxCausalMask)
+                    _mh_cls = getattr(_tkx_splash, "MultiHeadMask", _JaxMultiHeadMask)
+                    _ql_cls = getattr(_tkx_splash, "QKVLayout", _JaxQKVLayout)
+                    return _invoke_unfused_splash(
+                        _tkx_splash.make_splash_mha, _tkx_splash.BlockSizes, _ql_cls, _cm_cls, _mh_cls
+                    )
+                except Exception as exc:
+                    warnings.warn(
+                        f"[MLA] tokamax unfused splash_attention failed at seq_len={seq_len}: {exc}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+
+                try:
+                    from jax.experimental.pallas.ops.tpu.splash_attention import (
+                        BlockSizes as _JaxBlockSizes,
+                        CausalMask as _JaxCausalMask,
+                        MultiHeadMask as _JaxMultiHeadMask,
+                        QKVLayout as _JaxQKVLayout,
+                        make_splash_mha as _jax_make_splash_mha,
+                    )
+
+                    return _invoke_unfused_splash(
+                        _jax_make_splash_mha,
+                        _JaxBlockSizes,
+                        _JaxQKVLayout,
+                        _JaxCausalMask,
+                        _JaxMultiHeadMask,
+                    )
+                except Exception as exc:
+                    warnings.warn(
+                        f"[MLA] jax unfused splash_attention failed at seq_len={seq_len}: {exc}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+
+        if seq_len <= 4096:
+            try:
+                import tokamax  # type: ignore
+
+                fn = getattr(tokamax, "dot_product_attention", None)
+                if fn is not None:
+                    sig = inspect.signature(fn)
+                    kwargs: dict[str, object] = {"is_causal": True}
+                    if "logits_scale" in sig.parameters:
+                        kwargs["logits_scale"] = softmax_scale
+                    elif "scale" in sig.parameters:
+                        kwargs["scale"] = softmax_scale
+                    if "implementation" in sig.parameters:
+                        kwargs["implementation"] = "mosaic"
+                    out = fn(q_pad, k_pad, v_pad, **kwargs)
+                    return out[..., :d_v]
             except Exception as exc:
                 warnings.warn(
-                    f"[MLA] PallasMosaicTpuFlashAttention failed at seq_len={seq_len}: {exc}",
+                    f"[MLA] tokamax.dot_product_attention failed at seq_len={seq_len}: {exc}",
                     RuntimeWarning,
                     stacklevel=2,
                 )
-
-        try:
-            import tokamax  # type: ignore
-
-            fn = getattr(tokamax, "dot_product_attention", None)
-            if fn is not None:
-                sig = inspect.signature(fn)
-                kwargs: dict[str, object] = {"is_causal": True}
-                if "logits_scale" in sig.parameters:
-                    kwargs["logits_scale"] = softmax_scale
-                elif "scale" in sig.parameters:
-                    kwargs["scale"] = softmax_scale
-                if "implementation" in sig.parameters:
-                    kwargs["implementation"] = "mosaic"
-                out = fn(q_pad, k_pad, v_pad, **kwargs)
-                return out[..., :d_v]
-        except Exception as exc:
-            warnings.warn(
-                f"[MLA] tokamax.dot_product_attention failed at seq_len={seq_len}: {exc}",
-                RuntimeWarning,
-                stacklevel=2,
-            )
 
         if seq_len >= 128 and seq_len % 128 == 0:
             try:

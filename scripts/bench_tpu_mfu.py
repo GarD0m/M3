@@ -313,35 +313,37 @@ def main() -> None:
             if (args.microbatch is not None or args.tiny)
             else max(1, (int(spec["default_microbatch"]) * 4096) // seq_len)
         )
-        if args.tpu_preset == "v5e-1" and not args.tiny and seq_len >= 16384:
+        if args.tpu_preset == "v5e-1" and not args.tiny and (loops > 1 or seq_len >= 16384):
             auto_overrides: dict[str, Any] = {}
-            if args.remat_sublayers is None and not base_cfg.remat_sublayers:
-                auto_overrides["remat_sublayers"] = True
             if args.remat_moe is None and not base_cfg.remat_moe:
                 auto_overrides["remat_moe"] = True
-            if args.moe_chunk_size is None and base_cfg.moe_chunk_size == 0:
-                auto_overrides["moe_chunk_size"] = 4096
-            if args.chunk_ce_size is None and base_cfg.chunk_ce_size > 4096:
-                auto_overrides["chunk_ce_size"] = 4096
+            if seq_len >= 16384:
+                if loops > 1 and args.remat_sublayers is None and not base_cfg.remat_sublayers:
+                    auto_overrides["remat_sublayers"] = True
+                if args.moe_chunk_size is None and base_cfg.moe_chunk_size == 0:
+                    auto_overrides["moe_chunk_size"] = 4096
+                if args.chunk_ce_size is None and base_cfg.chunk_ce_size > 4096:
+                    auto_overrides["chunk_ce_size"] = 4096
             if auto_overrides:
                 point_cfg = LoopMoEConfig(**{**base_cfg.to_dict(), **auto_overrides})
                 print(
-                    f"[Auto-HBM v5e-1 @ seq={seq_len}] "
+                    f"[Auto-HBM v5e-1 @ seq={seq_len}, R={loops}] "
                     + ", ".join(f"{k}={v}" for k, v in auto_overrides.items())
                 )
-            explicit_risks = []
-            if args.remat_sublayers is False:
-                explicit_risks.append("--no-remat-sublayers")
-            if args.remat_moe is False:
-                explicit_risks.append("--no-remat-moe")
-            if args.chunk_ce_size is not None and args.chunk_ce_size > 4096:
-                explicit_risks.append(f"--chunk-ce-size {args.chunk_ce_size}")
-            if explicit_risks:
-                print(
-                    f"[WARN v5e-1 @ seq={seq_len}] Explicit flags disable 16 GB HBM savings: "
-                    + ", ".join(explicit_risks)
-                    + " (omit them to auto-fit 32K)"
-                )
+            if seq_len >= 16384:
+                explicit_risks = []
+                if loops > 1 and args.remat_sublayers is False:
+                    explicit_risks.append("--no-remat-sublayers")
+                if args.remat_moe is False:
+                    explicit_risks.append("--no-remat-moe")
+                if args.chunk_ce_size is not None and args.chunk_ce_size > 4096:
+                    explicit_risks.append(f"--chunk-ce-size {args.chunk_ce_size}")
+                if explicit_risks:
+                    print(
+                        f"[WARN v5e-1 @ seq={seq_len}] Explicit flags disable 16 GB HBM savings: "
+                        + ", ".join(explicit_risks)
+                        + " (omit them to auto-fit 32K)"
+                    )
         trace_here = (
             None
             if not args.profile_dir

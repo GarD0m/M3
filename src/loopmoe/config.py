@@ -618,26 +618,39 @@ def count_analytic_params(cfg: LoopMoEConfig) -> dict[str, float | int]:
 def estimate_step_flops(cfg: LoopMoEConfig, batch_size: int, seq_len: int) -> float:
     """Estimate training FLOPs (forward + backward) per microbatch or step for MFU calculation.
 
-    Uses standard transformer 6 * N_active * tokens + attention 12 * n_heads * seq^2 * (d_qk + d_v) * loops.
+    Accounts for Truncated BPTT (prefix loops execute 2x forward-only instead of 6x fwd+bwd),
+    Loop-0 KV reuse, dynamic-loop MoE token capacity, and sampled deep CE depths.
     """
     stats = count_analytic_params(cfg)
     tokens = batch_size * seq_len
+    n_deep = max(0, cfg.num_loops - 1)
+    if cfg.num_loops > 1 and cfg.bptt_window > 0 and n_deep > cfg.bptt_window:
+        n_bwd_deep = int(cfg.bptt_window)
+        n_fwd_only_deep = n_deep - n_bwd_deep
+        eff_deep = float(n_bwd_deep) + float(n_fwd_only_deep) / 3.0
+        eff_total_loops = 1.0 + eff_deep
+    else:
+        eff_deep = float(n_deep)
+        eff_total_loops = float(cfg.num_loops)
+
     engram_dense_runs = (
-        1 if (cfg.use_engram and cfg.engram_pre_loop_only) else (cfg.num_loops if cfg.use_engram else 0)
+        1.0
+        if (cfg.use_engram and cfg.engram_pre_loop_only)
+        else (eff_total_loops if cfg.use_engram else 0.0)
     )
     if cfg.reuse_kv_across_loops and cfg.num_loops > 1:
-        mla_matmul_total = int(stats["mla_per_loop"]) + (cfg.num_loops - 1) * int(
-            stats["mla_q_o_per_loop"]
+        mla_matmul_total = float(int(stats["mla_per_loop"])) + eff_deep * float(
+            int(stats["mla_q_o_per_loop"])
         )
     else:
-        mla_matmul_total = cfg.num_loops * int(stats["mla_per_loop"])
+        mla_matmul_total = eff_total_loops * float(int(stats["mla_per_loop"]))
     if cfg.num_loops > 1:
         cap_factor = (
             min(1.0, max(0.0, float(cfg.train_loop_capacity_factor)))
             if cfg.use_dynamic_loop
             else 1.0
         )
-        moe_runs = 1.0 + float(cfg.num_loops - 1) * cap_factor
+        moe_runs = 1.0 + eff_deep * cap_factor
     else:
         moe_runs = 1.0
     if cfg.use_dynamic_loop and cfg.num_loops > 1:
@@ -653,16 +666,16 @@ def estimate_step_flops(cfg: LoopMoEConfig, batch_size: int, seq_len: int) -> fl
     # Dense matmul FLOPs (embedding lookup is sparse; LM head projection IS a full matmul)
     active_matmul_params = (
         lm_head_runs * float(cfg.vocab_size * cfg.d_model)  # LM head
-        + float(engram_dense_runs * int(stats["active_engram_dense"]))
+        + engram_dense_runs * float(int(stats["active_engram_dense"]))
         + float(mla_matmul_total)
         + moe_runs * float(int(stats["active_ffn_per_loop"]))
-        + float(cfg.num_loops) * float(int(stats["mhc"]))
+        + eff_total_loops * float(int(stats["mhc"]))
     )
     linear_flops = 6.0 * float(active_matmul_params) * float(tokens)
-    # Causal attention FLOPs (~6 * B * H * S^2 * (d_qk + d_v) / 2 * loops for fwd+bwd)
+    # Causal attention FLOPs (~6 * B * H * S^2 * (d_qk + d_v) / 2 * eff_loops for fwd+bwd)
     attn_flops = (
         6.0
-        * float(cfg.num_loops)
+        * eff_total_loops
         * float(batch_size)
         * float(cfg.n_heads)
         * (float(seq_len) ** 2)
