@@ -330,7 +330,7 @@ def _prepare_stage_runtime(
     print(
         f"[Compiled S{st.stage_id}: {st.name}] seq={st.seq_len} loops={st.num_loops} "
         f"micro={st.microbatch}x{st.seq_len} accum={st.grad_accum} remat_moe={st.remat_moe} "
-        f"remat_sub={st.remat_sublayers} chunk_ce={st.chunk_ce_size} ({compile_s:.1f}s)"
+        f"chunk_ce={st.chunk_ce_size} ({compile_s:.1f}s)"
     )
     return _CompiledStageRuntime(
         stage_idx=stage_idx,

@@ -176,9 +176,7 @@ class LoopMoEConfig:
 
     # TPU execution
     remat_per_loop: bool = True
-    remat_sublayers: bool = False
     remat_moe: bool = False
-    moe_chunk_size: int = 0
 
     @property
     def is_dynamic_loop_active(self) -> bool:
@@ -290,45 +288,8 @@ class LoopMoEConfig:
             train_loop_explore_noise=0.05,
             bptt_window=8,
             remat_per_loop=False,
-            remat_sublayers=False,
             remat_moe=False,
         )
-
-    @classmethod
-    def for_tpu_v5e(cls, num_loops: int = 1, use_csa2_indexer: bool = False) -> LoopMoEConfig:
-        """Full 1B preset tuned for TPU v5e-1 (16 GB HBM, 197 TFLOPS, 128x128 MXU)."""
-        return cls(
-            num_loops=num_loops,
-            chunk_ce_size=8192,
-            use_csa2_indexer=use_csa2_indexer,
-            remat_per_loop=True,
-            remat_sublayers=False,
-            remat_moe=False,
-        )
-
-
-TPU_SPECS: dict[str, dict[str, float]] = {
-    "v5e-1": {
-        "peak_tflops_bf16": 197.0,
-        "hbm_bw_gbps": 819.0,
-        "hbm_capacity_gb": 16.0,
-        "mxu_size": 128.0,
-        "ridge_flops_per_byte": (197.0 * 1e12) / (819.0 * 1e9),
-        "default_microbatch": 8.0,
-        "default_grad_accum": 8.0,
-        "default_chunk_ce_size": 8192.0,
-    },
-    "v6e-1": {
-        "peak_tflops_bf16": 918.0,
-        "hbm_bw_gbps": 1600.0,
-        "hbm_capacity_gb": 32.0,
-        "mxu_size": 256.0,
-        "ridge_flops_per_byte": (918.0 * 1e12) / (1600.0 * 1e9),
-        "default_microbatch": 16.0,
-        "default_grad_accum": 4.0,
-        "default_chunk_ce_size": 16384.0,
-    },
-}
 
 
 @dataclass(frozen=True)

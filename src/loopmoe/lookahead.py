@@ -65,7 +65,6 @@ REQUIRED_MODEL_KEYS: tuple[str, ...] = (
     "router_weight_banks",
     "use_post_moe_rmsnorm",
     "moe_use_tokamax",
-    "moe_chunk_size",
     "iter_adaln_bottleneck",
     "embed_reinject_lambda",
     "use_dynamic_loop",
@@ -77,7 +76,6 @@ REQUIRED_MODEL_KEYS: tuple[str, ...] = (
     "train_loop_explore_noise",
     "bptt_window",
     "remat_per_loop",
-    "remat_sublayers",
     "remat_moe",
 )
 
@@ -124,7 +122,6 @@ REQUIRED_STAGE_KEYS: tuple[str, ...] = (
     "grad_accum",
     "warmup_steps",
     "remat_moe",
-    "remat_sublayers",
     "chunk_ce_size",
     "target_tokens",
     "checkpoint_every_steps",
@@ -185,7 +182,6 @@ class ExplicitStageConfig:
     grad_accum: int
     warmup_steps: int
     remat_moe: bool
-    remat_sublayers: bool
     chunk_ce_size: int
     target_tokens: int
     checkpoint_every_steps: int
@@ -196,7 +192,6 @@ class ExplicitStageConfig:
     web_tier: str
     code_tier: str
     math_tier: str
-    moe_chunk_size: int = 0
     use_csa2_indexer: bool | None = None
 
     @property
@@ -235,9 +230,7 @@ class ExplicitStageConfig:
             "num_loops": int(self.num_loops),
             "yarn_scale": base_model_cfg.yarn_scale_for_seq_len(self.seq_len),
             "remat_moe": bool(self.remat_moe),
-            "remat_sublayers": bool(self.remat_sublayers),
             "chunk_ce_size": int(self.chunk_ce_size),
-            "moe_chunk_size": int(self.moe_chunk_size),
         }
         if self.use_csa2_indexer is not None:
             overrides["use_csa2_indexer"] = bool(self.use_csa2_indexer)
@@ -443,7 +436,6 @@ def load_train_config(path: str | Path) -> TrainFileConfig:
             grad_accum=int(s_raw["grad_accum"]),
             warmup_steps=int(s_raw["warmup_steps"]),
             remat_moe=bool(s_raw["remat_moe"]),
-            remat_sublayers=bool(s_raw["remat_sublayers"]),
             chunk_ce_size=int(s_raw["chunk_ce_size"]),
             target_tokens=int(s_raw["target_tokens"]),
             checkpoint_every_steps=int(s_raw["checkpoint_every_steps"]),
@@ -454,7 +446,6 @@ def load_train_config(path: str | Path) -> TrainFileConfig:
             web_tier=str(s_raw["web_tier"]),
             code_tier=str(s_raw["code_tier"]),
             math_tier=str(s_raw["math_tier"]),
-            moe_chunk_size=int(s_raw.get("moe_chunk_size", model_cfg.moe_chunk_size)),
             use_csa2_indexer=(
                 None if "use_csa2_indexer" not in s_raw else bool(s_raw["use_csa2_indexer"])
             ),

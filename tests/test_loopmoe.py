@@ -191,14 +191,14 @@ def test_forward_and_backward_r1_r8_and_csa2() -> None:
     x = jax.random.randint(key, (2, 32), 0, 512, dtype=jnp.int32)
     y = jax.random.randint(jax.random.PRNGKey(43), (2, 32), 0, 512, dtype=jnp.int32)
 
-    for num_loops, use_csa2, remat, remat_sub in [
+    for num_loops, use_csa2, remat, remat_m in [
         (1, False, False, False),
         (8, False, True, True),
         (2, True, False, True),
     ]:
         cfg = LoopMoEConfig.tiny(num_loops=num_loops, use_csa2_indexer=use_csa2)
         cfg = LoopMoEConfig(
-            **{**cfg.to_dict(), "remat_per_loop": remat, "remat_sublayers": remat_sub}
+            **{**cfg.to_dict(), "remat_per_loop": remat, "remat_moe": remat_m}
         )
         params = init_model_params(jax.random.PRNGKey(7), cfg)
         if num_loops > 1:
@@ -1142,41 +1142,12 @@ def test_glm54_kv_reuse_and_dynamic_loop_early_exit() -> None:
     )
 
 
-def test_token_chunked_moe_and_r1_summary() -> None:
-    """Verify token-chunked MoE matches unchunked forward/grads and R=1 summary reports dyn=False."""
+def test_r1_summary_reports_dyn_false() -> None:
+    """Verify R=1 summary reports dyn=False and omits multi-loop dynamic fields."""
     s_r1 = summarize_model(LoopMoEConfig.tiny(num_loops=1))
     assert "R=1, dyn=False" in s_r1 and "dyn=True" not in s_r1
     s_r8 = summarize_model(LoopMoEConfig.tiny(num_loops=8))
     assert "max_R=8, dyn=True" in s_r8
-
-    k1, k2, k3 = jax.random.split(jax.random.PRNGKey(1301), 3)
-    for dtype, tol in ((jnp.float32, 1e-5), (jnp.bfloat16, 2e-2)):
-        cfg_ref = LoopMoEConfig(
-            **{**LoopMoEConfig.tiny(num_loops=1).to_dict(), "dtype_name": "float32" if dtype == jnp.float32 else "bfloat16", "moe_chunk_size": 0}
-        )
-        cfg_chk = LoopMoEConfig(**{**cfg_ref.to_dict(), "moe_chunk_size": 16})
-        moe_p = init_moe_params(k1, cfg_ref, dtype=dtype)
-        x_in = jax.random.normal(k2, (2, 32, cfg_ref.d_model), dtype=dtype)
-        cot = jax.random.normal(k3, (2, 32, cfg_ref.d_model), dtype=jnp.float32)
-
-        def _run(p, x, c):
-            out, ec, aux_l, mmr = apply_moe(p, x, 0, c)
-            loss = jnp.mean(out.astype(jnp.float32) * cot) + aux_l
-            return loss, (out, ec, mmr)
-
-        (_, (out_ref, ec_ref, mmr_ref)), (gp_ref, gx_ref) = jax.jit(
-            jax.value_and_grad(_run, argnums=(0, 1), has_aux=True), static_argnums=(2,)
-        )(moe_p, x_in, cfg_ref)
-        (_, (out_chk, ec_chk, mmr_chk)), (gp_chk, gx_chk) = jax.jit(
-            jax.value_and_grad(_run, argnums=(0, 1), has_aux=True), static_argnums=(2,)
-        )(moe_p, x_in, cfg_chk)
-
-        np.testing.assert_allclose(np.asarray(out_chk, dtype=np.float32), np.asarray(out_ref, dtype=np.float32), atol=tol, rtol=tol)
-        np.testing.assert_array_equal(np.asarray(ec_chk), np.asarray(ec_ref))
-        assert jnp.isfinite(mmr_chk) and float(mmr_chk) >= 1.0 and float(mmr_ref) >= 1.0
-        np.testing.assert_allclose(np.asarray(gx_chk, dtype=np.float32), np.asarray(gx_ref, dtype=np.float32), atol=tol, rtol=tol)
-        for lr, lc in zip(jax.tree_util.tree_leaves(gp_ref), jax.tree_util.tree_leaves(gp_chk), strict=True):
-            np.testing.assert_allclose(np.asarray(lc, dtype=np.float32), np.asarray(lr, dtype=np.float32), atol=tol, rtol=tol)
 
 
 def test_explicit_v6e_config_and_lookahead_scheduler(tmp_path: Path) -> None:
@@ -1191,19 +1162,18 @@ def test_explicit_v6e_config_and_lookahead_scheduler(tmp_path: Path) -> None:
     assert loaded.model.bptt_window == 8
     assert loaded.model.vocab_size == 32_768
     assert len(loaded.stages) == 35
-    assert [(s.name, s.seq_len, s.num_loops, s.microbatch, s.grad_accum, s.warmup_steps, s.remat_moe, s.remat_sublayers) for s in loaded.stages[:5]] == [
-        ("r1_4k", 4096, 1, 16, 4, 1000, False, False),
-        ("r1_8k", 8192, 1, 8, 4, 0, False, False),
-        ("r1_16k", 16384, 1, 2, 8, 0, False, False),
-        ("r1_32k", 32768, 1, 1, 8, 0, False, False),
-        ("r2_32k", 32768, 2, 1, 8, 0, True, False),
+    assert [(s.name, s.seq_len, s.num_loops, s.microbatch, s.grad_accum, s.warmup_steps, s.remat_moe) for s in loaded.stages[:5]] == [
+        ("r1_4k", 4096, 1, 16, 4, 1000, False),
+        ("r1_8k", 8192, 1, 8, 4, 0, False),
+        ("r1_16k", 16384, 1, 2, 8, 0, False),
+        ("r1_32k", 32768, 1, 1, 8, 0, False),
+        ("r2_32k", 32768, 2, 1, 8, 0, True),
     ]
     assert loaded.stages[-1].name == "r32_32k"
     assert loaded.stages[-1].num_loops == 32
     assert loaded.stages[-1].seq_len == 32768
     assert loaded.stages[-1].microbatch == 1
     assert loaded.stages[-1].remat_moe is True
-    assert loaded.stages[-1].remat_sublayers is False
 
     # Missing required key must fail loudly (no silent defaults)
     raw_bad = json.loads(cfg_path.read_text(encoding="utf-8"))
@@ -1269,7 +1239,6 @@ def test_explicit_v6e_config_and_lookahead_scheduler(tmp_path: Path) -> None:
             "grad_accum": 1,
             "warmup_steps": 0,
             "remat_moe": True,
-            "remat_sublayers": False,
             "chunk_ce_size": 16,
             "checkpoint_every_steps": 4,
         },

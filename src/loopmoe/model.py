@@ -132,11 +132,7 @@ def _single_loop_step(
                     engram_delta, gate_mean = apply_engram_step(p["engram"], h_summary, ekv, cfg)
                     return xs + ae * engram_delta[:, :, None, :], gate_mean
 
-            engram_fn = (
-                jax.checkpoint(_engram_sublayer)
-                if (cfg.remat_sublayers or cfg.remat_moe)
-                else _engram_sublayer
-            )
+            engram_fn = jax.checkpoint(_engram_sublayer) if cfg.remat_moe else _engram_sublayer
             x_streams, engram_gate_mean = engram_fn(params, x_streams, engram_kv, alpha_engram)
         else:
             engram_gate_mean = jnp.asarray(0.0, dtype=jnp.float32)
@@ -148,39 +144,32 @@ def _single_loop_step(
             )
 
         # 3. MLA sublayer inside Single-Pass mHC (optionally emitting/reusing Loop-0 KV & CSA2 mask)
-        def _attn_sublayer(p, xs, sa, sca, ga, aa, lidx, ckv):
-            with jax.named_scope("mhc_attn_sublayer"):
-                if cfg.use_mhc:
-                    h_in_a, _, h_post_a, h_res_a = mhc_compute_gates(
-                        p["mhc"]["attn"], xs, cfg.mhc_sinkhorn_iters, cfg.rms_norm_eps
-                    )
-                else:
-                    h_in_a = xs[:, :, 0, :]
-
-                h_in_a_norm = apply_adaln(
-                    h_in_a, p["iter_adaln"]["norm_attn_w"], sca, sa, cfg.rms_norm_eps
+        with jax.named_scope("mhc_attn_sublayer"):
+            if cfg.use_mhc:
+                h_in_a, _, h_post_a, h_res_a = mhc_compute_gates(
+                    params["mhc"]["attn"], x_streams, cfg.mhc_sinkhorn_iters, cfg.rms_norm_eps
                 )
-                if return_kv:
-                    attn_out, _, kv_out = apply_mla(
-                        p["mla"], h_in_a_norm, cfg, loop_idx=lidx, cached_kv=ckv, return_kv=True
-                    )
-                else:
-                    attn_out, _ = apply_mla(
-                        p["mla"], h_in_a_norm, cfg, loop_idx=lidx, cached_kv=ckv, return_kv=False
-                    )
-                    kv_out = None
-                attn_out = attn_out * ga.astype(dt)
+            else:
+                h_in_a = x_streams[:, :, 0, :]
 
-                if cfg.use_mhc:
-                    next_xs = mhc_post_merge(xs, attn_out, h_post_a, h_res_a, loop_gate=aa)
-                else:
-                    next_xs = xs + aa * attn_out[:, :, None, :]
-                return next_xs, kv_out
+            h_in_a_norm = apply_adaln(
+                h_in_a, params["iter_adaln"]["norm_attn_w"], scale_a, shift_a, cfg.rms_norm_eps
+            )
+            if return_kv:
+                attn_out, _, kv_out = apply_mla(
+                    params["mla"], h_in_a_norm, cfg, loop_idx=loop_idx, cached_kv=cached_kv, return_kv=True
+                )
+            else:
+                attn_out, _ = apply_mla(
+                    params["mla"], h_in_a_norm, cfg, loop_idx=loop_idx, cached_kv=cached_kv, return_kv=False
+                )
+                kv_out = None
+            attn_out = attn_out * gate_a.astype(dt)
 
-        attn_fn = jax.checkpoint(_attn_sublayer) if cfg.remat_sublayers else _attn_sublayer
-        x_streams, kv_out = attn_fn(
-            params, x_streams, shift_a, scale_a, gate_a, alpha_attn, loop_idx, cached_kv
-        )
+            if cfg.use_mhc:
+                x_streams = mhc_post_merge(x_streams, attn_out, h_post_a, h_res_a, loop_gate=alpha_attn)
+            else:
+                x_streams = x_streams + alpha_attn * attn_out[:, :, None, :]
 
         # 4. DeepSeek MoE sublayer inside Single-Pass mHC (optional Top-C token-drop & remat)
         def _moe_sublayer(p, xs, sm, scm, gm, am, lidx, ks):
@@ -211,11 +200,7 @@ def _single_loop_step(
                     next_xs = xs + am * moe_out[:, :, None, :]
                 return next_xs, ec, aux_l, mmr
 
-        moe_fn = (
-            jax.checkpoint(_moe_sublayer)
-            if (cfg.remat_sublayers or cfg.remat_moe)
-            else _moe_sublayer
-        )
+        moe_fn = jax.checkpoint(_moe_sublayer) if cfg.remat_moe else _moe_sublayer
         x_streams, expert_counts, seq_aux_loss, router_mmr = moe_fn(
             params, x_streams, shift_m, scale_m, gate_m, alpha_moe, loop_idx, keep_scores
         )
@@ -243,11 +228,7 @@ def _embed_and_engram(
                     engram_delta, p_gm = apply_engram_step(p_eng, x_in, ekv, cfg)
                     return x_in + a0.astype(x_in.dtype) * engram_delta, p_gm
 
-            pre_fn = (
-                jax.checkpoint(_pre_engram_apply)
-                if (cfg.remat_moe or cfg.remat_sublayers)
-                else _pre_engram_apply
-            )
+            pre_fn = jax.checkpoint(_pre_engram_apply) if cfg.remat_moe else _pre_engram_apply
             x, pre_gate_mean = pre_fn(
                 params["engram"], x, engram_e, params["iter_adaln"]["loop_alpha"][0, 0]
             )

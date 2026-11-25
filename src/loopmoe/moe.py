@@ -477,39 +477,10 @@ def apply_moe(
             num_tokens = cap
             active_bsz, active_seq = 1, cap
 
-    chunk_sz = int(cfg.moe_chunk_size)
-    if (
-        chunk_sz > 0
-        and num_tokens > chunk_sz
-        and num_tokens % chunk_sz == 0
-        and cfg.seq_aux_loss_weight == 0.0
-    ):
-        num_chunks = num_tokens // chunk_sz
-        x_chunks = x_flat.reshape(num_chunks, chunk_sz, d_model)
-
-        def _chunk_step(carry, x_chunk):
-            ec_acc, margin_acc = carry
-            out_c, ec_c, _, margin_c = _apply_moe_core(
-                params, x_chunk, loop_idx, cfg, 1, chunk_sz
-            )
-            return (ec_acc + ec_c, margin_acc + margin_c), out_c
-
-        init_counts = jnp.zeros((cfg.n_routed_experts,), dtype=jnp.float32)
-        init_margin = jnp.asarray(0.0, dtype=jnp.float32)
-        (expert_counts, margin_sum), out_chunks = jax.lax.scan(
-            jax.checkpoint(_chunk_step),
-            (init_counts, init_margin),
-            x_chunks,
-            unroll=1,
-        )
-        total_flat = out_chunks.reshape(num_tokens, d_model)
-        seq_aux_loss = jnp.asarray(0.0, dtype=jnp.float32)
-        router_mmr = jnp.exp(jnp.clip(margin_sum / float(num_chunks), -20.0, 20.0))
-    else:
-        total_flat, expert_counts, seq_aux_loss, mean_margin = _apply_moe_core(
-            params, x_flat, loop_idx, cfg, active_bsz, active_seq
-        )
-        router_mmr = jnp.exp(jnp.clip(mean_margin, -20.0, 20.0))
+    total_flat, expert_counts, seq_aux_loss, mean_margin = _apply_moe_core(
+        params, x_flat, loop_idx, cfg, active_bsz, active_seq
+    )
+    router_mmr = jnp.exp(jnp.clip(mean_margin, -20.0, 20.0))
 
     if active_idx is not None:
         assert gather_back_idx is not None

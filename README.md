@@ -23,12 +23,12 @@ A **1.49B parameter, single physical layer (`L=1`)** LLM combining **DeepSeek-V4
 All hyperparameters, per-stage batch sizes, and rematerialization flags are explicitly declared in [`configs/v6e_1_train.json`](configs/v6e_1_train.json) (no hidden defaults):
 
 - **Phase 1 (`R = 1`)**:
-  - `S1 (4K)`: `microbatch=16, grad_accum=4, warmup_steps=1000, remat_moe=false, remat_sublayers=false` (no Lookahead during warmup)
-  - `S2 (8K)`: `microbatch=8, grad_accum=4, warmup_steps=0, remat_moe=false, remat_sublayers=false`
-  - `S3 (16K)`: `microbatch=2, grad_accum=8, warmup_steps=0, remat_moe=false, remat_sublayers=false`
-  - `S4 (32K)`: `microbatch=1, grad_accum=8, warmup_steps=0, remat_moe=false, remat_sublayers=false`
+  - `S1 (4K)`: `microbatch=16, grad_accum=4, warmup_steps=1000, remat_moe=false` (no Lookahead during warmup)
+  - `S2 (8K)`: `microbatch=8, grad_accum=4, warmup_steps=0, remat_moe=false`
+  - `S3 (16K)`: `microbatch=2, grad_accum=8, warmup_steps=0, remat_moe=false`
+  - `S4 (32K)`: `microbatch=1, grad_accum=8, warmup_steps=0, remat_moe=false`
 - **Phase 2 (`R = 2, 3, ..., 32` at `32K`)**:
-  - `S5..S35`: `microbatch=1, grad_accum=8, bptt_window=8, remat_moe=true, remat_sublayers=false, chunk_ce_size=8192`
+  - `S5..S35`: `microbatch=1, grad_accum=8, bptt_window=8, remat_moe=true, chunk_ce_size=8192`
 - **Lookahead Time-Efficiency Switching**:
   - After stage warmup completes, alternates a large block on stage $A$ (`main_steps=200`) with a small probe block on next stage $B$ (`probe_steps=20`), using strictly **stage $B$'s training `ce_loss`** (`eff_A = (prev_tail - head) / t_A` vs `eff_B = (head - tail) / t_B_eff`) to switch only when stage $B$ yields faster loss reduction per second.
 
