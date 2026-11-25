@@ -329,8 +329,7 @@ def forward_hidden(
         w_halt = params["halt_gate"]["w"][: cfg.num_loops]
         b_halt = params["halt_gate"]["b"][: cfg.num_loops]
         hl_0 = (
-            jnp.einsum("bsd,d->bs", h0.astype(jnp.float32), w_halt[0].astype(jnp.float32))
-            + b_halt[0]
+            jnp.einsum("bsd,d->bs", h0, w_halt[0].astype(h0.dtype)).astype(jnp.float32) + b_halt[0]
         )
         surv_0 = 1.0 - jax.nn.sigmoid(hl_0)
     else:
@@ -339,36 +338,42 @@ def forward_hidden(
         hl_0 = jnp.zeros((bsz, seq_len), dtype=jnp.float32)
         surv_0 = jnp.ones((bsz, seq_len), dtype=jnp.float32)
 
-    init_sample_buf = (
-        jnp.zeros((int(sample_depths.shape[0]), bsz, seq_len, h0.shape[-1]), dtype=h0.dtype)
-        if use_sampled
-        else jnp.zeros((0,), dtype=jnp.float32)
-    )
     cutoff = (
         (cfg.num_loops - cfg.bptt_window)
         if (cfg.bptt_window > 0 and cfg.num_loops > (cfg.bptt_window + 1))
         else 1
     )
 
-    def _run_loop_range(carry_in, indices: jax.Array, detach_backbone: bool):
-        def _body(carry, loop_idx: jax.Array):
-            xs_c, surv_c, buf_c = carry
-            if use_token_drop:
-                ks = jax.lax.stop_gradient(surv_c)
-                if rng_key is not None and cfg.train_loop_explore_noise > 0.0:
-                    step_key = jax.random.fold_in(rng_key, loop_idx)
-                    ks = ks + jax.random.uniform(
-                        step_key,
-                        ks.shape,
-                        dtype=jnp.float32,
-                        minval=0.0,
-                        maxval=float(cfg.train_loop_explore_noise),
-                    )
-                moe_cap = float(cfg.train_loop_capacity_factor)
-            else:
-                ks = None
-                moe_cap = 1.0
+    def _keep_scores_for_step(surv_c: jax.Array, loop_idx: jax.Array) -> tuple[jax.Array | None, float]:
+        if not use_token_drop:
+            return None, 1.0
+        ks = jax.lax.stop_gradient(surv_c)
+        if rng_key is not None and cfg.train_loop_explore_noise > 0.0:
+            step_key = jax.random.fold_in(rng_key, loop_idx)
+            ks = ks + jax.random.uniform(
+                step_key,
+                ks.shape,
+                dtype=jnp.float32,
+                minval=0.0,
+                maxval=float(cfg.train_loop_explore_noise),
+            )
+        return ks, float(cfg.train_loop_capacity_factor)
 
+    prefix_outputs = None
+    prefix_buf = jnp.zeros((0,), dtype=jnp.float32)
+    xs_carry = x_streams_0
+    surv_carry = surv_0
+
+    if cutoff > 1:
+        init_prefix_buf = (
+            jnp.zeros((int(sample_depths.shape[0]), bsz, seq_len, h0.shape[-1]), dtype=h0.dtype)
+            if use_sampled
+            else jnp.zeros((0,), dtype=jnp.float32)
+        )
+
+        def _prefix_body(carry, loop_idx: jax.Array):
+            xs_c, surv_c, buf_c = carry
+            ks, moe_cap = _keep_scores_for_step(surv_c, loop_idx)
             next_xs, step_metrics, _ = _single_loop_step(
                 params,
                 xs_c,
@@ -381,21 +386,15 @@ def forward_hidden(
                 keep_scores=ks,
                 moe_capacity_factor=moe_cap,
             )
-            if detach_backbone:
-                # Truncated BPTT boundary: prefix stops backbone gradients while halt_gate stays exact
-                next_xs = jax.lax.stop_gradient(next_xs)
-
             if cfg.use_dynamic_loop:
                 assert w_halt is not None and b_halt is not None
                 h_t = rms_norm(
                     collapse_streams(next_xs), params["final_norm_w"], eps=cfg.rms_norm_eps
                 )
-                hl_t = (
-                    jnp.einsum(
-                        "bsd,d->bs", h_t.astype(jnp.float32), w_halt[loop_idx].astype(jnp.float32)
-                    )
-                    + b_halt[loop_idx]
-                )
+                dot_t = jnp.einsum(
+                    "bsd,d->bs", h_t, w_halt[loop_idx].astype(h_t.dtype)
+                ).astype(jnp.float32)
+                hl_t = dot_t + b_halt[loop_idx]
                 next_surv = surv_c * (1.0 - jax.nn.sigmoid(hl_t))
                 if use_sampled:
                     assert sample_depths is not None
@@ -405,25 +404,76 @@ def forward_hidden(
                 else:
                     next_buf = buf_c
                     h_emit = h_t
-                return (next_xs, next_surv, next_buf), (step_metrics, hl_t, h_emit)
-
+                return (next_xs, next_surv, next_buf), (step_metrics, dot_t, h_emit)
             h_empty = jnp.zeros((0,), dtype=jnp.float32)
             return (next_xs, surv_c, buf_c), (step_metrics, h_empty, h_empty)
 
-        fn = jax.checkpoint(_body) if (cfg.remat_per_loop and not detach_backbone) else _body
-        return jax.lax.scan(fn, carry_in, indices)
-
-    carry = (x_streams_0, surv_0, init_sample_buf)
-    prefix_outputs = None
-    if cutoff > 1:
-        carry, prefix_outputs = _run_loop_range(
-            carry, jnp.arange(1, cutoff, dtype=jnp.int32), detach_backbone=True
+        # Truncated BPTT boundary: stop_gradient over the ENTIRE prefix scan so XLA discards
+        # 100% of prefix backward compute & VJP residuals (fixes R=32 21.4G HLO temporaries OOM).
+        (xs_carry, surv_carry, prefix_buf), prefix_raw = jax.lax.stop_gradient(
+            jax.lax.scan(
+                _prefix_body,
+                (xs_carry, surv_carry, init_prefix_buf),
+                jnp.arange(1, cutoff, dtype=jnp.int32),
+            )
         )
-    carry, suffix_outputs = _run_loop_range(
-        carry, jnp.arange(cutoff, cfg.num_loops, dtype=jnp.int32), detach_backbone=False
+        ec_p, aux_p, gm_p, mmr_p = prefix_raw[0]
+        dot_p, h_p = prefix_raw[1], prefix_raw[2]
+        if cfg.use_dynamic_loop:
+            assert w_halt is not None and b_halt is not None
+            hl_p = dot_p + b_halt[1:cutoff, None, None]
+            if use_sampled:
+                assert sample_depths is not None
+                for j in range(int(sample_depths.shape[0])):
+                    d_j = sample_depths[j]
+                    is_pref = d_j < cutoff
+                    p_idx = jnp.clip(d_j - 1, 0, cutoff - 2)
+                    live_dot = jnp.einsum(
+                        "bsd,d->bs", prefix_buf[j], w_halt[d_j].astype(prefix_buf.dtype)
+                    ).astype(jnp.float32)
+                    hl_p = jnp.where(
+                        is_pref, hl_p.at[p_idx].set(live_dot + b_halt[d_j]), hl_p
+                    )
+        else:
+            hl_p = dot_p
+        prefix_outputs = ((ec_p, aux_p, gm_p, mmr_p), hl_p, h_p)
+
+    def _suffix_body(carry, loop_idx: jax.Array):
+        xs_c, surv_c = carry
+        ks, moe_cap = _keep_scores_for_step(surv_c, loop_idx)
+        next_xs, step_metrics, _ = _single_loop_step(
+            params,
+            xs_c,
+            x_embed,
+            engram_kv,
+            loop_idx,
+            cfg,
+            cached_kv=loop_kv,
+            return_kv=False,
+            keep_scores=ks,
+            moe_capacity_factor=moe_cap,
+        )
+        if cfg.use_dynamic_loop:
+            assert w_halt is not None and b_halt is not None
+            h_t = rms_norm(
+                collapse_streams(next_xs), params["final_norm_w"], eps=cfg.rms_norm_eps
+            )
+            hl_t = (
+                jnp.einsum(
+                    "bsd,d->bs", h_t, w_halt[loop_idx].astype(h_t.dtype)
+                ).astype(jnp.float32)
+                + b_halt[loop_idx]
+            )
+            next_surv = surv_c * (1.0 - jax.nn.sigmoid(hl_t))
+            return (next_xs, next_surv), (step_metrics, hl_t, h_t)
+        h_empty = jnp.zeros((0,), dtype=jnp.float32)
+        return (next_xs, surv_c), (step_metrics, h_empty, h_empty)
+
+    suffix_fn = jax.checkpoint(_suffix_body) if cfg.remat_per_loop else _suffix_body
+    (x_streams_last, _), suffix_outputs = jax.lax.scan(
+        suffix_fn, (xs_carry, surv_carry), jnp.arange(cutoff, cfg.num_loops, dtype=jnp.int32)
     )
 
-    x_streams_last, _, final_sample_buf = carry
     if prefix_outputs is not None:
         (ec_p, aux_p, gm_p, mmr_p), hl_p, h_p = prefix_outputs
         (ec_s, aux_s, gm_s, mmr_s), hl_s, h_s = suffix_outputs
@@ -434,7 +484,24 @@ def forward_hidden(
         hl_rest = jnp.concatenate([hl_p, hl_s], axis=0)
         h_rest = None if (use_sampled or not cfg.use_dynamic_loop) else jnp.concatenate([h_p, h_s], axis=0)
     else:
-        (ec_rest, aux_rest, gm_rest, mmr_rest), hl_rest, h_rest = suffix_outputs
+        (ec_rest, aux_rest, gm_rest, mmr_rest), hl_rest, h_s = suffix_outputs
+        h_rest = None if (use_sampled or not cfg.use_dynamic_loop) else h_s
+
+    if use_sampled:
+        assert sample_depths is not None
+        suffix_len = cfg.num_loops - cutoff
+        sampled_list = []
+        for j in range(int(sample_depths.shape[0])):
+            d_j = sample_depths[j]
+            s_idx = jnp.clip(d_j - cutoff, 0, suffix_len - 1)
+            h_from_s = h_s[s_idx]
+            if cutoff > 1:
+                sampled_list.append(jnp.where(d_j >= cutoff, h_from_s, prefix_buf[j]))
+            else:
+                sampled_list.append(h_from_s)
+        final_sample_buf = jnp.stack(sampled_list, axis=0)
+    else:
+        final_sample_buf = prefix_buf
 
     expert_counts = jnp.concatenate([ec0[None, :], ec_rest], axis=0)
     seq_aux_loss = jnp.mean(jnp.concatenate([aux0[None], aux_rest], axis=0))

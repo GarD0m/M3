@@ -60,6 +60,8 @@ from loopmoe.moe import (
     _moe_dispatch,
     _permute_1d,
     _sorted_weights_from_sort,
+    _token_drop_gather,
+    _token_drop_scatter,
     update_router_biases,
 )
 from loopmoe.optim import (
@@ -745,6 +747,30 @@ def test_mhc_compute_gates_and_moe_dispatch_combine_equivalence() -> None:
         np.testing.assert_allclose(
             np.asarray(tk_fast_grad, dtype=np.float32), np.asarray(tk_ref_grad, dtype=np.float32), atol=tol, rtol=tol
         )
+
+        # Verify scatter-free _token_drop_gather and _token_drop_scatter forward + backward equivalence
+        cap_td = num_tokens // 2
+        _, td_idx = jax.lax.top_k(logits_r[:, 0], cap_td)
+        td_back = jnp.full((num_tokens,), cap_td, dtype=jnp.int32).at[td_idx].set(
+            jnp.arange(cap_td, dtype=jnp.int32)
+        )
+        cot_td_act = jax.random.normal(k2, (cap_td, d_model), dtype=jnp.float32)
+        cot_td_full = jax.random.normal(k3, (num_tokens, d_model), dtype=jnp.float32)
+
+        td_g_fast = _token_drop_gather(x_flat, td_idx, td_back)
+        td_g_ref = x_flat[td_idx]
+        np.testing.assert_allclose(np.asarray(td_g_fast, dtype=np.float32), np.asarray(td_g_ref, dtype=np.float32), atol=tol)
+        g_td_gx_fast = jax.grad(lambda xf: jnp.mean(_token_drop_gather(xf, td_idx, td_back).astype(jnp.float32) * cot_td_act))(x_flat)
+        g_td_gx_ref = jax.grad(lambda xf: jnp.mean(xf[td_idx].astype(jnp.float32) * cot_td_act))(x_flat)
+        np.testing.assert_allclose(np.asarray(g_td_gx_fast, dtype=np.float32), np.asarray(g_td_gx_ref, dtype=np.float32), atol=tol, rtol=tol)
+
+        td_act_in = jax.random.normal(k4, (cap_td, d_model), dtype=dtype)
+        td_s_fast = _token_drop_scatter(td_act_in, td_idx, td_back)
+        td_s_ref = jnp.zeros((num_tokens, d_model), dtype=dtype).at[td_idx].set(td_act_in)
+        np.testing.assert_allclose(np.asarray(td_s_fast, dtype=np.float32), np.asarray(td_s_ref, dtype=np.float32), atol=tol)
+        g_td_sx_fast = jax.grad(lambda ao: jnp.mean(_token_drop_scatter(ao, td_idx, td_back).astype(jnp.float32) * cot_td_full))(td_act_in)
+        g_td_sx_ref = jax.grad(lambda ao: jnp.mean(jnp.zeros((num_tokens, d_model), dtype=dtype).at[td_idx].set(ao).astype(jnp.float32) * cot_td_full))(td_act_in)
+        np.testing.assert_allclose(np.asarray(g_td_sx_fast, dtype=np.float32), np.asarray(g_td_sx_ref, dtype=np.float32), atol=tol, rtol=tol)
 
     # Verify apply_mla flat-head RoPE equivalence against reference apply_rope in float32
     cfg_mla = LoopMoEConfig(**{**LoopMoEConfig.tiny(num_loops=1).to_dict(), "dtype_name": "float32", "untie_mla_per_loop": False})

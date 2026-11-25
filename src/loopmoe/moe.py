@@ -282,6 +282,72 @@ def _extract_topk_scores(scores: jax.Array, topk_idx: jax.Array, n_experts: int)
     return jnp.stack(cols, axis=-1)
 
 
+def _pallas_or_jax_gather(src_2d: jax.Array, idx_1d: jax.Array) -> jax.Array:
+    """Gather rows `[idx_1d]` from `src_2d` via Mosaic TPU Pallas DMA when aligned, else JAX gather."""
+    if can_use_pallas_moe(src_2d.shape[0], idx_1d.shape[0], src_2d.shape[1], 1):
+        try:
+            return pallas_moe_gather(src_2d, idx_1d)
+        except Exception:
+            pass
+    return src_2d[idx_1d]
+
+
+def _pad_zero_sentinel(arr: jax.Array) -> jax.Array:
+    """Append an aligned block of zero sentinel row(s) at `arr.shape[0]` for scatter-free routing."""
+    pad_rows = 128 if (arr.shape[0] % 128 == 0 and arr.shape[1] % 1024 == 0) else 1
+    return jnp.pad(arr, ((0, pad_rows), (0, 0)))
+
+
+@jax.custom_vjp
+def _token_drop_gather(
+    x_flat: jax.Array, active_idx: jax.Array, gather_back_idx: jax.Array
+) -> jax.Array:
+    """Gather `[cap, D]` active tokens via Pallas DMA; backward gathers gradients (zero scatter)."""
+    del gather_back_idx
+    return _pallas_or_jax_gather(x_flat, active_idx)
+
+
+def _token_drop_gather_fwd(
+    x_flat: jax.Array, active_idx: jax.Array, gather_back_idx: jax.Array
+) -> tuple[jax.Array, tuple[jax.Array]]:
+    return _pallas_or_jax_gather(x_flat, active_idx), (gather_back_idx,)
+
+
+def _token_drop_gather_bwd(
+    res: tuple[jax.Array], d_active: jax.Array
+) -> tuple[jax.Array, None, None]:
+    (gather_back_idx,) = res
+    return (_pallas_or_jax_gather(_pad_zero_sentinel(d_active), gather_back_idx), None, None)
+
+
+_token_drop_gather.defvjp(_token_drop_gather_fwd, _token_drop_gather_bwd)
+
+
+@jax.custom_vjp
+def _token_drop_scatter(
+    active_out: jax.Array, active_idx: jax.Array, gather_back_idx: jax.Array
+) -> jax.Array:
+    """Place `[cap, D]` active MoE outputs into `[N, D]` via Pallas DMA gather + zero sentinel."""
+    del active_idx
+    return _pallas_or_jax_gather(_pad_zero_sentinel(active_out), gather_back_idx)
+
+
+def _token_drop_scatter_fwd(
+    active_out: jax.Array, active_idx: jax.Array, gather_back_idx: jax.Array
+) -> tuple[jax.Array, tuple[jax.Array]]:
+    return _pallas_or_jax_gather(_pad_zero_sentinel(active_out), gather_back_idx), (active_idx,)
+
+
+def _token_drop_scatter_bwd(
+    res: tuple[jax.Array], d_scattered: jax.Array
+) -> tuple[jax.Array, None, None]:
+    (active_idx,) = res
+    return (_pallas_or_jax_gather(d_scattered, active_idx), None, None)
+
+
+_token_drop_scatter.defvjp(_token_drop_scatter_fwd, _token_drop_scatter_bwd)
+
+
 def apply_moe(
     params: dict[str, jax.Array],
     x: jax.Array,
@@ -304,6 +370,7 @@ def apply_moe(
     dt = x_flat.dtype
 
     active_idx: jax.Array | None = None
+    gather_back_idx: jax.Array | None = None
     active_bsz, active_seq = bsz, seq_len
     if keep_scores is not None and 0.0 < capacity_factor < 1.0 and num_tokens > 1:
         cap = max(1, int(math.ceil(num_tokens * float(capacity_factor))))
@@ -311,7 +378,10 @@ def apply_moe(
             cap = min(num_tokens, ((cap + 127) // 128) * 128)
         if cap < num_tokens:
             _, active_idx = jax.lax.top_k(keep_scores.reshape(num_tokens), cap)
-            x_flat = x_flat[active_idx]
+            gather_back_idx = jnp.full((num_tokens,), cap, dtype=jnp.int32).at[active_idx].set(
+                jnp.arange(cap, dtype=jnp.int32)
+            )
+            x_flat = _token_drop_gather(x_flat, active_idx, gather_back_idx)
             num_tokens = cap
             active_bsz, active_seq = 1, cap
 
@@ -401,9 +471,8 @@ def apply_moe(
     if cfg.use_post_moe_rmsnorm:
         total_flat = rms_norm(total_flat, params["post_norm_w"], eps=cfg.rms_norm_eps)
     if active_idx is not None:
-        scattered = jnp.zeros((bsz * seq_len, d_model), dtype=total_flat.dtype).at[active_idx].set(
-            total_flat
-        )
+        assert gather_back_idx is not None
+        scattered = _token_drop_scatter(total_flat, active_idx, gather_back_idx)
         return scattered.reshape(bsz, seq_len, d_model), expert_counts, seq_aux_loss, router_mmr
     return total_flat.reshape(bsz, seq_len, d_model), expert_counts, seq_aux_loss, router_mmr
 
