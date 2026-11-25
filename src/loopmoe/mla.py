@@ -143,15 +143,16 @@ def init_mla_params(
     cfg: LoopMoEConfig,
     dtype: jnp.dtype = jnp.bfloat16,
 ) -> dict[str, jax.Array]:
-    """Initialize MLA weights (untied Q/O per loop, optionally sharing Loop-0 KV & CSA2 across loops)."""
+    """Initialize MLA weights (cyclically untied Q/O banks, sharing Loop-0 KV & CSA2 across loops)."""
+    n_banks = min(cfg.max_loops, max(1, cfg.mla_weight_banks))
     if cfg.untie_mla_per_loop and cfg.reuse_kv_across_loops:
         k_qo, k_kv = jax.random.split(key, 2)
-        loop_keys = jax.random.split(k_qo, cfg.max_loops)
+        loop_keys = jax.random.split(k_qo, n_banks)
         qo_params = jax.vmap(lambda k: _init_single_mla_qo_params(k, cfg, dtype))(loop_keys)
         kv_params = _init_single_mla_kv_params(k_kv, cfg, dtype)
         return {**qo_params, **kv_params}
     if cfg.untie_mla_per_loop:
-        loop_keys = jax.random.split(key, cfg.max_loops)
+        loop_keys = jax.random.split(key, n_banks)
         return jax.vmap(lambda k: _init_single_mla_params(k, cfg, dtype))(loop_keys)
     return _init_single_mla_params(key, cfg, dtype)
 
@@ -351,7 +352,10 @@ def apply_mla(
     """Run Multi-head Latent Attention with optional GLM-5.4 Loop-0 KV & CSA2 mask reuse."""
     bsz, seq_len, _ = x.shape
     h = cfg.n_heads
-    p = {k: (v[loop_idx] if is_per_loop_mla_leaf(k, v) else v) for k, v in params.items()}
+    p = {
+        k: (v[loop_idx % v.shape[0]] if is_per_loop_mla_leaf(k, v) else v)
+        for k, v in params.items()
+    }
 
     with jax.named_scope("mla_qkv_proj"):
         c_q = rms_norm(x @ p["w_dq"], p["q_norm_w"], eps=cfg.rms_norm_eps)

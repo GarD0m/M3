@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import math
 
 import jax
 import jax.numpy as jnp
@@ -18,13 +19,14 @@ def init_moe_params(
     cfg: LoopMoEConfig,
     dtype: jnp.dtype = jnp.bfloat16,
 ) -> dict[str, jax.Array]:
-    """Initialize routed experts (3D tensors for per-expert Muon), shared expert, and router."""
+    """Initialize routed experts (3D tensors for per-expert Muon), shared expert, and cyclic routers."""
     keys = jax.random.split(key, 5)
     d = cfg.d_model
     e = cfg.n_routed_experts
     df = cfg.d_ff_expert
     ds = cfg.n_shared_experts * cfg.d_ff_shared
-    router_shape = (cfg.max_loops, d, e) if cfg.untie_router_per_loop else (d, e)
+    n_router_banks = min(cfg.max_loops, max(1, cfg.router_weight_banks))
+    router_shape = (n_router_banks, d, e) if cfg.untie_router_per_loop else (d, e)
 
     params: dict[str, jax.Array] = {
         "router_w": jax.random.normal(keys[0], router_shape, dtype=dtype)
@@ -285,11 +287,13 @@ def apply_moe(
     x: jax.Array,
     loop_idx: jax.Array | int,
     cfg: LoopMoEConfig,
+    keep_scores: jax.Array | None = None,
+    capacity_factor: float = 1.0,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Run DeepSeek-V4.1-Flash fine-grained MoE for one loop iteration.
+    """Run DeepSeek-V4.1-Flash fine-grained MoE with optional training early-exit token dropping.
 
     Returns:
-        out: [B, S, D] MoE output tensor.
+        out: [B, S, D] MoE output tensor (zeros for early-exited tokens when `keep_scores` drops them).
         expert_counts: [E] token assignment counts (float32) for Aux-Loss-Free bias updates.
         seq_aux_loss: scalar sequence-wise balance regularization loss.
         router_mmr: scalar Foil Median Margin Ratio diagnostic.
@@ -299,9 +303,25 @@ def apply_moe(
     x_flat = x.reshape(num_tokens, d_model)
     dt = x_flat.dtype
 
+    active_idx: jax.Array | None = None
+    active_bsz, active_seq = bsz, seq_len
+    if keep_scores is not None and 0.0 < capacity_factor < 1.0 and num_tokens > 1:
+        cap = max(1, int(math.ceil(num_tokens * float(capacity_factor))))
+        if num_tokens >= 128:
+            cap = min(num_tokens, ((cap + 127) // 128) * 128)
+        if cap < num_tokens:
+            _, active_idx = jax.lax.top_k(keep_scores.reshape(num_tokens), cap)
+            x_flat = x_flat[active_idx]
+            num_tokens = cap
+            active_bsz, active_seq = 1, cap
+
     # 1. Sigmoid routing + Aux-Loss-Free bias (bias excluded from gradient flow)
     with jax.named_scope("moe_router"):
-        router_w_t = params["router_w"][loop_idx] if params["router_w"].ndim == 3 else params["router_w"]
+        router_w_t = (
+            params["router_w"][loop_idx % params["router_w"].shape[0]]
+            if params["router_w"].ndim == 3
+            else params["router_w"]
+        )
         router_logits = x_flat @ router_w_t.astype(dt)
         # Foil Eq. 11 Median Margin Ratio diagnostic: exp(mean(z_(1) - z_(E/2)))
         z_sub = jax.lax.stop_gradient(
@@ -345,12 +365,12 @@ def apply_moe(
         scores_norm = scores / (
             jnp.sum(scores, axis=-1, keepdims=True) + jnp.asarray(1e-6, dtype=dt)
         )
-        scores_seq = scores_norm.reshape(bsz, seq_len, cfg.n_routed_experts)
-        idx_seq = topk_idx.reshape(bsz, seq_len, cfg.top_k)
+        scores_seq = scores_norm.reshape(active_bsz, active_seq, cfg.n_routed_experts)
+        idx_seq = topk_idx.reshape(active_bsz, active_seq, cfg.top_k)
         seq_counts = jax.vmap(
             lambda idx: jnp.diff(jnp.searchsorted(jnp.sort(idx.reshape(-1)), edges, side="left"))
         )(idx_seq).astype(jnp.float32)
-        ce = seq_counts * (float(cfg.n_routed_experts) / float(seq_len * cfg.top_k))  # [B, E]
+        ce = seq_counts * (float(cfg.n_routed_experts) / float(active_seq * cfg.top_k))  # [B, E]
         pi = jnp.mean(scores_seq, axis=1, dtype=jnp.float32)  # [B, E]
         seq_aux_loss = cfg.seq_aux_loss_weight * jnp.mean(jnp.sum(ce * pi, axis=-1))
     else:
@@ -377,10 +397,15 @@ def apply_moe(
         shared_gate, shared_up = jnp.split(shared_gate_up, 2, axis=-1)
         shared_out = (jax.nn.silu(shared_gate) * shared_up) @ params["shared_w_down"]
 
-    total_out = (routed_out + shared_out).reshape(bsz, seq_len, d_model)
+    total_flat = routed_out + shared_out
     if cfg.use_post_moe_rmsnorm:
-        total_out = rms_norm(total_out, params["post_norm_w"], eps=cfg.rms_norm_eps)
-    return total_out, expert_counts, seq_aux_loss, router_mmr
+        total_flat = rms_norm(total_flat, params["post_norm_w"], eps=cfg.rms_norm_eps)
+    if active_idx is not None:
+        scattered = jnp.zeros((bsz * seq_len, d_model), dtype=total_flat.dtype).at[active_idx].set(
+            total_flat
+        )
+        return scattered.reshape(bsz, seq_len, d_model), expert_counts, seq_aux_loss, router_mmr
+    return total_flat.reshape(bsz, seq_len, d_model), expert_counts, seq_aux_loss, router_mmr
 
 
 def update_router_biases(

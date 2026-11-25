@@ -98,6 +98,8 @@ def _single_loop_step(
     cfg: LoopMoEConfig,
     cached_kv: tuple[jax.Array, jax.Array, jax.Array | None] | None = None,
     return_kv: bool = False,
+    keep_scores: jax.Array | None = None,
+    moe_capacity_factor: float = 1.0,
 ) -> tuple[
     jax.Array,
     tuple[jax.Array, jax.Array, jax.Array, jax.Array],
@@ -180,8 +182,8 @@ def _single_loop_step(
             params, x_streams, shift_a, scale_a, gate_a, alpha_attn, loop_idx, cached_kv
         )
 
-        # 4. DeepSeek MoE sublayer inside Single-Pass mHC
-        def _moe_sublayer(p, xs, sm, scm, gm, am, lidx):
+        # 4. DeepSeek MoE sublayer inside Single-Pass mHC (optional Top-C early-exit token dropping)
+        def _moe_sublayer(p, xs, sm, scm, gm, am, lidx, ks):
             with jax.named_scope("mhc_moe_sublayer"):
                 if cfg.use_mhc:
                     h_in_m, _, h_post_m, h_res_m = mhc_compute_gates(
@@ -195,10 +197,24 @@ def _single_loop_step(
                 )
                 if cfg.remat_moe and not cfg.remat_sublayers:
                     moe_out, ec, aux_l, mmr = jax.checkpoint(
-                        lambda pm, h_in, li: apply_moe(pm, h_in, li, cfg)
-                    )(p["moe"], h_in_m_norm, lidx)
+                        lambda pm, h_in, li, ks_in: apply_moe(
+                            pm,
+                            h_in,
+                            li,
+                            cfg,
+                            keep_scores=ks_in,
+                            capacity_factor=moe_capacity_factor,
+                        )
+                    )(p["moe"], h_in_m_norm, lidx, ks)
                 else:
-                    moe_out, ec, aux_l, mmr = apply_moe(p["moe"], h_in_m_norm, lidx, cfg)
+                    moe_out, ec, aux_l, mmr = apply_moe(
+                        p["moe"],
+                        h_in_m_norm,
+                        lidx,
+                        cfg,
+                        keep_scores=ks,
+                        capacity_factor=moe_capacity_factor,
+                    )
                 moe_out = moe_out * gm.astype(dt)
 
                 if cfg.use_mhc:
@@ -209,7 +225,7 @@ def _single_loop_step(
 
         moe_fn = jax.checkpoint(_moe_sublayer) if cfg.remat_sublayers else _moe_sublayer
         x_streams, expert_counts, seq_aux_loss, router_mmr = moe_fn(
-            params, x_streams, shift_m, scale_m, gate_m, alpha_moe, loop_idx
+            params, x_streams, shift_m, scale_m, gate_m, alpha_moe, loop_idx, keep_scores
         )
 
         return x_streams, (expert_counts, seq_aux_loss, engram_gate_mean, router_mmr), kv_out
@@ -242,15 +258,34 @@ def _embed_and_engram(
     return x_streams, x_embed, engram_kv, pre_gate_mean
 
 
+def _select_ce_sample_depths(
+    num_loops: int,
+    k_sample: int,
+    rng_key: jax.Array | None = None,
+) -> jax.Array:
+    """Select `k_sample` distinct deep loop indices in `[1, num_loops - 1]` sorted ascending."""
+    if rng_key is not None:
+        perm = jax.random.permutation(rng_key, num_loops - 1)[:k_sample] + 1
+        return jnp.sort(perm).astype(jnp.int32)
+    if k_sample <= 1:
+        return jnp.asarray([num_loops - 1], dtype=jnp.int32)
+    step = float(num_loops - 2) / float(k_sample - 1)
+    idxs = [1 + int(round(i * step)) for i in range(k_sample)]
+    idxs[-1] = num_loops - 1
+    return jnp.asarray(idxs, dtype=jnp.int32)
+
+
 def forward_hidden(
     params: dict[str, Any],
     input_ids: jax.Array,
     cfg: LoopMoEConfig,
+    rng_key: jax.Array | None = None,
+    sample_depths: jax.Array | None = None,
 ) -> tuple[jax.Array, dict[str, Any]]:
-    """Run embedding + pre-loop Engram + dynamic LoopMoE (with GLM-5.4 Loop-0 KV reuse)."""
+    """Run embedding + Engram + dynamic LoopMoE (KV reuse, MoE token-drop, truncated BPTT, sampled CE)."""
     x_streams, x_embed, engram_kv, pre_gate_mean = _embed_and_engram(params, input_ids, cfg)
 
-    # Always run Loop 0 statically so Loop-0 KV & CSA2 sparse mask can be reused loop-invariantly
+    # Always run Loop 0 statically (100% tokens) so Loop-0 KV & CSA2 sparse mask stay loop-invariant
     emit_kv = cfg.reuse_kv_across_loops and (cfg.num_loops > 1)
     x_streams_0, (ec0, aux0, gm0, mmr0), cached_kv_0 = _single_loop_step(
         params,
@@ -261,6 +296,8 @@ def forward_hidden(
         cfg,
         cached_kv=None,
         return_kv=emit_kv,
+        keep_scores=None,
+        moe_capacity_factor=1.0,
     )
 
     if cfg.num_loops == 1:
@@ -279,32 +316,125 @@ def forward_hidden(
         return hidden, aux
 
     loop_kv = cached_kv_0 if cfg.reuse_kv_across_loops else None
-    h0 = (
-        rms_norm(collapse_streams(x_streams_0), params["final_norm_w"], eps=cfg.rms_norm_eps)
-        if cfg.use_dynamic_loop
-        else None
+    bsz, seq_len = input_ids.shape
+    h0 = rms_norm(collapse_streams(x_streams_0), params["final_norm_w"], eps=cfg.rms_norm_eps)
+    use_token_drop = (
+        cfg.use_dynamic_loop
+        and (0.0 < float(cfg.train_loop_capacity_factor) < 1.0)
+        and ((bsz * seq_len) > 1)
+    )
+    use_sampled = cfg.use_dynamic_loop and (sample_depths is not None)
+
+    if cfg.use_dynamic_loop:
+        w_halt = params["halt_gate"]["w"][: cfg.num_loops]
+        b_halt = params["halt_gate"]["b"][: cfg.num_loops]
+        hl_0 = (
+            jnp.einsum("bsd,d->bs", h0.astype(jnp.float32), w_halt[0].astype(jnp.float32))
+            + b_halt[0]
+        )
+        surv_0 = 1.0 - jax.nn.sigmoid(hl_0)
+    else:
+        w_halt = None
+        b_halt = None
+        hl_0 = jnp.zeros((bsz, seq_len), dtype=jnp.float32)
+        surv_0 = jnp.ones((bsz, seq_len), dtype=jnp.float32)
+
+    init_sample_buf = (
+        jnp.zeros((int(sample_depths.shape[0]), bsz, seq_len, h0.shape[-1]), dtype=h0.dtype)
+        if use_sampled
+        else jnp.zeros((0,), dtype=jnp.float32)
+    )
+    cutoff = (
+        (cfg.num_loops - cfg.bptt_window)
+        if (cfg.bptt_window > 0 and cfg.num_loops > (cfg.bptt_window + 1))
+        else 1
     )
 
-    def scan_body(carry: jax.Array, loop_idx: jax.Array):
-        next_xs, step_metrics, _ = _single_loop_step(
-            params,
-            carry,
-            x_embed,
-            engram_kv,
-            loop_idx,
-            cfg,
-            cached_kv=loop_kv,
-            return_kv=False,
-        )
-        if cfg.use_dynamic_loop:
-            h_t = rms_norm(collapse_streams(next_xs), params["final_norm_w"], eps=cfg.rms_norm_eps)
-            return next_xs, (step_metrics, h_t)
-        return next_xs, (step_metrics, None)
+    def _run_loop_range(carry_in, indices: jax.Array, detach_backbone: bool):
+        def _body(carry, loop_idx: jax.Array):
+            xs_c, surv_c, buf_c = carry
+            if use_token_drop:
+                ks = jax.lax.stop_gradient(surv_c)
+                if rng_key is not None and cfg.train_loop_explore_noise > 0.0:
+                    step_key = jax.random.fold_in(rng_key, loop_idx)
+                    ks = ks + jax.random.uniform(
+                        step_key,
+                        ks.shape,
+                        dtype=jnp.float32,
+                        minval=0.0,
+                        maxval=float(cfg.train_loop_explore_noise),
+                    )
+                moe_cap = float(cfg.train_loop_capacity_factor)
+            else:
+                ks = None
+                moe_cap = 1.0
 
-    step_fn = jax.checkpoint(scan_body) if cfg.remat_per_loop else scan_body
-    loop_indices = jnp.arange(1, cfg.num_loops, dtype=jnp.int32)
-    x_streams_last, (rest_metrics, h_rest) = jax.lax.scan(step_fn, x_streams_0, loop_indices)
-    ec_rest, aux_rest, gm_rest, mmr_rest = rest_metrics
+            next_xs, step_metrics, _ = _single_loop_step(
+                params,
+                xs_c,
+                x_embed,
+                engram_kv,
+                loop_idx,
+                cfg,
+                cached_kv=loop_kv,
+                return_kv=False,
+                keep_scores=ks,
+                moe_capacity_factor=moe_cap,
+            )
+            if detach_backbone:
+                # Truncated BPTT boundary: prefix stops backbone gradients while halt_gate stays exact
+                next_xs = jax.lax.stop_gradient(next_xs)
+
+            if cfg.use_dynamic_loop:
+                assert w_halt is not None and b_halt is not None
+                h_t = rms_norm(
+                    collapse_streams(next_xs), params["final_norm_w"], eps=cfg.rms_norm_eps
+                )
+                hl_t = (
+                    jnp.einsum(
+                        "bsd,d->bs", h_t.astype(jnp.float32), w_halt[loop_idx].astype(jnp.float32)
+                    )
+                    + b_halt[loop_idx]
+                )
+                next_surv = surv_c * (1.0 - jax.nn.sigmoid(hl_t))
+                if use_sampled:
+                    assert sample_depths is not None
+                    match = (sample_depths == loop_idx)[:, None, None, None]
+                    next_buf = jnp.where(match, h_t[None, ...], buf_c)
+                    h_emit = jnp.zeros((0,), dtype=jnp.float32)
+                else:
+                    next_buf = buf_c
+                    h_emit = h_t
+                return (next_xs, next_surv, next_buf), (step_metrics, hl_t, h_emit)
+
+            h_empty = jnp.zeros((0,), dtype=jnp.float32)
+            return (next_xs, surv_c, buf_c), (step_metrics, h_empty, h_empty)
+
+        fn = jax.checkpoint(_body) if (cfg.remat_per_loop and not detach_backbone) else _body
+        return jax.lax.scan(fn, carry_in, indices)
+
+    carry = (x_streams_0, surv_0, init_sample_buf)
+    prefix_outputs = None
+    if cutoff > 1:
+        carry, prefix_outputs = _run_loop_range(
+            carry, jnp.arange(1, cutoff, dtype=jnp.int32), detach_backbone=True
+        )
+    carry, suffix_outputs = _run_loop_range(
+        carry, jnp.arange(cutoff, cfg.num_loops, dtype=jnp.int32), detach_backbone=False
+    )
+
+    x_streams_last, _, final_sample_buf = carry
+    if prefix_outputs is not None:
+        (ec_p, aux_p, gm_p, mmr_p), hl_p, h_p = prefix_outputs
+        (ec_s, aux_s, gm_s, mmr_s), hl_s, h_s = suffix_outputs
+        ec_rest = jnp.concatenate([ec_p, ec_s], axis=0)
+        aux_rest = jnp.concatenate([aux_p, aux_s], axis=0)
+        gm_rest = jnp.concatenate([gm_p, gm_s], axis=0)
+        mmr_rest = jnp.concatenate([mmr_p, mmr_s], axis=0)
+        hl_rest = jnp.concatenate([hl_p, hl_s], axis=0)
+        h_rest = None if (use_sampled or not cfg.use_dynamic_loop) else jnp.concatenate([h_p, h_s], axis=0)
+    else:
+        (ec_rest, aux_rest, gm_rest, mmr_rest), hl_rest, h_rest = suffix_outputs
 
     expert_counts = jnp.concatenate([ec0[None, :], ec_rest], axis=0)
     seq_aux_loss = jnp.mean(jnp.concatenate([aux0[None], aux_rest], axis=0))
@@ -323,25 +453,27 @@ def forward_hidden(
     }
 
     if cfg.use_dynamic_loop:
-        assert h0 is not None and h_rest is not None
-        all_hiddens = jnp.concatenate([h0[None, ...], h_rest], axis=0)  # [R, B, S, D]
-        w_halt = params["halt_gate"]["w"][: cfg.num_loops]
-        b_halt = params["halt_gate"]["b"][: cfg.num_loops]
-        halt_logits = (
-            jnp.einsum("rbsd,rd->rbs", all_hiddens.astype(jnp.float32), w_halt.astype(jnp.float32))
-            + b_halt[:, None, None]
-        )
+        halt_logits = jnp.concatenate([hl_0[None, ...], hl_rest], axis=0)  # [R, B, S]
         halt_probs, _ = _compute_halt_distribution(halt_logits)
         depths = jnp.arange(1, cfg.num_loops + 1, dtype=jnp.float32)[:, None, None]
         expected_loops = jnp.mean(jnp.sum(depths * halt_probs, axis=0))
         q_bar = jnp.mean(halt_probs, axis=(1, 2))
         halt_entropy = -jnp.sum(q_bar * jnp.log(jnp.maximum(q_bar, 1e-8)))
 
-        aux["all_hiddens"] = all_hiddens
+        hidden_last = rms_norm(
+            collapse_streams(x_streams_last), params["final_norm_w"], eps=cfg.rms_norm_eps
+        )
+        if use_sampled:
+            aux["h0"] = h0
+            aux["sampled_hiddens"] = final_sample_buf
+            aux["sample_depths"] = sample_depths
+        else:
+            assert h_rest is not None
+            aux["all_hiddens"] = jnp.concatenate([h0[None, ...], h_rest], axis=0)
         aux["halt_probs"] = halt_probs
         aux["expected_loops"] = expected_loops
         aux["halt_entropy"] = halt_entropy
-        return all_hiddens[-1], aux
+        return hidden_last, aux
 
     hidden = rms_norm(collapse_streams(x_streams_last), params["final_norm_w"], eps=cfg.rms_norm_eps)
     aux["expected_loops"] = jnp.asarray(float(cfg.num_loops), dtype=jnp.float32)
@@ -362,9 +494,17 @@ def forward_logits(
     cfg: LoopMoEConfig,
 ) -> tuple[jax.Array, dict[str, Any]]:
     """Compute full logits [B, S, V] at max active loop depth (intended for eval / unit tests)."""
-    hidden, aux = forward_hidden(params, input_ids, cfg)
+    prev_cap = cfg.train_loop_capacity_factor
+    eval_cfg = (
+        LoopMoEConfig(**{**cfg.to_dict(), "train_loop_capacity_factor": 1.0})
+        if prev_cap < 1.0
+        else cfg
+    )
+    hidden, aux = forward_hidden(params, input_ids, eval_cfg)
     aux.pop("all_hiddens", None)
-    logits = (hidden @ get_lm_head_weight(params, cfg)).astype(jnp.float32)
+    aux.pop("sampled_hiddens", None)
+    aux.pop("h0", None)
+    logits = (hidden @ get_lm_head_weight(params, eval_cfg)).astype(jnp.float32)
     return logits, aux
 
 
@@ -1121,15 +1261,49 @@ def chunked_cross_entropy_loss_and_nll(
     return loss, jax.lax.stop_gradient(nll_chunks.reshape(bsz, seq_len))
 
 
+def _stride_slice(
+    arr: jax.Array, seq_axis: int, stride: int, phase: jax.Array | int
+) -> jax.Array:
+    """Slice sequence axis every `stride` tokens starting at `phase` with static output shape."""
+    if stride <= 1:
+        return arr
+    s_len = arr.shape[seq_axis]
+    if isinstance(phase, int) or (s_len % stride != 0):
+        slices: list[Any] = [slice(None)] * arr.ndim
+        slices[seq_axis] = slice(None, None, stride)
+        return arr[tuple(slices)]
+    new_shape = arr.shape[:seq_axis] + (s_len // stride, stride) + arr.shape[seq_axis + 1 :]
+    return jnp.take(arr.reshape(new_shape), phase, axis=seq_axis + 1)
+
+
 def forward_model(
     params: dict[str, Any],
     input_ids: jax.Array,
     targets: jax.Array,
     cfg: LoopMoEConfig,
     loss_mask: jax.Array | None = None,
+    rng_key: jax.Array | None = None,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
-    """Forward pass returning total loss (Eq. 6 dynamic loop when num_loops > 1) and telemetry."""
-    hidden, aux = forward_hidden(params, input_ids, cfg)
+    """Forward pass returning total loss (Eq. 6 dynamic loop + sampled CE + BPTT) and telemetry."""
+    if rng_key is not None and cfg.num_loops > 1 and cfg.use_dynamic_loop:
+        key_drop, key_depth, key_phase = jax.random.split(rng_key, 3)
+    else:
+        key_drop = key_depth = key_phase = None
+
+    sample_depths: jax.Array | None = None
+    if cfg.num_loops > 1 and cfg.use_dynamic_loop:
+        k_ce_cfg = int(cfg.dynamic_loop_ce_sample_depths)
+        deep_avail = cfg.num_loops - 1
+        if 1 <= k_ce_cfg < deep_avail:
+            sample_depths = _select_ce_sample_depths(cfg.num_loops, k_ce_cfg, key_depth)
+
+    hidden, aux = forward_hidden(
+        params,
+        input_ids,
+        cfg,
+        rng_key=key_drop,
+        sample_depths=sample_depths,
+    )
     if cfg.tie_word_embeddings:
         lm_w = params["embed_tokens"]
         weight_is_vd = True
@@ -1151,40 +1325,63 @@ def forward_model(
         aux["ce_loss"] = ce_loss
         return total_loss, aux
 
-    all_hiddens = aux.pop("all_hiddens")  # [R, B, S, D]
-    halt_probs = aux.pop("halt_probs")    # [R, B, S]
-    r_steps, bsz, seq_len, d_model = all_hiddens.shape
+    halt_probs = aux.pop("halt_probs")  # [R, B, S]
+    r_steps, bsz, seq_len = halt_probs.shape
     base_mask = (
         jnp.ones((bsz, seq_len), dtype=jnp.float32)
         if loss_mask is None
         else loss_mask.astype(jnp.float32)
     )
     denom_full = jnp.maximum(jnp.sum(base_mask), 1.0)
+
+    if "sampled_hiddens" in aux:
+        h0 = aux.pop("h0")
+        deep_hiddens = aux.pop("sampled_hiddens")  # [K, B, S, D]
+        used_depths = aux.pop("sample_depths")     # [K]
+        q_deep = halt_probs[used_depths]
+        depth_scale = float(r_steps - 1) / float(deep_hiddens.shape[0])
+    else:
+        all_hiddens = aux.pop("all_hiddens")  # [R, B, S, D]
+        h0 = all_hiddens[0]
+        deep_hiddens = all_hiddens[1:]
+        q_deep = halt_probs[1:]
+        depth_scale = 1.0
+
+    n_deep, _, _, d_model = deep_hiddens.shape
     stride = max(1, int(cfg.dynamic_loop_ce_subsample))
+    phase: jax.Array | int = (
+        jax.random.randint(key_phase, (), 0, stride, dtype=jnp.int32)
+        if (key_phase is not None and stride > 1 and seq_len % stride == 0)
+        else 0
+    )
 
     with jax.named_scope("chunked_ce_loss"):
         if stride == 1:
-            w_rest = jax.lax.stop_gradient(halt_probs[1:]) * base_mask[None, :, :]
-            w_all = jnp.concatenate([base_mask[None, :, :], w_rest], axis=0)
+            n_stack = 1 + n_deep
+            h_stack = jnp.concatenate([h0[None, ...], deep_hiddens], axis=0)
+            w_deep = jax.lax.stop_gradient(q_deep) * float(depth_scale) * base_mask[None, :, :]
+            w_stack = jnp.concatenate([base_mask[None, :, :], w_deep], axis=0)
             lm_loss, nll_flat = chunked_cross_entropy_loss_and_nll(
-                all_hiddens.reshape(r_steps * bsz, seq_len, d_model),
+                h_stack.reshape(n_stack * bsz, seq_len, d_model),
                 lm_w,
-                jnp.broadcast_to(targets[None, :, :], (r_steps, bsz, seq_len)).reshape(
-                    r_steps * bsz, seq_len
+                jnp.broadcast_to(targets[None, :, :], (n_stack, bsz, seq_len)).reshape(
+                    n_stack * bsz, seq_len
                 ),
                 chunk_size=cfg.chunk_ce_size,
-                loss_mask=w_all.reshape(r_steps * bsz, seq_len),
+                loss_mask=w_stack.reshape(n_stack * bsz, seq_len),
                 weight_is_vd=weight_is_vd,
                 denom_override=denom_full,
             )
-            all_nlls_sub = nll_flat.reshape(r_steps, bsz, seq_len)
-            ce_loss_r0 = jnp.sum(all_nlls_sub[0] * base_mask) / denom_full
-            q_sub = halt_probs
-            sub_mask = base_mask
-            denom_sub = denom_full
+            nll_stack = nll_flat.reshape(n_stack, bsz, seq_len)
+            ce_loss_r0 = jnp.sum(nll_stack[0] * base_mask) / denom_full
+            gate_loss = (
+                jnp.sum(halt_probs[0] * jax.lax.stop_gradient(nll_stack[0]) * base_mask)
+                + float(depth_scale)
+                * jnp.sum(q_deep * jax.lax.stop_gradient(nll_stack[1:]) * base_mask[None, :, :])
+            ) / denom_full
         else:
             loss_0, nll_0 = chunked_cross_entropy_loss_and_nll(
-                all_hiddens[0],
+                h0,
                 lm_w,
                 targets,
                 chunk_size=cfg.chunk_ce_size,
@@ -1192,36 +1389,39 @@ def forward_model(
                 weight_is_vd=weight_is_vd,
                 denom_override=denom_full,
             )
-            sub_mask = base_mask[:, ::stride]
+            sub_mask = _stride_slice(base_mask, 1, stride, phase)
             denom_sub = jnp.maximum(jnp.sum(sub_mask), 1.0)
-            sub_targets = targets[:, ::stride]
-            q_sub = halt_probs[:, :, ::stride]
+            sub_targets = _stride_slice(targets, 1, stride, phase)
             s_sub = sub_targets.shape[1]
-            reconsider_loss, nll_rest_flat = chunked_cross_entropy_loss_and_nll(
-                all_hiddens[1:, :, ::stride, :].reshape((r_steps - 1) * bsz, s_sub, d_model),
+            q0_sub = _stride_slice(halt_probs[0], 1, stride, phase)
+            q_deep_sub = _stride_slice(q_deep, 2, stride, phase)
+            deep_h_sub = _stride_slice(deep_hiddens, 2, stride, phase)
+            nll_0_sub = _stride_slice(nll_0, 1, stride, phase)
+            reconsider_loss, nll_deep_flat = chunked_cross_entropy_loss_and_nll(
+                deep_h_sub.reshape(n_deep * bsz, s_sub, d_model),
                 lm_w,
-                jnp.broadcast_to(sub_targets[None, :, :], (r_steps - 1, bsz, s_sub)).reshape(
-                    (r_steps - 1) * bsz, s_sub
+                jnp.broadcast_to(sub_targets[None, :, :], (n_deep, bsz, s_sub)).reshape(
+                    n_deep * bsz, s_sub
                 ),
                 chunk_size=cfg.chunk_ce_size,
-                loss_mask=(jax.lax.stop_gradient(q_sub[1:]) * sub_mask[None, :, :]).reshape(
-                    (r_steps - 1) * bsz, s_sub
-                ),
+                loss_mask=(
+                    jax.lax.stop_gradient(q_deep_sub) * float(depth_scale) * sub_mask[None, :, :]
+                ).reshape(n_deep * bsz, s_sub),
                 weight_is_vd=weight_is_vd,
                 denom_override=denom_sub,
             )
             lm_loss = loss_0 + reconsider_loss
             ce_loss_r0 = loss_0
-            all_nlls_sub = jnp.concatenate(
-                [nll_0[:, ::stride][None, :, :], nll_rest_flat.reshape(r_steps - 1, bsz, s_sub)],
-                axis=0,
-            )
+            nll_deep_sub = nll_deep_flat.reshape(n_deep, bsz, s_sub)
+            gate_loss = (
+                jnp.sum(q0_sub * jax.lax.stop_gradient(nll_0_sub) * sub_mask)
+                + float(depth_scale)
+                * jnp.sum(
+                    q_deep_sub * jax.lax.stop_gradient(nll_deep_sub) * sub_mask[None, :, :]
+                )
+            ) / denom_sub
 
     with jax.named_scope("dynamic_halt_loss"):
-        gate_loss = (
-            jnp.sum(q_sub * jax.lax.stop_gradient(all_nlls_sub) * sub_mask[None, :, :])
-            / denom_sub
-        )
         q_bar = jnp.sum(halt_probs * base_mask[None, :, :], axis=(1, 2)) / denom_full
         halt_entropy = -jnp.sum(q_bar * jnp.log(jnp.maximum(q_bar, 1e-8)))
         balance_loss = -jnp.asarray(cfg.halt_balance_weight, dtype=jnp.float32) * halt_entropy
@@ -1259,25 +1459,26 @@ def expand_checkpoint_1_to_n_loops(
     adaln["loop_alpha"] = loop_alpha
     new_params["iter_adaln"] = adaln
 
-    # Warm-start ONLY per-loop MLA Q/O parameters from trained loop 0; keep single-copy KV/CSA2 intact
+    # Warm-start ONLY per-loop MLA Q/O banks from trained loop 0; keep single-copy KV/CSA2 intact
     if new_params["mla"]["w_dq"].ndim == 3:
         new_params["mla"] = {
             k: (jnp.repeat(v[0:1], v.shape[0], axis=0) if is_per_loop_mla_leaf(k, v) else v)
             for k, v in new_params["mla"].items()
         }
 
-    # Broadcast learned Phase-1 router bias and warm-start untied per-loop routers
+    # Broadcast learned Phase-1 router bias and warm-start untied per-bank routers
     moe = dict(new_params["moe"])
     base_bias = moe["router_bias"][0:1]
     moe["router_bias"] = jnp.repeat(base_bias, max_loops, axis=0)
     if moe["router_w"].ndim == 3:
         base_rw = moe["router_w"][0:1]
+        n_rw_banks = moe["router_w"].shape[0]
         rw_noise = (
-            jax.random.normal(k_router, (max_loops - 1, *base_rw.shape[1:]), dtype=base_rw.dtype)
+            jax.random.normal(k_router, (n_rw_banks - 1, *base_rw.shape[1:]), dtype=base_rw.dtype)
             * noise_std
         )
         moe["router_w"] = jnp.concatenate(
-            [base_rw, jnp.repeat(base_rw, max_loops - 1, axis=0) + rw_noise], axis=0
+            [base_rw, jnp.repeat(base_rw, n_rw_banks - 1, axis=0) + rw_noise], axis=0
         )
     new_params["moe"] = moe
     return new_params
@@ -1292,6 +1493,7 @@ def summarize_model(cfg: LoopMoEConfig) -> str:
     return (
         f"LoopMoE(d={cfg.d_model}, V={cfg.vocab_size}, max_R={cfg.num_loops}, "
         f"dyn={cfg.use_dynamic_loop}, kv_reuse={cfg.reuse_kv_across_loops}, "
+        f"cap={cfg.train_loop_capacity_factor:.2f}, ce_k={cfg.dynamic_loop_ce_sample_depths}, "
         f"experts={cfg.n_routed_experts}x{cfg.d_ff_expert} top-{cfg.top_k}+shared) | "
         f"Total={stats['total']/1e6:.2f}M | Emb={stats['embedding']/1e6:.2f}M | "
         f"Engram={stats['engram_total']/1e6:.2f}M ({stats['engram_sparse_ratio']*100:.1f}% sparse) | "

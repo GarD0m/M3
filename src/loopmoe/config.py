@@ -98,7 +98,7 @@ class LoopMoEConfig:
     vocab_size: int = 32_768
     d_model: int = 2048
     num_layers: int = 1
-    max_loops: int = 8
+    max_loops: int = 32
     num_loops: int = 1  # max active loops for this stage (early exit when > 1)
     tie_word_embeddings: bool = True
     dtype_name: str = "bfloat16"
@@ -140,6 +140,7 @@ class LoopMoEConfig:
     d_qk_rope: int = 32
     d_v: int = 128
     untie_mla_per_loop: bool = True
+    mla_weight_banks: int = 8
     reuse_kv_across_loops: bool = True
     attn_use_tokamax: bool = True
     use_csa2_indexer: bool = False
@@ -157,6 +158,7 @@ class LoopMoEConfig:
     router_bias_update_rate: float = 1e-3
     seq_aux_loss_weight: float = 0.0
     untie_router_per_loop: bool = True
+    router_weight_banks: int = 8
     use_post_moe_rmsnorm: bool = True
     moe_use_tokamax: bool = True
 
@@ -167,6 +169,10 @@ class LoopMoEConfig:
     halt_balance_weight: float = 0.01
     halt_threshold: float = 0.5
     dynamic_loop_ce_subsample: int = 1
+    dynamic_loop_ce_sample_depths: int = 2
+    train_loop_capacity_factor: float = 0.5
+    train_loop_explore_noise: float = 0.05
+    bptt_window: int = 8
 
     # TPU execution
     remat_per_loop: bool = True
@@ -229,7 +235,7 @@ class LoopMoEConfig:
         return cls(
             vocab_size=512,
             d_model=64,
-            max_loops=8,
+            max_loops=32,
             num_loops=num_loops,
             chunk_ce_size=16,
             base_seq_len=32,
@@ -251,6 +257,7 @@ class LoopMoEConfig:
             d_qk_rope=8,
             d_v=8,
             untie_mla_per_loop=True,
+            mla_weight_banks=8,
             reuse_kv_across_loops=True,
             attn_use_tokamax=False,
             use_csa2_indexer=use_csa2_indexer,
@@ -264,6 +271,7 @@ class LoopMoEConfig:
             top_k=2,
             seq_aux_loss_weight=0.0,
             untie_router_per_loop=True,
+            router_weight_banks=8,
             use_post_moe_rmsnorm=True,
             moe_use_tokamax=False,
             iter_adaln_bottleneck=16,
@@ -272,6 +280,10 @@ class LoopMoEConfig:
             halt_balance_weight=0.01,
             halt_threshold=0.5,
             dynamic_loop_ce_subsample=1,
+            dynamic_loop_ce_sample_depths=2,
+            train_loop_capacity_factor=0.5,
+            train_loop_explore_noise=0.05,
+            bptt_window=8,
             remat_per_loop=False,
             remat_sublayers=False,
             remat_moe=False,
@@ -517,7 +529,7 @@ def count_analytic_params(cfg: LoopMoEConfig) -> dict[str, float | int]:
         + 2 * d  # base pre-sublayer RMSNorms
     )
 
-    # MLA (Q/O optionally untied per max_loops; Loop-0 KV & CSA2 reused across loops by default)
+    # MLA (Q/O optionally untied per cyclic bank; Loop-0 KV & CSA2 reused across loops by default)
     mla_q_o_single = (
         d * cfg.d_q_lora
         + cfg.d_q_lora
@@ -537,9 +549,10 @@ def count_analytic_params(cfg: LoopMoEConfig) -> dict[str, float | int]:
             + d * cfg.csa2_num_heads
         )
     mla_single = mla_q_o_single + mla_kv_single
+    eff_mla_banks = min(cfg.max_loops, max(1, cfg.mla_weight_banks)) if cfg.untie_mla_per_loop else 1
     if cfg.untie_mla_per_loop:
-        mla = cfg.max_loops * mla_q_o_single + (
-            mla_kv_single if cfg.reuse_kv_across_loops else cfg.max_loops * mla_kv_single
+        mla = eff_mla_banks * mla_q_o_single + (
+            mla_kv_single if cfg.reuse_kv_across_loops else eff_mla_banks * mla_kv_single
         )
     else:
         mla = mla_single
@@ -547,7 +560,10 @@ def count_analytic_params(cfg: LoopMoEConfig) -> dict[str, float | int]:
     # MoE
     moe_routed = cfg.n_routed_experts * (3 * d * cfg.d_ff_expert)
     moe_shared = cfg.n_shared_experts * (3 * d * cfg.d_ff_shared)
-    moe_router = (cfg.max_loops if cfg.untie_router_per_loop else 1) * d * cfg.n_routed_experts
+    eff_router_banks = (
+        min(cfg.max_loops, max(1, cfg.router_weight_banks)) if cfg.untie_router_per_loop else 1
+    )
+    moe_router = eff_router_banks * d * cfg.n_routed_experts
     moe_bias = cfg.max_loops * cfg.n_routed_experts
     moe_post_norm = d if cfg.use_post_moe_rmsnorm else 0
     moe = moe_routed + moe_shared + moe_router + moe_bias + moe_post_norm
@@ -610,8 +626,23 @@ def estimate_step_flops(cfg: LoopMoEConfig, batch_size: int, seq_len: int) -> fl
         )
     else:
         mla_matmul_total = cfg.num_loops * int(stats["mla_per_loop"])
+    if cfg.num_loops > 1:
+        cap_factor = (
+            min(1.0, max(0.0, float(cfg.train_loop_capacity_factor)))
+            if cfg.use_dynamic_loop
+            else 1.0
+        )
+        moe_runs = 1.0 + float(cfg.num_loops - 1) * cap_factor
+    else:
+        moe_runs = 1.0
     if cfg.use_dynamic_loop and cfg.num_loops > 1:
-        lm_head_runs = 1.0 + float(cfg.num_loops - 1) / float(max(1, cfg.dynamic_loop_ce_subsample))
+        deep_avail = cfg.num_loops - 1
+        k_ce = (
+            deep_avail
+            if (cfg.dynamic_loop_ce_sample_depths <= 0 or cfg.dynamic_loop_ce_sample_depths >= deep_avail)
+            else cfg.dynamic_loop_ce_sample_depths
+        )
+        lm_head_runs = 1.0 + float(k_ce) / float(max(1, cfg.dynamic_loop_ce_subsample))
     else:
         lm_head_runs = 1.0
     # Dense matmul FLOPs (embedding lookup is sparse; LM head projection IS a full matmul)
@@ -619,7 +650,8 @@ def estimate_step_flops(cfg: LoopMoEConfig, batch_size: int, seq_len: int) -> fl
         lm_head_runs * float(cfg.vocab_size * cfg.d_model)  # LM head
         + float(engram_dense_runs * int(stats["active_engram_dense"]))
         + float(mla_matmul_total)
-        + float(cfg.num_loops) * float(int(stats["active_ffn_per_loop"]) + int(stats["mhc"]))
+        + moe_runs * float(int(stats["active_ffn_per_loop"]))
+        + float(cfg.num_loops) * float(int(stats["mhc"]))
     )
     linear_flops = 6.0 * float(active_matmul_params) * float(tokens)
     # Causal attention FLOPs (~6 * B * H * S^2 * (d_qk + d_v) / 2 * loops for fwd+bwd)

@@ -99,15 +99,25 @@ def maybe_tokamax_autotune(
         return contextlib.nullcontext()
 
 
+def _extract_opt_step(opt_state: Any) -> jax.Array:
+    int_leaves = [
+        v
+        for v in jax.tree_util.tree_leaves(opt_state)
+        if hasattr(v, "ndim") and v.ndim == 0 and jnp.issubdtype(v.dtype, jnp.integer)
+    ]
+    return int_leaves[0].astype(jnp.int32) if int_leaves else jnp.asarray(0, dtype=jnp.int32)
+
+
 def make_train_step(
     model_cfg: LoopMoEConfig,
     optimizer: optax.GradientTransformation,
     grad_accum_steps: int,
+    seed: int = 42,
 ):
     """Build a donated JIT-compiled global optimizer step over `grad_accum_steps` microbatches."""
 
-    def _loss_fn(params: dict[str, Any], x: jax.Array, y: jax.Array):
-        return forward_model(params, x, y, model_cfg)
+    def _loss_fn(params: dict[str, Any], x: jax.Array, y: jax.Array, rng_key: jax.Array | None):
+        return forward_model(params, x, y, model_cfg, rng_key=rng_key)
 
     grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
 
@@ -118,6 +128,8 @@ def make_train_step(
         batch_xs: jax.Array,
         batch_ys: jax.Array,
     ) -> tuple[dict[str, Any], Any, dict[str, jax.Array]]:
+        step_idx = _extract_opt_step(opt_state)
+        base_rng = jax.random.fold_in(jax.random.PRNGKey(seed), step_idx)
         zero_grads = jax.tree_util.tree_map(jnp.zeros_like, params)
         init_counts = jnp.zeros((model_cfg.num_loops, model_cfg.n_routed_experts), dtype=jnp.float32)
         init_carry = (
@@ -135,11 +147,12 @@ def make_train_step(
 
         def accum_body(carry, microbatch):
             g_acc, loss_acc, ce_acc, gate_acc, mmr_acc, exp_r_acc, h_ent_acc, cnt_acc = carry
-            x_mb, y_mb = microbatch
+            x_mb, y_mb, mb_idx = microbatch
             x_mb = x_mb.astype(jnp.int32)
             y_mb = y_mb.astype(jnp.int32)
+            mb_key = jax.random.fold_in(base_rng, mb_idx) if model_cfg.num_loops > 1 else None
             with jax.named_scope("fwd_bwd_microbatch"):
-                (loss, aux), grads = grad_fn(params, x_mb, y_mb)
+                (loss, aux), grads = grad_fn(params, x_mb, y_mb, mb_key)
             g_acc = jax.tree_util.tree_map(lambda a, g: a + g, g_acc, grads)
             return (
                 g_acc,
@@ -152,6 +165,7 @@ def make_train_step(
                 cnt_acc + aux["expert_counts"] * inv_g,
             ), None
 
+        mb_indices = jnp.arange(grad_accum_steps, dtype=jnp.int32)
         with jax.named_scope("grad_accum_scan"):
             (
                 grads_sum,
@@ -162,7 +176,7 @@ def make_train_step(
                 exp_r_mean,
                 h_ent_mean,
                 counts_mean,
-            ), _ = jax.lax.scan(accum_body, init_carry, (batch_xs, batch_ys))
+            ), _ = jax.lax.scan(accum_body, init_carry, (batch_xs, batch_ys, mb_indices))
         grads_mean = jax.tree_util.tree_map(
             lambda g: g * jnp.asarray(inv_g, dtype=g.dtype), grads_sum
         )
@@ -316,6 +330,24 @@ def parse_args() -> argparse.Namespace:
         help="Stride for deeper-loop CE in arXiv:2611.05724 dynamic loops (1=exact, 2/4=faster R>1 training).",
     )
     parser.add_argument(
+        "--dynamic-loop-ce-depths",
+        type=int,
+        default=None,
+        help="Number of deep depths (r >= 1) sampled per microbatch for CE (default 2; <=0 evaluates all).",
+    )
+    parser.add_argument(
+        "--train-loop-capacity",
+        type=float,
+        default=None,
+        help="Fraction of hardest/continuing tokens routed through MoE on r >= 1 (default 0.5).",
+    )
+    parser.add_argument(
+        "--bptt-window",
+        type=int,
+        default=None,
+        help="Truncated BPTT suffix window for high R (e.g. R=32 uses Loop 0 + last K loops; default 8).",
+    )
+    parser.add_argument(
         "--halt-balance-weight",
         type=float,
         default=None,
@@ -339,6 +371,12 @@ def main() -> None:
         cfg_overrides["use_csa2_indexer"] = True
     if args.dynamic_loop_ce_subsample is not None:
         cfg_overrides["dynamic_loop_ce_subsample"] = args.dynamic_loop_ce_subsample
+    if args.dynamic_loop_ce_depths is not None:
+        cfg_overrides["dynamic_loop_ce_sample_depths"] = args.dynamic_loop_ce_depths
+    if args.train_loop_capacity is not None:
+        cfg_overrides["train_loop_capacity_factor"] = args.train_loop_capacity
+    if args.bptt_window is not None:
+        cfg_overrides["bptt_window"] = args.bptt_window
     if args.halt_balance_weight is not None:
         cfg_overrides["halt_balance_weight"] = args.halt_balance_weight
     if args.tpu_preset == "v5e-1" and not args.tiny:
@@ -458,7 +496,7 @@ def main() -> None:
         if opt_state is None:
             opt_state = optimizer.init(params)
 
-        train_step = make_train_step(stage_model_cfg, optimizer, grad_accum)
+        train_step = make_train_step(stage_model_cfg, optimizer, grad_accum, seed=args.seed)
         step_flops = estimate_step_flops(stage_model_cfg, micro_bs, stage.seq_len) * grad_accum
         loader = _build_loader(stage, args, stage_model_cfg, tokenizer, micro_tok)
 

@@ -76,11 +76,13 @@ def _path_str(path: tuple[Any, ...]) -> str:
 
 
 def classify_param(path_str: str, arr: Any) -> str:
-    """Classify each parameter into frozen | muon | adam_decay | adam_no_decay."""
+    """Classify each parameter into frozen | muon | engram_row_adam | adam_decay | adam_no_decay."""
     if not hasattr(arr, "ndim"):
         return "frozen"
     if path_str.endswith("router_bias"):
         return "frozen"
+    if path_str == "engram/tables":
+        return "engram_row_adam"
 
     leaf = path_str.split("/")[-1]
 
@@ -279,11 +281,80 @@ def scale_by_cubic_muon(
     return optax.GradientTransformation(init_fn, update_fn)
 
 
+class RowAdamState(NamedTuple):
+    """Optimizer state for Row-Wise Factored AdamW (BF16 mu + 1 FP32 scalar v_row per N-gram slot)."""
+
+    count: jax.Array
+    mu: Any
+    v_row: Any
+
+
+def scale_by_row_adam(
+    b1: float = 0.9,
+    b2: float = 0.95,
+    eps: float = 1e-8,
+    mu_dtype: jnp.dtype | None = jnp.bfloat16,
+) -> optax.GradientTransformation:
+    """Factored row-wise Adam preserving Zipfian per-slot step scaling at ~33% less HBM & bandwidth."""
+    mu_dtype_can = optax._src.utils.canonicalize_dtype(mu_dtype)
+
+    def init_fn(params: Any) -> RowAdamState:
+        return RowAdamState(
+            count=jnp.zeros([], dtype=jnp.int32),
+            mu=optax.tree.zeros_like(params, dtype=mu_dtype_can),
+            v_row=jax.tree_util.tree_map(
+                lambda a: jnp.zeros(a.shape[:-1] + (1,), dtype=jnp.float32),
+                params,
+            ),
+        )
+
+    def update_fn(updates: Any, state: RowAdamState, params: Any | None = None):
+        del params
+        count_inc = (
+            optax.tree.safe_increment(state.count)
+            if hasattr(optax.tree, "safe_increment")
+            else (state.count + jnp.asarray(1, dtype=jnp.int32))
+        )
+        c_f32 = count_inc.astype(jnp.float32)
+        bc1 = jnp.asarray(1.0, dtype=jnp.float32) - jnp.asarray(b1, dtype=jnp.float32) ** c_f32
+        bc2 = jnp.asarray(1.0, dtype=jnp.float32) - jnp.asarray(b2, dtype=jnp.float32) ** c_f32
+
+        def _step_leaf(g: jax.Array, m: jax.Array, v: jax.Array):
+            g_f32 = g.astype(jnp.float32)
+            new_m_f32 = jnp.asarray(b1, dtype=jnp.float32) * m.astype(jnp.float32) + (
+                jnp.asarray(1.0 - b1, dtype=jnp.float32) * g_f32
+            )
+            row_sq = jnp.mean(jnp.square(g_f32), axis=-1, keepdims=True)
+            new_v = jnp.asarray(b2, dtype=jnp.float32) * v + (
+                jnp.asarray(1.0 - b2, dtype=jnp.float32) * row_sq
+            )
+            upd = (new_m_f32 / bc1) / (jnp.sqrt(new_v / bc2) + jnp.asarray(eps, dtype=jnp.float32))
+            return upd.astype(g.dtype), new_m_f32.astype(mu_dtype_can), new_v
+
+        treedef = jax.tree_util.tree_structure(updates)
+        u_leaves = jax.tree_util.tree_leaves(updates)
+        m_leaves = jax.tree_util.tree_leaves(state.mu)
+        v_leaves = jax.tree_util.tree_leaves(state.v_row)
+        out_u, out_m, out_v = [], [], []
+        for g, m, v in zip(u_leaves, m_leaves, v_leaves, strict=True):
+            ug, nm, nv = _step_leaf(g, m, v)
+            out_u.append(ug)
+            out_m.append(nm)
+            out_v.append(nv)
+        return jax.tree_util.tree_unflatten(treedef, out_u), RowAdamState(
+            count=count_inc,
+            mu=jax.tree_util.tree_unflatten(treedef, out_m),
+            v_row=jax.tree_util.tree_unflatten(treedef, out_v),
+        )
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
 def create_muon_adamw_optimizer(
     optim_cfg: OptimConfig,
     params_template: Any | None = None,
 ) -> optax.GradientTransformation:
-    """Build clipped Muon (Cubic5 default or Quintic) + BF16-moment AdamW optimizer."""
+    """Build clipped Muon (Cubic5) + Row-Factored Engram AdamW + BF16-moment AdamW optimizer."""
     del params_template  # labels & dim numbers resolve dynamically inside optax.partition
     muon_lr = make_warmup_stable_schedule(optim_cfg.muon_lr, optim_cfg.warmup_steps)
     adam_lr = make_warmup_stable_schedule(optim_cfg.adam_lr, optim_cfg.warmup_steps)
@@ -325,6 +396,17 @@ def create_muon_adamw_optimizer(
     else:
         raise ValueError(f"Unsupported muon_ns_mode: {optim_cfg.muon_ns_mode!r}")
 
+    engram_row_adam_tx = optax.chain(
+        scale_by_row_adam(
+            b1=optim_cfg.adam_b1,
+            b2=optim_cfg.adam_b2,
+            eps=1e-8,
+            mu_dtype=jnp.bfloat16,
+        ),
+        optax.add_decayed_weights(optim_cfg.adam_weight_decay),
+        optax.scale_by_learning_rate(adam_lr),
+    )
+
     adam_decay_tx = optax.adamw(
         learning_rate=adam_lr,
         b1=optim_cfg.adam_b1,
@@ -346,6 +428,7 @@ def create_muon_adamw_optimizer(
     partitioned = optax.partition(
         transforms={
             "muon": muon_tx,
+            "engram_row_adam": engram_row_adam_tx,
             "adam_decay": adam_decay_tx,
             "adam_no_decay": adam_no_decay_tx,
             "frozen": optax.set_to_zero(),
