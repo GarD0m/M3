@@ -172,7 +172,7 @@ class LoopMoEConfig:
     dynamic_loop_ce_sample_depths: int = 2
     train_loop_capacity_factor: float = 0.5
     train_loop_explore_noise: float = 0.05
-    bptt_window: int = 8
+    bptt_window: int = 4
 
     # TPU execution
     remat_per_loop: bool = True
@@ -288,7 +288,7 @@ class LoopMoEConfig:
             dynamic_loop_ce_sample_depths=2,
             train_loop_capacity_factor=0.5,
             train_loop_explore_noise=0.05,
-            bptt_window=8,
+            bptt_window=4,
             remat_per_loop=False,
             remat_sublayers=False,
             remat_moe=False,

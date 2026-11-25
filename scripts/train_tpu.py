@@ -378,7 +378,7 @@ def parse_args() -> argparse.Namespace:
         "--bptt-window",
         type=int,
         default=None,
-        help="Truncated BPTT suffix window for high R (e.g. R=32 uses Loop 0 + last K loops; default 8).",
+        help="Truncated BPTT suffix window for high R (e.g. R=32 uses Loop 0 + last K loops; default 4).",
     )
     parser.add_argument(
         "--halt-balance-weight",
@@ -513,19 +513,15 @@ def main() -> None:
         if args.use_csa2_long and stage.seq_len < 16384:
             # Keep idx_* parameter shapes consistent across stages while staying dense below 16K
             stage_overrides["csa2_topk"] = stage.seq_len
-        if args.tpu_preset == "v5e-1" and not args.tiny and (stage.num_loops > 1 or stage.seq_len >= 16384):
+        if not args.tiny and (stage.num_loops > 1 or (args.tpu_preset == "v5e-1" and stage.seq_len >= 16384)):
             if args.remat_moe is None and not stage_model_cfg.remat_moe:
                 stage_overrides["remat_moe"] = True
-            if stage.seq_len >= 16384:
-                if stage.num_loops > 1 and args.remat_sublayers is None and not stage_model_cfg.remat_sublayers:
-                    stage_overrides["remat_sublayers"] = True
-                if args.moe_chunk_size is None and stage_model_cfg.moe_chunk_size == 0:
+            if args.tpu_preset == "v5e-1" and stage.seq_len >= 16384:
+                if args.remat_moe is False and args.moe_chunk_size is None and stage_model_cfg.moe_chunk_size == 0:
                     stage_overrides["moe_chunk_size"] = 4096
                 if args.chunk_ce_size is None and stage_model_cfg.chunk_ce_size > 4096:
                     stage_overrides["chunk_ce_size"] = 4096
                 explicit_risks = []
-                if stage.num_loops > 1 and args.remat_sublayers is False:
-                    explicit_risks.append("--no-remat-sublayers")
                 if args.remat_moe is False:
                     explicit_risks.append("--no-remat-moe")
                 if args.chunk_ce_size is not None and args.chunk_ce_size > 4096:

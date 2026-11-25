@@ -109,7 +109,7 @@ def test_full_1b_analytic_params_and_tiny_exact_match() -> None:
     assert cfg.halt_balance_weight == 0.01
     assert cfg.dynamic_loop_ce_sample_depths == 2
     assert cfg.train_loop_capacity_factor == 0.5
-    assert cfg.bptt_window == 8
+    assert cfg.bptt_window == 4
     assert cfg.untie_router_per_loop is True
     assert cfg.router_weight_banks == 8
     assert cfg.use_post_moe_rmsnorm is True
@@ -123,7 +123,7 @@ def test_full_1b_analytic_params_and_tiny_exact_match() -> None:
     assert estimate_step_flops(LoopMoEConfig(num_loops=32, train_loop_capacity_factor=0.5), 2, 4096) < (
         estimate_step_flops(LoopMoEConfig(num_loops=32, train_loop_capacity_factor=1.0), 2, 4096)
     )
-    assert estimate_step_flops(LoopMoEConfig(num_loops=32, bptt_window=8), 2, 4096) < (
+    assert estimate_step_flops(LoopMoEConfig(num_loops=32, bptt_window=4), 2, 4096) < (
         estimate_step_flops(LoopMoEConfig(num_loops=32, bptt_window=0), 2, 4096)
     )
 
