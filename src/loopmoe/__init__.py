@@ -10,8 +10,10 @@ from .config import (
 )
 from .model import (
     chunked_cross_entropy_loss,
+    chunked_cross_entropy_loss_and_nll,
     count_tree_params,
     expand_checkpoint_1_to_8_loops,
+    forward_dynamic_exit,
     forward_model,
     init_model_params,
 )
@@ -22,10 +24,12 @@ __all__ = [
     "LoopMoEConfig",
     "StageConfig",
     "chunked_cross_entropy_loss",
+    "chunked_cross_entropy_loss_and_nll",
     "count_analytic_params",
     "count_tree_params",
     "estimate_step_flops",
     "expand_checkpoint_1_to_8_loops",
+    "forward_dynamic_exit",
     "forward_model",
     "init_model_params",
 ]

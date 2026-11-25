@@ -126,13 +126,15 @@ def make_train_step(
             jnp.asarray(0.0, dtype=jnp.float32),
             jnp.asarray(0.0, dtype=jnp.float32),
             jnp.asarray(0.0, dtype=jnp.float32),
+            jnp.asarray(0.0, dtype=jnp.float32),
+            jnp.asarray(0.0, dtype=jnp.float32),
             init_counts,
         )
 
         inv_g = 1.0 / float(grad_accum_steps)
 
         def accum_body(carry, microbatch):
-            g_acc, loss_acc, ce_acc, gate_acc, mmr_acc, cnt_acc = carry
+            g_acc, loss_acc, ce_acc, gate_acc, mmr_acc, exp_r_acc, h_ent_acc, cnt_acc = carry
             x_mb, y_mb = microbatch
             x_mb = x_mb.astype(jnp.int32)
             y_mb = y_mb.astype(jnp.int32)
@@ -145,13 +147,22 @@ def make_train_step(
                 ce_acc + aux["ce_loss"] * inv_g,
                 gate_acc + aux["engram_gate_mean"] * inv_g,
                 mmr_acc + aux["router_mmr"] * inv_g,
+                exp_r_acc + aux.get("expected_loops", jnp.asarray(float(model_cfg.num_loops), dtype=jnp.float32)) * inv_g,
+                h_ent_acc + aux.get("halt_entropy", jnp.asarray(0.0, dtype=jnp.float32)) * inv_g,
                 cnt_acc + aux["expert_counts"] * inv_g,
             ), None
 
         with jax.named_scope("grad_accum_scan"):
-            (grads_sum, loss_mean, ce_mean, gate_mean, mmr_mean, counts_mean), _ = jax.lax.scan(
-                accum_body, init_carry, (batch_xs, batch_ys)
-            )
+            (
+                grads_sum,
+                loss_mean,
+                ce_mean,
+                gate_mean,
+                mmr_mean,
+                exp_r_mean,
+                h_ent_mean,
+                counts_mean,
+            ), _ = jax.lax.scan(accum_body, init_carry, (batch_xs, batch_ys))
         grads_mean = jax.tree_util.tree_map(
             lambda g: g * jnp.asarray(inv_g, dtype=g.dtype), grads_sum
         )
@@ -178,6 +189,8 @@ def make_train_step(
             "ce_loss": ce_mean,
             "engram_gate": gate_mean,
             "router_mmr": mmr_mean,
+            "expected_loops": exp_r_mean,
+            "halt_entropy": h_ent_mean,
             "expert_cv": expert_cv,
             "loop_alpha_1": jnp.mean(jnp.abs(new_params["iter_adaln"]["loop_alpha"][1:]))
             if model_cfg.num_loops > 1
@@ -296,6 +309,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profile-steps", type=int, default=3, help="Number of steps to trace in profiler.")
     parser.add_argument("--peak-tflops", type=float, default=None, help="Override TPU BF16 peak TFLOPS.")
     parser.add_argument("--use-csa2-long", action="store_true", help="Enable CSA2 indexer on >=16K stages.")
+    parser.add_argument(
+        "--dynamic-loop-ce-subsample",
+        type=int,
+        default=None,
+        help="Stride for deeper-loop CE in arXiv:2611.05724 dynamic loops (1=exact, 2/4=faster R>1 training).",
+    )
+    parser.add_argument(
+        "--halt-balance-weight",
+        type=float,
+        default=None,
+        help="Marginal halting entropy weight beta in arXiv:2611.05724 Eq. 6 (default 0.01).",
+    )
     parser.add_argument("--tiny", action="store_true", help="Use tiny model config for local debugging.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log-every", type=int, default=10)
@@ -312,6 +337,10 @@ def main() -> None:
     cfg_overrides: dict[str, Any] = {}
     if args.use_csa2_long:
         cfg_overrides["use_csa2_indexer"] = True
+    if args.dynamic_loop_ce_subsample is not None:
+        cfg_overrides["dynamic_loop_ce_subsample"] = args.dynamic_loop_ce_subsample
+    if args.halt_balance_weight is not None:
+        cfg_overrides["halt_balance_weight"] = args.halt_balance_weight
     if args.tpu_preset == "v5e-1" and not args.tiny:
         cfg_overrides["chunk_ce_size"] = int(spec["default_chunk_ce_size"])
     if args.remat_sublayers:
@@ -488,11 +517,17 @@ def main() -> None:
                         tok_per_sec = (grad_accum * micro_tok) / sec_per_step
                         mfu = 100.0 * (step_flops / sec_per_step) / (peak_tflops * 1e12)
                         tag = " (compile)" if step == start_step else ""
+                        dyn_str = (
+                            f" exp_r={float(metrics['expected_loops']):.2f}"
+                            f" h_ent={float(metrics['halt_entropy']):.2f}"
+                            if stage.num_loops > 1
+                            else ""
+                        )
                         print(
                             f"[S{stage.stage_id} step {step + 1}/{total_steps}]{tag} "
                             f"loss={float(metrics['loss']):.4f} ce={float(metrics['ce_loss']):.4f} "
                             f"eng_g={float(metrics['engram_gate']):.3f} exp_cv={float(metrics['expert_cv']):.3f} "
-                            f"mmr={float(metrics['router_mmr']):.2f} "
+                            f"mmr={float(metrics['router_mmr']):.2f}{dyn_str} "
                             f"| {tok_per_sec:,.0f} tok/s | MFU={mfu:.1f}% | total_tok={tokens_seen/1e9:.3f}B"
                         )
                         t_log = time.perf_counter()

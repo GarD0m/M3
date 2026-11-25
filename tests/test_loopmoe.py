@@ -45,8 +45,10 @@ from loopmoe.model import (
     _saved_logits_ce,
     _saved_logits_ce_vd,
     chunked_cross_entropy_loss,
+    chunked_cross_entropy_loss_and_nll,
     count_tree_params,
     expand_checkpoint_1_to_8_loops,
+    forward_dynamic_exit,
     forward_logits,
     forward_model,
     init_model_params,
@@ -86,12 +88,18 @@ def test_full_1b_analytic_params_and_tiny_exact_match() -> None:
     assert cfg.seq_aux_loss_weight == 0.0
     assert cfg.engram_pre_loop_only is True
     assert cfg.untie_mla_per_loop is True
+    assert cfg.reuse_kv_across_loops is True
+    assert cfg.use_dynamic_loop is True
+    assert cfg.halt_balance_weight == 0.01
     assert cfg.untie_router_per_loop is True
     assert cfg.use_post_moe_rmsnorm is True
     assert cfg.embed_reinject_lambda == 0.5
 
     tied_cfg = LoopMoEConfig(untie_mla_per_loop=False)
     assert estimate_step_flops(cfg, 2, 4096) == estimate_step_flops(tied_cfg, 2, 4096)
+    assert estimate_step_flops(LoopMoEConfig(num_loops=8, reuse_kv_across_loops=True), 2, 4096) < (
+        estimate_step_flops(LoopMoEConfig(num_loops=8, reuse_kv_across_loops=False), 2, 4096)
+    )
 
     # Verify curriculum token sum == 21B (20B R=1 + 1B R=8) and all stages use L3
     assert sum(s.target_tokens for s in DEFAULT_CURRICULUM if s.num_loops == 1) == 20_000_000_000
@@ -117,7 +125,7 @@ def test_full_1b_analytic_params_and_tiny_exact_match() -> None:
         assert en_s.code_ratio == 0.10
         assert en_s.math_ratio == 0.10
 
-    # Verify analytic count matches actual initialized pytree leaf count across mHC, Engram & untied modes
+    # Verify analytic count matches actual initialized pytree leaf count across mHC, Engram, KV reuse & dynamic loop
     tiny_cfg = LoopMoEConfig.tiny()
     tiny_params = init_model_params(jax.random.PRNGKey(0), tiny_cfg)
     assert count_analytic_params(tiny_cfg)["total"] == count_tree_params(tiny_params)
@@ -138,6 +146,17 @@ def test_full_1b_analytic_params_and_tiny_exact_match() -> None:
     assert count_analytic_params(tiny_tied)["total"] == count_tree_params(
         init_model_params(jax.random.PRNGKey(2), tiny_tied)
     )
+
+    for extra in (
+        {"reuse_kv_across_loops": False},
+        {"use_dynamic_loop": False},
+        {"use_csa2_indexer": True},
+        {"use_csa2_indexer": True, "reuse_kv_across_loops": False},
+    ):
+        cfg_var = LoopMoEConfig(**{**tiny_cfg.to_dict(), **extra})
+        assert count_analytic_params(cfg_var)["total"] == count_tree_params(
+            init_model_params(jax.random.PRNGKey(3), cfg_var)
+        ), f"Param mismatch for {extra}"
 
 
 def test_forward_and_backward_r1_r8_and_csa2() -> None:
@@ -218,17 +237,25 @@ def test_r1_to_r8_smooth_expansion_preserves_logits_and_learns() -> None:
     logits_r1, _ = jax.jit(lambda p: forward_logits(p, x, cfg_r1))(params_r1)
     params_r8 = expand_checkpoint_1_to_8_loops(params_r1, jax.random.PRNGKey(103))
     assert params_r8["mla"]["w_dq"].shape[0] == 8
+    assert params_r8["mla"]["w_dkv"].ndim == 2
+    np.testing.assert_array_equal(
+        np.asarray(params_r8["mla"]["w_dkv"], dtype=np.float32),
+        np.asarray(params_r1["mla"]["w_dkv"], dtype=np.float32),
+    )
     np.testing.assert_allclose(
         np.asarray(params_r8["mla"]["w_dq"][0], dtype=np.float32),
         np.asarray(params_r8["mla"]["w_dq"][7], dtype=np.float32),
     )
     logits_r8, _ = jax.jit(lambda p: forward_logits(p, x, cfg_r8))(params_r8)
+    logits_r8_dyn, dyn_info = jax.jit(lambda p: forward_dynamic_exit(p, x, cfg_r8))(params_r8)
 
     # In bfloat16, unrolled R=1 scan vs R=8 while-loop differs by at most 1 BF16 ULP (~0.0039)
     max_diff = float(jnp.max(jnp.abs(logits_r1 - logits_r8)))
     mean_diff = float(jnp.mean(jnp.abs(logits_r1 - logits_r8)))
     assert max_diff < 1e-2, f"BF16 step-0 logits drifted after R=1->8 expansion: {max_diff}"
     assert mean_diff < 1e-3, f"BF16 mean diff too large: {mean_diff}"
+    assert float(jnp.max(jnp.abs(logits_r1 - logits_r8_dyn))) < 1e-2
+    assert 1.0 <= float(dyn_info["mean_loops"]) <= 8.0
 
     # Verify exact mathematical preservation in float32
     cfg_r1_f32 = LoopMoEConfig(**{**cfg_r1.to_dict(), "dtype_name": "float32"})
@@ -237,13 +264,16 @@ def test_r1_to_r8_smooth_expansion_preserves_logits_and_learns() -> None:
     l1_f32, _ = jax.jit(lambda p: forward_logits(p, x, cfg_r1_f32))(p1_f32)
     p8_f32 = expand_checkpoint_1_to_8_loops(p1_f32, jax.random.PRNGKey(103))
     l8_f32, _ = jax.jit(lambda p: forward_logits(p, x, cfg_r8_f32))(p8_f32)
+    l8_dyn_f32, _ = jax.jit(lambda p: forward_dynamic_exit(p, x, cfg_r8_f32))(p8_f32)
     assert float(jnp.max(jnp.abs(l1_f32 - l8_f32))) < 1e-5
+    assert float(jnp.max(jnp.abs(l1_f32 - l8_dyn_f32))) < 1e-5
 
-    # Verify newly added loop gates t=1..7 immediately receive non-zero gradient (including re-injection gate 0)
+    # Verify newly added loop gates t=1..7 & halt_gate immediately receive non-zero gradient
     _, grads = jax.jit(jax.value_and_grad(lambda p: forward_model(p, x, y, cfg_r8)[0]))(params_r8)
     alpha_grads_new = grads["iter_adaln"]["loop_alpha"][1:]
     assert float(jnp.max(jnp.abs(alpha_grads_new))) > 0.0
     assert float(jnp.max(jnp.abs(alpha_grads_new[:, 0]))) > 0.0
+    assert float(jnp.linalg.norm(grads["halt_gate"]["b"][:-1])) > 0.0
 
 
 def test_muon_adamw_optimizer_per_expert_and_no_decay() -> None:
@@ -291,8 +321,11 @@ def test_muon_adamw_optimizer_per_expert_and_no_decay() -> None:
 
     assert classify_param("moe/w_gate_up", params["moe"]["w_gate_up"]) == "muon"
     assert classify_param("mla/w_dq", params["mla"]["w_dq"]) == "muon"
+    assert classify_param("mla/w_dkv", params["mla"]["w_dkv"]) == "muon"
     assert classify_param("mla/q_norm_w", params["mla"]["q_norm_w"]) == "adam_no_decay"
     assert classify_param("mla/kv_norm_w", params["mla"]["kv_norm_w"]) == "adam_no_decay"
+    assert classify_param("halt_gate/w", params["halt_gate"]["w"]) == "adam_decay"
+    assert classify_param("halt_gate/b", params["halt_gate"]["b"]) == "adam_no_decay"
     assert classify_param("moe/router_w", params["moe"]["router_w"]) == "adam_decay"
     assert classify_param("moe/post_norm_w", params["moe"]["post_norm_w"]) == "adam_no_decay"
     assert classify_param("embed_tokens", params["embed_tokens"]) == "adam_decay"
@@ -864,3 +897,139 @@ def test_pallas_moe_dispatch_combine_kernels() -> None:
             mlir_c = pl.lower_as_mlir(lambda a, b: pallas_moe_combine(a, b, top_k=5), down_s, idx_s, platforms=("tpu",))
             assert "shape_cast" not in mlir_g and "shape_cast" not in mlir_c
             assert "pallas_moe_gather" in mlir_g and "pallas_moe_combine" in mlir_c
+
+
+def test_glm54_kv_reuse_and_dynamic_loop_early_exit() -> None:
+    import math as _math
+
+    # 1. Verify GLM-5.4 Loop-0 KV & CSA2 sparse-mask reuse skips KV & indexer projections cleanly
+    k1, k2, k3 = jax.random.split(jax.random.PRNGKey(1201), 3)
+    for use_csa2 in (False, True):
+        cfg_mla = LoopMoEConfig(
+            **{
+                **LoopMoEConfig.tiny(num_loops=2, use_csa2_indexer=use_csa2).to_dict(),
+                "dtype_name": "float32",
+                "csa2_topk": 4 if use_csa2 else 16,
+            }
+        )
+        mla_p = init_mla_params(k1, cfg_mla, dtype=jnp.float32)
+        x0 = jax.random.normal(k2, (2, 16, cfg_mla.d_model), dtype=jnp.float32)
+        x1 = jax.random.normal(k3, (2, 16, cfg_mla.d_model), dtype=jnp.float32)
+
+        _, _, kv0 = apply_mla(mla_p, x0, cfg_mla, loop_idx=0, return_kv=True)
+        # Zero out ALL KV & CSA2 weights to prove cached_kv bypasses KV projections & indexer completely
+        mla_p_nokv = dict(mla_p)
+        for kv_k in ("w_dkv", "w_uk", "w_uv", "idx_w_q", "idx_w_k", "idx_w_score"):
+            if kv_k in mla_p_nokv:
+                mla_p_nokv[kv_k] = jnp.zeros_like(mla_p_nokv[kv_k])
+
+        out_cached, _ = apply_mla(mla_p_nokv, x1, cfg_mla, loop_idx=1, cached_kv=kv0, return_kv=False)
+
+        # Reference: loop-1 Q/O weights attending directly to cached kv0
+        cfg_noshare = LoopMoEConfig(**{**cfg_mla.to_dict(), "reuse_kv_across_loops": False})
+        assert cfg_noshare.reuse_kv_across_loops is False
+        out_full, _ = apply_mla(mla_p, x1, cfg_mla, loop_idx=1, cached_kv=kv0, return_kv=False)
+        np.testing.assert_allclose(np.asarray(out_cached), np.asarray(out_full), atol=1e-6, rtol=1e-6)
+
+    # 2. Verify chunked_cross_entropy_loss_and_nll matches dense per-token NLL and weighted gradients
+    kh, kw, kt, km = jax.random.split(jax.random.PRNGKey(1202), 4)
+    hidden = jax.random.normal(kh, (2, 16, 64), dtype=jnp.float32)
+    lm_w = jax.random.normal(kw, (64, 512), dtype=jnp.float32) * 0.1
+    targets = jax.random.randint(kt, (2, 16), 0, 512, dtype=jnp.int32)
+    weights = jax.random.uniform(km, (2, 16), minval=0.0, maxval=1.0, dtype=jnp.float32)
+    denom_custom = jnp.asarray(12.5, dtype=jnp.float32)
+
+    def _dense_weighted(h, w):
+        logits = h @ w
+        nll = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
+        return jnp.sum(nll * weights) / denom_custom, jax.lax.stop_gradient(nll)
+
+    (d_loss, d_nll), (d_dh, d_dw) = jax.value_and_grad(
+        lambda h, w: _dense_weighted(h, w), argnums=(0, 1), has_aux=True
+    )(hidden, lm_w)
+
+    for weight_is_vd, w_mat in ((False, lm_w), (True, lm_w.T)):
+        (c_loss, c_nll), (c_dh, c_dw) = jax.value_and_grad(
+            lambda h, w, vd=weight_is_vd: chunked_cross_entropy_loss_and_nll(
+                h, w, targets, chunk_size=8, loss_mask=weights, weight_is_vd=vd, denom_override=denom_custom
+            ),
+            argnums=(0, 1),
+            has_aux=True,
+        )(hidden, w_mat)
+        np.testing.assert_allclose(float(c_loss), float(d_loss), atol=1e-5)
+        np.testing.assert_allclose(np.asarray(c_nll), np.asarray(d_nll), atol=1e-5)
+        np.testing.assert_allclose(np.asarray(c_dh), np.asarray(d_dh), atol=1e-4)
+        dw_cmp = c_dw.T if weight_is_vd else c_dw
+        np.testing.assert_allclose(np.asarray(dw_cmp), np.asarray(d_dw), atol=1e-4)
+
+    # 3. Verify Eq. 6 dynamic-loop forward+backward gradients (subsample=1 & subsample=2)
+    x_tok = jax.random.randint(jax.random.PRNGKey(1203), (2, 32), 0, 512, dtype=jnp.int32)
+    y_tok = jax.random.randint(jax.random.PRNGKey(1204), (2, 32), 0, 512, dtype=jnp.int32)
+    for sub in (1, 2):
+        cfg_dyn = LoopMoEConfig(
+            **{
+                **LoopMoEConfig.tiny(num_loops=4).to_dict(),
+                "dynamic_loop_ce_subsample": sub,
+                "remat_per_loop": True,
+            }
+        )
+        p_dyn = expand_checkpoint_1_to_8_loops(init_model_params(jax.random.PRNGKey(1205), cfg_dyn), jax.random.PRNGKey(1206))
+        p_dyn["iter_adaln"] = {
+            **p_dyn["iter_adaln"],
+            "loop_alpha": jnp.full_like(p_dyn["iter_adaln"]["loop_alpha"], 0.5),
+        }
+        (loss, aux), grads = jax.jit(
+            jax.value_and_grad(lambda p: forward_model(p, x_tok, y_tok, cfg_dyn), has_aux=True)
+        )(p_dyn)
+        assert jnp.isfinite(loss)
+        assert 1.0 <= float(aux["expected_loops"]) <= 4.0
+        assert 0.0 <= float(aux["halt_entropy"]) <= _math.log(4.0) + 1e-4
+        assert float(jnp.linalg.norm(grads["halt_gate"]["w"][:4])) > 0.0
+        assert float(jnp.linalg.norm(grads["halt_gate"]["b"][:3])) > 0.0
+        assert float(jnp.linalg.norm(grads["mla"]["w_dq"][:4])) > 0.0
+        assert float(jnp.linalg.norm(grads["mla"]["w_dkv"])) > 0.0
+        assert float(jnp.linalg.norm(grads["moe"]["w_gate_up"])) > 0.0
+
+    # 4. Verify forward_dynamic_exit truly performs early exit based on halt_gate
+    cfg_exit = LoopMoEConfig.tiny(num_loops=4)
+    p_exit = expand_checkpoint_1_to_8_loops(init_model_params(jax.random.PRNGKey(1207), cfg_exit), jax.random.PRNGKey(1208))
+    p_exit["iter_adaln"] = {
+        **p_exit["iter_adaln"],
+        "loop_alpha": jnp.full_like(p_exit["iter_adaln"]["loop_alpha"], 0.5),
+    }
+    dyn_jit = jax.jit(lambda p: forward_dynamic_exit(p, x_tok, cfg_exit))
+
+    p_early0 = {
+        **p_exit,
+        "halt_gate": {**p_exit["halt_gate"], "b": jnp.full((cfg_exit.max_loops,), 10.0, dtype=jnp.float32)},
+    }
+    _, info0 = dyn_jit(p_early0)
+    assert int(info0["loops_executed"]) == 1
+    np.testing.assert_allclose(float(info0["mean_loops"]), 1.0, atol=1e-6)
+    np.testing.assert_array_equal(np.asarray(info0["exit_depth"]), np.zeros((2, 32), dtype=np.int32))
+
+    p_early1 = {
+        **p_exit,
+        "halt_gate": {
+            **p_exit["halt_gate"],
+            "b": jnp.asarray([-10.0, 10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0], dtype=jnp.float32),
+        },
+    }
+    _, info1 = dyn_jit(p_early1)
+    assert int(info1["loops_executed"]) == 2
+    np.testing.assert_allclose(float(info1["mean_loops"]), 2.0, atol=1e-6)
+    np.testing.assert_array_equal(np.asarray(info1["exit_depth"]), np.ones((2, 32), dtype=np.int32))
+
+    p_full = {
+        **p_exit,
+        "halt_gate": {**p_exit["halt_gate"], "b": jnp.full((cfg_exit.max_loops,), -10.0, dtype=jnp.float32)},
+    }
+    logits_dyn_full, info_full = dyn_jit(p_full)
+    logits_static_full, _ = jax.jit(lambda p: forward_logits(p, x_tok, cfg_exit))(p_full)
+    assert int(info_full["loops_executed"]) == 4
+    np.testing.assert_allclose(float(info_full["mean_loops"]), 4.0, atol=1e-6)
+    np.testing.assert_allclose(
+        np.asarray(logits_dyn_full, dtype=np.float32),
+        np.asarray(logits_static_full, dtype=np.float32),
+        atol=1e-2,
+    )

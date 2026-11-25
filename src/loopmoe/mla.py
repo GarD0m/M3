@@ -63,48 +63,79 @@ def apply_rope(x: jax.Array, inv_freq: jax.Array) -> jax.Array:
     return jnp.concatenate([out1, out2], axis=-1)
 
 
-def _init_single_mla_params(
+def is_per_loop_mla_leaf(name: str, arr: jax.Array) -> bool:
+    """Return True when an MLA parameter leaf has a leading `max_loops` axis."""
+    return (arr.ndim == 3) or (name.endswith("_norm_w") and arr.ndim == 2)
+
+
+def _init_single_mla_qo_params(
     key: jax.Array,
     cfg: LoopMoEConfig,
     dtype: jnp.dtype = jnp.bfloat16,
 ) -> dict[str, jax.Array]:
-    """Initialize a single loop's MLA projection matrices and optional CSA2 Lightning Indexer."""
-    keys = jax.random.split(key, 10)
+    """Initialize per-loop MLA query & output projection matrices."""
+    keys = jax.random.split(key, 3)
     d = cfg.d_model
     h = cfg.n_heads
-
-    params: dict[str, jax.Array] = {
+    return {
         "w_dq": jax.random.normal(keys[0], (d, cfg.d_q_lora), dtype=dtype)
         * (1.0 / jnp.sqrt(float(d))),
         "q_norm_w": jnp.ones((cfg.d_q_lora,), dtype=dtype),
         "w_uq": jax.random.normal(keys[1], (cfg.d_q_lora, h * cfg.d_qk_head), dtype=dtype)
         * (1.0 / jnp.sqrt(float(cfg.d_q_lora))),
-        "w_dkv": jax.random.normal(keys[2], (d, cfg.d_kv_lora + cfg.d_qk_rope), dtype=dtype)
+        "w_o": jax.random.normal(keys[2], (h * cfg.d_v, d), dtype=dtype)
+        * (1.0 / jnp.sqrt(float(h * cfg.d_v))),
+    }
+
+
+def _init_single_mla_kv_params(
+    key: jax.Array,
+    cfg: LoopMoEConfig,
+    dtype: jnp.dtype = jnp.bfloat16,
+) -> dict[str, jax.Array]:
+    """Initialize MLA KV projections and optional CSA2 Lightning Indexer (reusable across loops)."""
+    keys = jax.random.split(key, 7)
+    d = cfg.d_model
+    h = cfg.n_heads
+
+    params: dict[str, jax.Array] = {
+        "w_dkv": jax.random.normal(keys[0], (d, cfg.d_kv_lora + cfg.d_qk_rope), dtype=dtype)
         * (1.0 / jnp.sqrt(float(d))),
         "kv_norm_w": jnp.ones((cfg.d_kv_lora,), dtype=dtype),
-        "w_uk": jax.random.normal(keys[3], (cfg.d_kv_lora, h * cfg.d_qk_nope), dtype=dtype)
+        "w_uk": jax.random.normal(keys[1], (cfg.d_kv_lora, h * cfg.d_qk_nope), dtype=dtype)
         * (1.0 / jnp.sqrt(float(cfg.d_kv_lora))),
-        "w_uv": jax.random.normal(keys[4], (cfg.d_kv_lora, h * cfg.d_v), dtype=dtype)
+        "w_uv": jax.random.normal(keys[2], (cfg.d_kv_lora, h * cfg.d_v), dtype=dtype)
         * (1.0 / jnp.sqrt(float(cfg.d_kv_lora))),
-        "w_o": jax.random.normal(keys[5], (h * cfg.d_v, d), dtype=dtype)
-        * (1.0 / jnp.sqrt(float(h * cfg.d_v))),
     }
 
     if cfg.use_csa2_indexer:
         params.update(
             {
                 "idx_w_q": jax.random.normal(
-                    keys[6], (cfg.d_q_lora, cfg.csa2_num_heads * cfg.csa2_head_dim), dtype=dtype
+                    keys[3], (cfg.d_q_lora, cfg.csa2_num_heads * cfg.csa2_head_dim), dtype=dtype
                 )
                 * (1.0 / jnp.sqrt(float(cfg.d_q_lora))),
-                "idx_w_k": jax.random.normal(keys[7], (d, cfg.csa2_head_dim), dtype=dtype)
+                "idx_w_k": jax.random.normal(keys[4], (d, cfg.csa2_head_dim), dtype=dtype)
                 * (1.0 / jnp.sqrt(float(d))),
                 "idx_k_norm_w": jnp.ones((cfg.csa2_head_dim,), dtype=dtype),
-                "idx_w_score": jax.random.normal(keys[8], (d, cfg.csa2_num_heads), dtype=dtype)
+                "idx_w_score": jax.random.normal(keys[5], (d, cfg.csa2_num_heads), dtype=dtype)
                 * (1.0 / jnp.sqrt(float(d))),
             }
         )
     return params
+
+
+def _init_single_mla_params(
+    key: jax.Array,
+    cfg: LoopMoEConfig,
+    dtype: jnp.dtype = jnp.bfloat16,
+) -> dict[str, jax.Array]:
+    """Initialize a single loop's complete MLA projection matrices and optional CSA2 Indexer."""
+    k_qo, k_kv = jax.random.split(key, 2)
+    return {
+        **_init_single_mla_qo_params(k_qo, cfg, dtype),
+        **_init_single_mla_kv_params(k_kv, cfg, dtype),
+    }
 
 
 def init_mla_params(
@@ -112,7 +143,13 @@ def init_mla_params(
     cfg: LoopMoEConfig,
     dtype: jnp.dtype = jnp.bfloat16,
 ) -> dict[str, jax.Array]:
-    """Initialize MLA projection matrices (untied per loop when `untie_mla_per_loop=True`)."""
+    """Initialize MLA weights (untied Q/O per loop, optionally sharing Loop-0 KV & CSA2 across loops)."""
+    if cfg.untie_mla_per_loop and cfg.reuse_kv_across_loops:
+        k_qo, k_kv = jax.random.split(key, 2)
+        loop_keys = jax.random.split(k_qo, cfg.max_loops)
+        qo_params = jax.vmap(lambda k: _init_single_mla_qo_params(k, cfg, dtype))(loop_keys)
+        kv_params = _init_single_mla_kv_params(k_kv, cfg, dtype)
+        return {**qo_params, **kv_params}
     if cfg.untie_mla_per_loop:
         loop_keys = jax.random.split(key, cfg.max_loops)
         return jax.vmap(lambda k: _init_single_mla_params(k, cfg, dtype))(loop_keys)
@@ -308,15 +345,13 @@ def apply_mla(
     x: jax.Array,
     cfg: LoopMoEConfig,
     loop_idx: jax.Array | int = 0,
-) -> tuple[jax.Array, dict[str, jax.Array]]:
-    """Run Multi-head Latent Attention (+ optional CSA2 Lightning Indexer)."""
+    cached_kv: tuple[jax.Array, jax.Array, jax.Array | None] | None = None,
+    return_kv: bool = False,
+) -> tuple[jax.Array, dict[str, jax.Array]] | tuple[jax.Array, dict[str, jax.Array], tuple[jax.Array, jax.Array, jax.Array | None]]:
+    """Run Multi-head Latent Attention with optional GLM-5.4 Loop-0 KV & CSA2 mask reuse."""
     bsz, seq_len, _ = x.shape
     h = cfg.n_heads
-    p = (
-        jax.tree_util.tree_map(lambda a: a[loop_idx], params)
-        if params["w_dq"].ndim == 3
-        else params
-    )
+    p = {k: (v[loop_idx] if is_per_loop_mla_leaf(k, v) else v) for k, v in params.items()}
 
     with jax.named_scope("mla_qkv_proj"):
         c_q = rms_norm(x @ p["w_dq"], p["q_norm_w"], eps=cfg.rms_norm_eps)
@@ -329,12 +364,16 @@ def apply_mla(
         q_r1 = c_q @ w_uq_r1  # [B, S, H * half] -> width 256 (2 full 128-lanes, zero padding)
         q_r2 = c_q @ w_uq_r2
 
-        kv_raw = x @ p["w_dkv"]
-        c_kv_raw, k_rope_shared = jnp.split(kv_raw, [cfg.d_kv_lora], axis=-1)
-        c_kv = rms_norm(c_kv_raw, p["kv_norm_w"], eps=cfg.rms_norm_eps)
-
-        k_nope = (c_kv @ p["w_uk"]).reshape(bsz, seq_len, h, cfg.d_qk_nope)
-        v = (c_kv @ p["w_uv"]).reshape(bsz, seq_len, h, cfg.d_v)
+        if cached_kv is None:
+            kv_raw = x @ p["w_dkv"]
+            c_kv_raw, k_rope_shared = jnp.split(kv_raw, [cfg.d_kv_lora], axis=-1)
+            c_kv = rms_norm(c_kv_raw, p["kv_norm_w"], eps=cfg.rms_norm_eps)
+            k_nope = (c_kv @ p["w_uk"]).reshape(bsz, seq_len, h, cfg.d_qk_nope)
+            v = (c_kv @ p["w_uv"]).reshape(bsz, seq_len, h, cfg.d_v)
+        else:
+            k_rope_shared = None
+            k_nope = None
+            v = cached_kv[1]
 
     with jax.named_scope("mla_rope"):
         inv_freq, mscale = compute_yarn_freqs(
@@ -356,23 +395,32 @@ def apply_mla(
         q_out2 = (q_r1 * sin_h + q_r2 * cos_h).reshape(bsz, seq_len, h, half)
         q = jnp.concatenate([q_nope, q_out1, q_out2], axis=-1)
 
-        k_r1, k_r2 = jnp.split(k_rope_shared, 2, axis=-1)
-        k_out1 = k_r1 * cos_2d[None, :, :] - k_r2 * sin_2d[None, :, :]
-        k_out2 = k_r1 * sin_2d[None, :, :] + k_r2 * cos_2d[None, :, :]
-        k_rope = jnp.broadcast_to(
-            jnp.concatenate([k_out1, k_out2], axis=-1)[:, :, None, :],
-            (bsz, seq_len, h, cfg.d_qk_rope),
-        )
-        k = jnp.concatenate([k_nope, k_rope], axis=-1)
+        if cached_kv is None:
+            assert k_rope_shared is not None and k_nope is not None
+            k_r1, k_r2 = jnp.split(k_rope_shared, 2, axis=-1)
+            k_out1 = k_r1 * cos_2d[None, :, :] - k_r2 * sin_2d[None, :, :]
+            k_out2 = k_r1 * sin_2d[None, :, :] + k_r2 * cos_2d[None, :, :]
+            k_rope = jnp.broadcast_to(
+                jnp.concatenate([k_out1, k_out2], axis=-1)[:, :, None, :],
+                (bsz, seq_len, h, cfg.d_qk_rope),
+            )
+            k = jnp.concatenate([k_nope, k_rope], axis=-1)
+        else:
+            k = cached_kv[0]
 
     softmax_scale = (mscale * mscale) / math.sqrt(float(cfg.d_qk_head))
 
     aux_info: dict[str, jax.Array] = {}
-    sparse_mask = None
-    if cfg.use_csa2_indexer and seq_len > cfg.csa2_topk:
-        with jax.named_scope("mla_csa2_indexer"):
-            sparse_mask, idx_scores = compute_csa2_lightning_mask(p, x, c_q, cfg)
-            aux_info["csa2_score_mean"] = jnp.mean(idx_scores)
+    if cached_kv is None:
+        sparse_mask = None
+        if cfg.use_csa2_indexer and seq_len > cfg.csa2_topk:
+            with jax.named_scope("mla_csa2_indexer"):
+                sparse_mask, idx_scores = compute_csa2_lightning_mask(p, x, c_q, cfg)
+                aux_info["csa2_score_mean"] = jnp.mean(idx_scores)
+        kv_out = (k, v, sparse_mask)
+    else:
+        sparse_mask = cached_kv[2]
+        kv_out = cached_kv
 
     with jax.named_scope("mla_attention"):
         attn_out = _run_causal_attention(
@@ -385,4 +433,6 @@ def apply_mla(
         )
     with jax.named_scope("mla_out_proj"):
         out = attn_out.reshape(bsz, seq_len, h * cfg.d_v) @ p["w_o"]
+    if return_kv:
+        return out, aux_info, kv_out
     return out, aux_info

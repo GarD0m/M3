@@ -74,7 +74,7 @@ class LoopMoEConfig:
     d_model: int = 2048
     num_layers: int = 1
     max_loops: int = 8
-    num_loops: int = 1
+    num_loops: int = 1  # max active loops for this stage (early exit when > 1)
     tie_word_embeddings: bool = True
     dtype_name: str = "bfloat16"
     rms_norm_eps: float = 1e-6
@@ -114,6 +114,7 @@ class LoopMoEConfig:
     d_qk_rope: int = 32
     d_v: int = 128
     untie_mla_per_loop: bool = True
+    reuse_kv_across_loops: bool = True
     attn_use_tokamax: bool = True
     use_csa2_indexer: bool = False
     csa2_num_heads: int = 4
@@ -133,9 +134,13 @@ class LoopMoEConfig:
     use_post_moe_rmsnorm: bool = True
     moe_use_tokamax: bool = True
 
-    # LoopMoE IterAdaLN & LOOM embedding re-injection
+    # LoopMoE IterAdaLN, LOOM embedding re-injection & Dynamic Loop (arXiv:2611.05724)
     iter_adaln_bottleneck: int = 128
     embed_reinject_lambda: float = 0.5
+    use_dynamic_loop: bool = True
+    halt_balance_weight: float = 0.01
+    halt_threshold: float = 0.5
+    dynamic_loop_ce_subsample: int = 1
 
     # TPU execution
     remat_per_loop: bool = True
@@ -215,6 +220,7 @@ class LoopMoEConfig:
             d_qk_rope=8,
             d_v=8,
             untie_mla_per_loop=True,
+            reuse_kv_across_loops=True,
             attn_use_tokamax=False,
             use_csa2_indexer=use_csa2_indexer,
             csa2_num_heads=2,
@@ -231,6 +237,10 @@ class LoopMoEConfig:
             moe_use_tokamax=False,
             iter_adaln_bottleneck=16,
             embed_reinject_lambda=0.5,
+            use_dynamic_loop=True,
+            halt_balance_weight=0.01,
+            halt_threshold=0.5,
+            dynamic_loop_ce_subsample=1,
             remat_per_loop=False,
             remat_sublayers=False,
             remat_moe=False,
@@ -476,24 +486,32 @@ def count_analytic_params(cfg: LoopMoEConfig) -> dict[str, float | int]:
         + 2 * d  # base pre-sublayer RMSNorms
     )
 
-    # MLA (optionally untied across max_loops with zero extra active FLOPs)
-    mla_single = (
+    # MLA (Q/O optionally untied per max_loops; Loop-0 KV & CSA2 reused across loops by default)
+    mla_q_o_single = (
         d * cfg.d_q_lora
         + cfg.d_q_lora
         + cfg.d_q_lora * (cfg.n_heads * cfg.d_qk_head)
-        + d * (cfg.d_kv_lora + cfg.d_qk_rope)
-        + cfg.d_kv_lora
-        + cfg.d_kv_lora * (cfg.n_heads * (cfg.d_qk_nope + cfg.d_v))
         + (cfg.n_heads * cfg.d_v) * d
     )
+    mla_kv_single = (
+        d * (cfg.d_kv_lora + cfg.d_qk_rope)
+        + cfg.d_kv_lora
+        + cfg.d_kv_lora * (cfg.n_heads * (cfg.d_qk_nope + cfg.d_v))
+    )
     if cfg.use_csa2_indexer:
-        mla_single += (
+        mla_kv_single += (
             cfg.d_q_lora * (cfg.csa2_num_heads * cfg.csa2_head_dim)
             + d * cfg.csa2_head_dim
             + cfg.csa2_head_dim
             + d * cfg.csa2_num_heads
         )
-    mla = mla_single * (cfg.max_loops if cfg.untie_mla_per_loop else 1)
+    mla_single = mla_q_o_single + mla_kv_single
+    if cfg.untie_mla_per_loop:
+        mla = cfg.max_loops * mla_q_o_single + (
+            mla_kv_single if cfg.reuse_kv_across_loops else cfg.max_loops * mla_kv_single
+        )
+    else:
+        mla = mla_single
 
     # MoE
     moe_routed = cfg.n_routed_experts * (3 * d * cfg.d_ff_expert)
@@ -503,7 +521,10 @@ def count_analytic_params(cfg: LoopMoEConfig) -> dict[str, float | int]:
     moe_post_norm = d if cfg.use_post_moe_rmsnorm else 0
     moe = moe_routed + moe_shared + moe_router + moe_bias + moe_post_norm
 
-    total = emb + lm_head + final_norm + mhc + engram + iter_adaln + mla + moe
+    # Dynamic loop halting gate (arXiv:2611.05724)
+    halt_gate = (cfg.max_loops * (d + 1)) if cfg.use_dynamic_loop else 0
+
+    total = emb + lm_head + final_norm + mhc + engram + iter_adaln + mla + moe + halt_gate
     active_ffn = cfg.top_k * (3 * d * cfg.d_ff_expert) + moe_shared
     active_engram_dense = (engram - engram_tables) if cfg.use_engram else 0
     active_engram_per_loop = 0 if cfg.engram_pre_loop_only else active_engram_dense
@@ -525,11 +546,14 @@ def count_analytic_params(cfg: LoopMoEConfig) -> dict[str, float | int]:
         "iter_adaln": iter_adaln,
         "mla": mla,
         "mla_per_loop": mla_single,
+        "mla_q_o_per_loop": mla_q_o_single,
+        "mla_kv_per_loop": mla_kv_single,
         "moe_routed": moe_routed,
         "moe_shared": moe_shared,
         "moe_router": moe_router + moe_bias,
         "moe_post_norm": moe_post_norm,
         "moe_total": moe,
+        "halt_gate": halt_gate,
         "total": total,
         "active_ffn_per_loop": active_ffn,
         "active_per_loop_non_emb": active_per_loop_non_emb,
@@ -549,11 +573,22 @@ def estimate_step_flops(cfg: LoopMoEConfig, batch_size: int, seq_len: int) -> fl
     engram_dense_runs = (
         1 if (cfg.use_engram and cfg.engram_pre_loop_only) else (cfg.num_loops if cfg.use_engram else 0)
     )
+    if cfg.reuse_kv_across_loops and cfg.num_loops > 1:
+        mla_matmul_total = int(stats["mla_per_loop"]) + (cfg.num_loops - 1) * int(
+            stats["mla_q_o_per_loop"]
+        )
+    else:
+        mla_matmul_total = cfg.num_loops * int(stats["mla_per_loop"])
+    if cfg.use_dynamic_loop and cfg.num_loops > 1:
+        lm_head_runs = 1.0 + float(cfg.num_loops - 1) / float(max(1, cfg.dynamic_loop_ce_subsample))
+    else:
+        lm_head_runs = 1.0
     # Dense matmul FLOPs (embedding lookup is sparse; LM head projection IS a full matmul)
     active_matmul_params = (
-        cfg.vocab_size * cfg.d_model  # LM head
-        + engram_dense_runs * int(stats["active_engram_dense"])
-        + cfg.num_loops * (int(stats["mla_per_loop"]) + int(stats["active_ffn_per_loop"]) + int(stats["mhc"]))
+        lm_head_runs * float(cfg.vocab_size * cfg.d_model)  # LM head
+        + float(engram_dense_runs * int(stats["active_engram_dense"]))
+        + float(mla_matmul_total)
+        + float(cfg.num_loops) * float(int(stats["active_ffn_per_loop"]) + int(stats["mhc"]))
     )
     linear_flops = 6.0 * float(active_matmul_params) * float(tokens)
     # Causal attention FLOPs (~6 * B * H * S^2 * (d_qk + d_v) / 2 * loops for fwd+bwd)
