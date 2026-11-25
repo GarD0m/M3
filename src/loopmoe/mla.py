@@ -343,8 +343,11 @@ def _run_causal_attention(
                     mask = mh_mask_cls([causal_mask_cls(shape=(seq_len, seq_len)) for _ in range(num_heads)])
                     mk_sig = inspect.signature(make_fn)
                     mk_kwargs: dict[str, object] = {}
+                    if "config" in mk_sig.parameters:
+                        mk_kwargs["config"] = bs
+                    elif "block_sizes" in mk_sig.parameters:
+                        mk_kwargs["block_sizes"] = bs
                     for k, v in (
-                        ("block_sizes", bs),
                         ("head_shards", 1),
                         ("q_seq_shards", 1),
                         ("downcast_smem_data", True),
@@ -366,11 +369,27 @@ def _run_causal_attention(
                         QKVLayout as _JaxQKVLayout,
                     )
 
-                    _cm_cls = getattr(_tkx_splash, "CausalMask", _JaxCausalMask)
-                    _mh_cls = getattr(_tkx_splash, "MultiHeadMask", _JaxMultiHeadMask)
+                    try:
+                        from tokamax._src.ops.splash_attention import splash_attention_mask as _tkx_mask  # type: ignore
+                    except Exception:
+                        _tkx_mask = None
+
+                    _cfg_cls = getattr(_tkx_splash, "SplashConfig", None) or getattr(
+                        _tkx_splash, "BlockSizes", None
+                    )
+                    if _cfg_cls is None:
+                        raise AttributeError("tokamax splash_attention_kernel lacks SplashConfig/BlockSizes")
+                    _cm_cls = (
+                        getattr(_tkx_mask, "CausalMask", None)
+                        or getattr(_tkx_splash, "CausalMask", _JaxCausalMask)
+                    )
+                    _mh_cls = (
+                        getattr(_tkx_mask, "MultiHeadMask", None)
+                        or getattr(_tkx_splash, "MultiHeadMask", _JaxMultiHeadMask)
+                    )
                     _ql_cls = getattr(_tkx_splash, "QKVLayout", _JaxQKVLayout)
                     return _invoke_unfused_splash(
-                        _tkx_splash.make_splash_mha, _tkx_splash.BlockSizes, _ql_cls, _cm_cls, _mh_cls
+                        _tkx_splash.make_splash_mha, _cfg_cls, _ql_cls, _cm_cls, _mh_cls
                     )
                 except Exception as exc:
                     warnings.warn(
